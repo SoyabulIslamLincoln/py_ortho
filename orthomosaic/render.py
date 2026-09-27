@@ -62,7 +62,10 @@ def render(frames, affines: dict, gains: dict, backend, out_path: str, gsd: floa
            epsg: Optional[int], origin_offset: tuple[float, float], render_scale: float = 1.0,
            block: int = 1024, tile: int = 512, mode: int = 0, power: float = 2.0,
            workers: int = 4, cache_mb: int = 1024, preview_path: Optional[str] = None,
-           max_pixels: float = 4e10):
+           max_pixels: float = 4e10, post=None, thermal=None):
+    """post: optional callable applied to every rendered RGBA block.
+    thermal: dict(lut, range, raw_path) -> the blended gray is raw thermal; colour it with the
+    palette and also write the raw values (float32, nodata NaN) to raw_path."""
     ids = sorted(affines)
     # world footprints
     boxes = {}
@@ -86,6 +89,12 @@ def render(frames, affines: dict, gains: dict, backend, out_path: str, gsd: floa
     geo = dict(epsg=epsg, origin=(minX + origin_offset[0], maxY + origin_offset[1]), pixel_size=gsd) \
         if epsg is not None else dict(epsg=None, origin=(minX, maxY), pixel_size=gsd)
     writer = GeoTIFFWriter(out_path, W, H, tile=tile, **geo)
+    raw_writer = None
+    if thermal is not None:
+        from .thermal import colorize_rgba
+        raw_writer = GeoTIFFWriter(thermal["raw_path"], W, H, tile=tile, kind="float32", nodata=float("nan"), **geo)
+        t_lo, t_hi = thermal["range"]
+        t_lut = thermal["lut"]
 
     # world -> loaded-image pixel transforms
     inv = {}
@@ -110,13 +119,19 @@ def render(frames, affines: dict, gains: dict, backend, out_path: str, gsd: floa
         row = range(bx_n) if by % 2 == 0 else range(bx_n - 1, -1, -1)
         order.extend((bx, by) for bx in row)
 
-    def do_block(bx, by):
+    def block_hits(bx, by):
         x0, y0 = bx * block, by * block
         bw, bh = min(block, W - x0), min(block, H - y0)
         wx0, wx1 = minX + x0 * gsd, minX + (x0 + bw) * gsd
         wy1, wy0 = maxY - y0 * gsd, maxY - (y0 + bh) * gsd
-        hits = [i for i in ids if boxes[i][0] < wx1 and boxes[i][1] > wx0
+        return [i for i in ids if boxes[i][0] < wx1 and boxes[i][1] > wx0
                 and boxes[i][2] < wy1 and boxes[i][3] > wy0]
+
+    def render_block(bx, by):
+        """Warp + blend every overlapping image into one block (runs on the compute backend)."""
+        x0, y0 = bx * block, by * block
+        bw, bh = min(block, W - x0), min(block, H - y0)
+        hits = block_hits(bx, by)
         rgba = None
         if hits:
             B = np.array([[gsd, 0, minX + (x0 + 0.5) * gsd], [0, -gsd, maxY - (y0 + 0.5) * gsd], [0, 0, 1]])
@@ -127,7 +142,22 @@ def render(frames, affines: dict, gains: dict, backend, out_path: str, gsd: floa
             rgba = backend.finalize(acc, mode)
             if not rgba[..., 3].any():
                 rgba = None
+            else:
+                if post is not None:
+                    rgba = post(rgba)
+        return x0, y0, bw, bh, rgba
+
+    def compress_block(x0, y0, bw, bh, rgba):
         out = []
+        if rgba is not None and raw_writer is not None:
+            raw = np.where(rgba[..., 3] > 0, t_lo + rgba[..., 0].astype(np.float32) * ((t_hi - t_lo) / 255.0),
+                           np.nan).astype(np.float32)
+            for ty in range(0, bh, tile):
+                for tx in range(0, bw, tile):
+                    blk = raw[ty:ty + tile, tx:tx + tile]
+                    if np.isfinite(blk).any():
+                        out.append(("raw", (x0 + tx) // tile, (y0 + ty) // tile, raw_writer.compress_tile(blk)))
+            rgba = colorize_rgba(rgba, t_lut)
         if rgba is not None:
             for ty in range(0, bh, tile):
                 for tx in range(0, bw, tile):
@@ -136,10 +166,16 @@ def render(frames, affines: dict, gains: dict, backend, out_path: str, gsd: floa
                         out.append(((x0 + tx) // tile, (y0 + ty) // tile, writer.compress_tile(t)))
         return x0, y0, rgba, out
 
+    def do_block(bx, by):
+        return compress_block(*render_block(bx, by))
+
     def consume(result):
         x0, y0, rgba, tiles = result
-        for tx, ty, data in tiles:
-            writer.write_tile(tx, ty, data)
+        for t in tiles:
+            if t[0] == "raw":
+                raw_writer.write_tile(t[1], t[2], t[3])
+            else:
+                writer.write_tile(*t)
         if preview is not None and rgba is not None:
             ox, oy = (-x0) % pf, (-y0) % pf
             sub = rgba[oy::pf, ox::pf]
@@ -163,12 +199,29 @@ def render(frames, affines: dict, gains: dict, backend, out_path: str, gsd: floa
             for fut in pending:
                 consume(fut.result())
     else:
-        for bx, by in order:
-            consume(do_block(bx, by))
-            done += 1
-            if done % step == 0:
-                log.info("  rendered %d/%d blocks", done, total)
+        # GPU backends render blocks one at a time; overlap the CPU work around them:
+        # decode (and upload) the images of the next blocks and Deflate finished tiles in threads
+        from collections import deque
+        prefetched = set()
+        with ThreadPoolExecutor(max(2, workers)) as ex:
+            pending = deque()
+            for k, (bx, by) in enumerate(order):
+                for nb in order[k + 1:k + 3]:
+                    for i in block_hits(*nb):
+                        if i not in prefetched:
+                            prefetched.add(i)
+                            ex.submit(cache.get, i)
+                pending.append(ex.submit(compress_block, *render_block(bx, by)))
+                while len(pending) > 2 * workers:
+                    consume(pending.popleft().result())
+                done += 1
+                if done % step == 0:
+                    log.info("  rendered %d/%d blocks", done, total)
+            while pending:
+                consume(pending.popleft().result())
     writer.close()
+    if raw_writer is not None:
+        raw_writer.close()
     log.info("Image decodes during render: %d (for %d images)", cache.loads, len(ids))
 
     if preview is not None:

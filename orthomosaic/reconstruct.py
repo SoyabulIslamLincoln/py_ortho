@@ -110,7 +110,8 @@ def build_3d(images: Union[str, Sequence[str]], out_dir: str, options: Optional[
                                     width=it.width, height=it.height)
 
     # ---- dense
-    gains = solve_gains(al.used, ar.pairs) if opt.exposure_compensation else {}
+    thermal = ar.thermal_range is not None          # radiometric thermal: never exposure-compensate
+    gains = solve_gains(al.used, ar.pairs) if (opt.exposure_compensation and not thermal) else {}
     dopt = mvs.DenseOptions(gsd=opt.dsm_resolution, max_views=opt.max_views, min_score=opt.min_score,
                             window=opt.ncc_window, tile=opt.tile, cache_mb=opt.cache_mb, workers=ar.workers)
     dense = mvs.dense_reconstruct(ar, rec, gains, al.gsd, dopt)
@@ -119,10 +120,21 @@ def build_3d(images: Union[str, Sequence[str]], out_dir: str, options: Optional[
     covered = np.isfinite(dsm)
     origin_xy = (dense.minX + ox, dense.maxY + oy)
 
+    # ---- thermal: the dense colours are raw values (gray); keep them and colour with the palette
+    colors = dense.rgb
+    if thermal:
+        from .thermal import legend, palette_lut
+        lo, hi = ar.thermal_range
+        raw = np.where(covered, lo + dense.rgb[..., 0].astype(np.float32) * ((hi - lo) / 255.0), np.nan)
+        _write_raster(os.path.join(out_dir, "orthophoto_thermal.tif"), raw.astype(np.float32), "float32", epsg,
+                      origin_xy, gsd, float("nan"))
+        colors = palette_lut(opt.palette)[dense.rgb[..., 0]]
+        legend(os.path.join(out_dir, "thermal_legend.png"), opt.palette, ar.thermal_range)
+
     # ---- rasters
     dsm_out = np.where(covered, dsm, NODATA).astype(np.float32)
     _write_raster(os.path.join(out_dir, "dsm.tif"), dsm_out, "float32", epsg, origin_xy, gsd, NODATA)
-    rgba = np.dstack([dense.rgb, (covered * 255).astype(np.uint8)])
+    rgba = np.dstack([colors, (covered * 255).astype(np.uint8)])
     rgba[~covered, :3] = 0
     _write_raster(os.path.join(out_dir, "orthophoto.tif"), rgba, "rgba", epsg, origin_xy, gsd)
     pf = max(1, math.ceil(max(dsm.shape) / 2048))
@@ -137,7 +149,7 @@ def build_3d(images: Union[str, Sequence[str]], out_dir: str, options: Optional[
     ys, xs = np.nonzero(conf[::s, ::s])
     ys, xs = ys * s, xs * s
     xyz = np.column_stack([dense.minX + (xs + 0.5) * gsd, dense.maxY - (ys + 0.5) * gsd, dense.Z[ys, xs]])
-    col = dense.rgb[ys, xs]
+    col = colors[ys, xs]
     outputs = {"dsm": "dsm.tif", "orthophoto": "orthophoto.tif", "sparse": "sparse.ply"}
     if "ply" in opt.formats:
         export.write_ply(os.path.join(out_dir, "dense.ply"), xyz, col, offset3, f"EPSG:{epsg}" if epsg else "")
@@ -153,7 +165,7 @@ def build_3d(images: Union[str, Sequence[str]], out_dir: str, options: Optional[
         Zm, vm = _block_reduce(dsm, f, covered)
         V, F, UV = export.grid_mesh(Zm, vm & np.isfinite(Zm), dense.minX, dense.maxY, gsd * f)
         th = max(1, math.ceil(max(rgba.shape[:2]) / opt.texture_max))
-        tex = Image.fromarray(dense.rgb[::th, ::th])
+        tex = Image.fromarray(np.ascontiguousarray(colors[::th, ::th]))
         if "obj" in opt.formats:
             export.write_obj(os.path.join(out_dir, "mesh.obj"), V, F, UV, tex, offset3)
             outputs["mesh_obj"] = "mesh.obj"
@@ -173,6 +185,8 @@ def build_3d(images: Union[str, Sequence[str]], out_dir: str, options: Optional[
                  confident_fraction=float(conf.sum() / max(covered.sum(), 1)),
                  z_range=[float(np.nanpercentile(dsm, 1)), float(np.nanpercentile(dsm, 99))] if covered.any() else None),
         dense_points=int(len(xyz)), outputs=outputs, seconds=round(time.time() - t0, 1),
+        thermal=(dict(raw_range=list(ar.thermal_range), palette=opt.palette, raw_values="orthophoto_thermal.tif",
+                      legend="thermal_legend.png") if thermal else None),
         options={k: (list(v) if isinstance(v, tuple) else v) for k, v in asdict(opt).items()},
         cameras=cams,
     )
@@ -189,7 +203,7 @@ def main(argv=None):
                                              "from nadir drone images.")
     ap.add_argument("images", help="folder containing the images")
     ap.add_argument("-o", "--output", default="reconstruction", help="output folder")
-    ap.add_argument("--backend", choices=["auto", "cuda", "cpu"], default=d.backend)
+    ap.add_argument("--backend", choices=["auto", "cuda", "mps", "cpu"], default=d.backend)
     ap.add_argument("--workers", type=int, default=d.workers)
     ap.add_argument("--dsm-resolution", type=float, default=None, help="DSM cell size in metres (default 2x GSD)")
     ap.add_argument("--gps-sigma", type=float, default=d.gps_sigma)
@@ -199,13 +213,16 @@ def main(argv=None):
     ap.add_argument("--mesh-max-vertices", type=int, default=d.mesh_max_vertices)
     ap.add_argument("--formats", default=",".join(d.formats), help="comma list of ply,las,obj,glb")
     ap.add_argument("--cache-mb", type=int, default=d.cache_mb)
+    ap.add_argument("--palette", default=d.palette, help="thermal palette (rainbow, iron, white_hot, ...)")
+    ap.add_argument("--no-thermal", action="store_true", help="ignore radiometric data; use JPEG colours")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
     opt = Options3D(backend=a.backend, workers=a.workers, dsm_resolution=a.dsm_resolution, gps_sigma=a.gps_sigma,
                     max_views=a.max_views, min_score=a.min_score, cloud_step=a.cloud_step,
-                    mesh_max_vertices=a.mesh_max_vertices, cache_mb=a.cache_mb,
+                    mesh_max_vertices=a.mesh_max_vertices, cache_mb=a.cache_mb, palette=a.palette,
+                    thermal="off" if a.no_thermal else "auto",
                     formats=tuple(f.strip() for f in a.formats.split(",") if f.strip()))
     build_3d(a.images, a.output, opt)
 

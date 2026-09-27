@@ -93,7 +93,7 @@ void sample_view(const float* __restrict__ img, const int h, const int w, const 
                  const double c0, const double c1, const double c2,
                  const double f, const double k1, const double k2, const double cx, const double cy,
                  const double X0, const double Y0, const double gsd,
-                 const float* __restrict__ Z, const int H, const int W,
+                 const float* __restrict__ Z, const int H, const int W, const int Hs,
                  float* __restrict__ out, unsigned char* __restrict__ valid)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -102,7 +102,7 @@ void sample_view(const float* __restrict__ img, const int h, const int w, const 
     const int idx = r * W + c;
     valid[idx] = 0;
     const double dx = X0 + (c + 0.5) * gsd - c0;
-    const double dy = Y0 - (r + 0.5) * gsd - c1;
+    const double dy = Y0 - ((r % Hs) + 0.5) * gsd - c1;   // Z may be a (D, Hs, W) stack
     const double dz = (double)Z[idx] - c2;
     const double zc = r20 * dx + r21 * dy + r22 * dz;
     if (zc <= 1e-6) return;
@@ -219,7 +219,9 @@ class CUDABackend:
     def sample_view(self, img, cam, X0, Y0, gsd, Z):
         R, C, f, k1, k2, cx, cy = cam
         Z = cp.ascontiguousarray(cp.asarray(Z, cp.float32))
-        H, W = Z.shape
+        lead = Z.shape[:-2]
+        Hs, W = Z.shape[-2:]
+        H = int(np.prod(lead, dtype=np.int64)) * Hs if lead else Hs
         h, w, nch = img.shape
         out = cp.zeros((H, W, nch), cp.float32)
         valid = cp.zeros((H, W), cp.uint8)
@@ -230,8 +232,26 @@ class CUDABackend:
         _k_sample(grid, bs, (img, np.int32(h), np.int32(w), np.int32(nch), *Rf, *Cf,
                              np.float64(f), np.float64(k1), np.float64(k2), np.float64(cx), np.float64(cy),
                              np.float64(X0), np.float64(Y0), np.float64(gsd), Z, np.int32(H), np.int32(W),
-                             out, valid))
-        return out, valid
+                             np.int32(Hs), out, valid))
+        return out.reshape(*lead, Hs, W, nch), valid.reshape(*lead, Hs, W)
 
     def to_numpy(self, a):
         return cp.asnumpy(a)
+
+    def box(self, a, r):
+        from .backend import _box_cumsum
+        return _box_cumsum(cp, a, r)
+
+    def asarray(self, a, dtype=None):
+        return cp.asarray(a, dtype)
+
+    def topk_mean(self, st, k):
+        return -cp.sort(-st, axis=0)[:k].mean(axis=0)
+
+    def argmin0(self, a):
+        idx = cp.argmin(a, axis=0)
+        return idx, cp.take_along_axis(a, idx[None], axis=0)[0]
+
+    def argmax0(self, a):
+        idx = cp.argmax(a, axis=0)
+        return idx, cp.take_along_axis(a, idx[None], axis=0)[0]

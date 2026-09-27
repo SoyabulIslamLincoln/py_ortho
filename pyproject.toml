@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 authors = [{ name = "Soyabul Islam Lincoln", email = "islamsoyabul98@gmail.com" }]
 license = "MIT"
 name = "pyOrthomosaic"
-version = "0.1.2"
+version = "0.2.0"
 description = "Native (Cython + optional CUDA) orthomosaic generator for nadir drone imagery"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -21,6 +21,7 @@ dependencies = ["numpy>=1.21", "pillow>=9.0"]
 
 [project.optional-dependencies]
 cuda = ["cupy-cuda12x[ctk]"]   # [ctk] = CUDA headers needed for runtime kernel compilation
+mps = ["mlx>=0.25; sys_platform == 'darwin' and platform_machine == 'arm64'"]   # Apple-silicon GPU
 
 [project.scripts]
 orthomosaic = "orthomosaic.__main__:main"
@@ -32,7 +33,7 @@ packages = ["orthomosaic"]
 [tool.cibuildwheel]
 build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
 skip = "*-musllinux_i686 *-win32 *-manylinux_i686"
-test-command = "python {project}/tests/test_core.py && python {project}/tests/test_ba.py && python {project}/tests/test_3d.py"
+test-command = "python {project}/tests/test_core.py && python {project}/tests/test_ba.py && python {project}/tests/test_3d.py && python {project}/tests/test_thermal.py && python {project}/tests/test_backends.py"
 # numpy/pillow only ship recent-Linux (glibc >= 2.28) wheels now; build and test in the
 # matching image, and never let pip fall back to compiling a dependency from source.
 manylinux-x86_64-image = "manylinux_2_28"

@@ -31,6 +31,8 @@ class Frame:
     rel_alt: Optional[float] = None     # DJI XMP: height above take-off (m)
     abs_alt: Optional[float] = None     # DJI XMP: absolute altitude (m)
     gimbal_pitch: Optional[float] = None
+    raw_shape: Optional[tuple] = None     # (h, w) of embedded radiometric thermal data (DJI R-JPEG)
+    thermal_range: Optional[tuple] = None  # set by the pipeline: decode raw thermal with this range
     # filled by the pipeline
     E: Optional[float] = None
     N: Optional[float] = None
@@ -120,6 +122,11 @@ def read_frame(path: str) -> Frame:
         except Exception:
             pass
     _read_dji_xmp(path, fr)
+    try:
+        from .thermal import raw_thermal_shape
+        fr.raw_shape = raw_thermal_shape(path, fr.width, fr.height) if fr.orientation == 1 else None
+    except Exception:
+        fr.raw_shape = None
     return fr
 
 
@@ -132,6 +139,11 @@ def load_rgb(frame: Frame, scale: float = 1.0) -> np.ndarray:
     """
     tw = max(1, int(round(frame.width * scale)))
     th = max(1, int(round(frame.height * scale)))
+    if frame.thermal_range is not None and frame.raw_shape is not None:
+        # radiometric thermal: use the raw sensor values (common survey-wide scale) as gray
+        from .thermal import raw_to_gray, read_raw_thermal
+        g = raw_to_gray(read_raw_thermal(frame.path, frame.raw_shape), frame.thermal_range, (tw, th))
+        return np.repeat(g[..., None], 3, axis=2)
     with Image.open(frame.path) as im:
         if scale < 1.0 and im.format == "JPEG":
             dw, dh = (tw, th) if frame.orientation not in (5, 6, 7, 8) else (th, tw)

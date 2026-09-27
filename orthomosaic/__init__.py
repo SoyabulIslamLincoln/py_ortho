@@ -2,8 +2,10 @@
 from .backend import cuda_available, select_backend
 from .pipeline import Options, build_orthomosaic
 from .reconstruct import Options3D, build_3d
+from .thermal import apply_palette, palette_names, recolor
 
-__all__ = ["Options", "Options3D", "build_orthomosaic", "build_3d", "cuda_available", "select_backend"]
+__all__ = ["Options", "Options3D", "build_orthomosaic", "build_3d", "cuda_available", "select_backend",
+           "palette_names", "apply_palette", "recolor"]
 try:  # single source of truth: the version in pyproject.toml
     from importlib.metadata import version as _version
     __version__ = _version("pyOrthomosaic")

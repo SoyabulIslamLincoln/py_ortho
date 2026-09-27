@@ -12,7 +12,8 @@ From PyPI (prebuilt wheels for Linux, Windows and macOS 14+):
 
 ```bash
 pip install pyOrthomosaic            # CPU
-pip install "pyOrthomosaic[cuda]"    # + NVIDIA GPU support via CuPy
+pip install "pyOrthomosaic[cuda]"    # + NVIDIA GPU (CUDA, via CuPy)
+pip install "pyOrthomosaic[mps]"     # + Apple-silicon GPU (Metal, via MLX)
 ```
 
 The package is installed as `pyOrthomosaic` but imported as `orthomosaic`.
@@ -50,7 +51,8 @@ Useful flags:
 
 | Flag | Effect |
 |---|---|
-| `--backend cpu\|cuda\|auto` | Choose the compute backend (`auto` uses CUDA if available). |
+| `--backend auto\|cuda\|mps\|cpu` | Compute backend. `auto` picks CUDA, then the Apple GPU (`mps`), then the CPU. |
+| `--palette rainbow` | Thermal palette (see below). |
 | `--render-scale 0.5` | Decode images at half size: about 4x less RAM and faster, at half the output resolution. |
 | `--resolution 0.05` | Output GSD in metres per pixel. |
 | `--cache-mb 256` | Cap the decoded-image cache used during rendering. This is the main RAM knob. |
@@ -99,6 +101,58 @@ python -m orthomosaic /tmp/syn/images -o /tmp/syn/ortho.tif
 python tests/synthetic.py eval /tmp/syn/images /tmp/syn/ortho.tif
 python tests/test_core.py
 ```
+
+## GPU backends
+
+| Backend | Hardware | How |
+|---|---|---|
+| `cpu` | any | Cython kernels, all cores, no extra dependencies |
+| `cuda` | NVIDIA | CuPy raw kernels compiled at runtime (`pip install "pyOrthomosaic[cuda]"`, which includes the CUDA headers) |
+| `mps` | Apple M1/M2/M3/M4 | Metal kernels through MLX (`pip install "pyOrthomosaic[mps]"`) |
+
+GPU backends run a self-test at start-up and fall back to the CPU, with a message saying what to
+install, if anything fails. The GPU accelerates matching, rendering and the dense 3D sweep. Every
+kernel is tested against the CPU implementation (`tests/test_backends.py`).
+
+Timings on an Apple M1 (8 cores) with the same output on both backends:
+
+| Job | CPU | Apple GPU |
+|---|---|---|
+| 2D, 228 synthetic images | 33 s | 19 s |
+| 3D dense step, synthetic survey | 12 s | 7 s |
+| 3D dense step, real 157-image RGB site | — | 80 s (a CPU run with the older, pre-batching code took 11 min) |
+
+## Thermal palettes
+
+DJI radiometric thermal images (R-JPEG: M30T, M3T, M4T, H20T, ...) carry the raw 16-bit sensor
+image. When every image has it, the pipeline:
+
+1. mosaics the **raw values** on one survey-wide scale (palette colours are never blended, and
+   exposure compensation is disabled);
+2. applies the palette to the finished product, with **rainbow** as the default;
+3. writes `*_thermal.tif`, a float32 raster of raw values, and `*_legend.png`, a colour bar.
+
+Available palettes are `rainbow` (default), `iron`, `white_hot`, `black_hot`, `arctic`, `lava`,
+`hot_metal`, `medical`, `green_hot` and `rainbow_hc`. A custom list of RGB stops also works.
+
+```bash
+python -m orthomosaic thermal_images/ -o thermal.tif --palette iron
+python -m orthomosaic.thermal list
+python -m orthomosaic.thermal recolor thermal_thermal.tif -o thermal_arctic.tif --palette arctic
+```
+
+The last command switches the palette afterwards without re-processing.
+
+```python
+from orthomosaic import Options, build_orthomosaic, recolor
+build_orthomosaic("thermal/", "t.tif", Options(palette="white_hot"))
+recolor("t_thermal.tif", "t_custom.tif", palette=[(0, 0, 0), (255, 0, 0), (255, 255, 0)])
+```
+
+Raw values are the camera's sensor units, which increase monotonically with temperature. Converting
+them to degrees needs the camera's radiometric calibration (DJI Thermal SDK), which isn't done here.
+The mosaic stores 256 levels over the survey's value range. Images without radiometric data keep
+their JPEG colours; `--no-thermal` forces that behaviour.
 
 ## 3D reconstruction (DSM, true orthophoto, point cloud, mesh)
 

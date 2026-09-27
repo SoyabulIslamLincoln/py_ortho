@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class Options:
-    backend: str = "auto"              # auto | cuda | cpu
+    backend: str = "auto"              # auto (CUDA > Apple GPU > CPU) | cuda | mps | cpu
     workers: int = 0                   # 0 -> os.cpu_count()
     # features / matching
     feature_max_dim: int = 2000        # detect features on images downscaled to this
@@ -43,6 +43,19 @@ class Options:
     block: int = 1024
     cache_mb: int = 1024
     preview: bool = True
+    # thermal (DJI radiometric R-JPEG): mosaic raw sensor values, colour with a palette at the end
+    thermal: str = "auto"              # auto (use raw data when every image has it) | off
+    palette: str = "rainbow"           # rainbow | iron | white_hot | black_hot | arctic | lava | ... (see thermal.py)
+
+
+def _thermal_spec(ar, opt, output):
+    """Palette + raw-value raster settings when the survey is radiometric thermal."""
+    if ar.thermal_range is None:
+        return None
+    from .thermal import legend, palette_lut
+    base = os.path.splitext(output)[0]
+    legend(base + "_legend.png", opt.palette, ar.thermal_range)
+    return dict(lut=palette_lut(opt.palette), range=ar.thermal_range, raw_path=base + "_thermal.tif")
 
 
 def _absolute(A, origin):
@@ -67,6 +80,7 @@ class AlignResult:
     backend: object
     workers: int
     dropped: list
+    thermal_range: Optional[tuple] = None   # raw-value range when mosaicking radiometric thermal
 
 
 def align_images(images: Union[str, Sequence[str]], opt: Options) -> AlignResult:
@@ -80,6 +94,18 @@ def align_images(images: Union[str, Sequence[str]], opt: Options) -> AlignResult
     log.info("Reading metadata of %d images", len(paths))
     with ThreadPoolExecutor(workers) as ex:
         frames = list(ex.map(read_frame, paths))
+
+    # ---- radiometric thermal: work on raw sensor values with one survey-wide scale
+    thermal_range = None
+    if opt.thermal != "off" and all(f.raw_shape is not None for f in frames):
+        from .thermal import survey_range
+        thermal_range = survey_range(frames)
+        for f in frames:
+            f.thermal_range = thermal_range
+        log.info("Radiometric thermal images (raw %dx%d): raw range %.0f..%.0f, palette '%s'",
+                 frames[0].raw_shape[1], frames[0].raw_shape[0], *thermal_range, opt.palette)
+    elif opt.thermal != "off" and any(f.raw_shape is not None for f in frames):
+        log.warning("Only some images carry radiometric thermal data; using the JPEG colours as they are")
 
     # ---- GPS -> UTM (local origin keeps numbers well conditioned)
     positions, epsg, origin = None, None, (0.0, 0.0)
@@ -137,18 +163,20 @@ def align_images(images: Union[str, Sequence[str]], opt: Options) -> AlignResult
     log.info("Aligned %d images, georeferenced=%s, native GSD=%.4f, match RMS=%.2f px",
              len(al.used), al.georeferenced, al.gsd, al.residual_px)
     return AlignResult(frames, feats, work_scale, pairs, len(cand), al, positions, epsg, origin,
-                       backend, workers, dropped)
+                       backend, workers, dropped, thermal_range)
 
 
 def build_orthomosaic(images: Union[str, Sequence[str]], output: str,
                       options: Optional[Options] = None) -> dict:
     opt = options or Options()
     t0 = time.time()
+    os.makedirs(os.path.dirname(os.path.abspath(output)), exist_ok=True)
     ar = align_images(images, opt)
     frames, pairs, al, backend = ar.frames, ar.pairs, ar.alignment, ar.backend
     epsg, origin, workers, dropped, cand = ar.epsg, ar.origin, ar.workers, ar.dropped, ar.candidates
 
-    gains = solve_gains(al.used, pairs) if opt.exposure_compensation else {}
+    # thermal values are radiometric: never "exposure-compensate" them
+    gains = solve_gains(al.used, pairs) if (opt.exposure_compensation and ar.thermal_range is None) else {}
 
     # ---- render
     gsd = opt.resolution or al.gsd / opt.render_scale
@@ -158,7 +186,7 @@ def build_orthomosaic(images: Union[str, Sequence[str]], output: str,
                   render_scale=opt.render_scale, block=opt.block,
                   mode=MODE_MAX if opt.blend == "seam" else MODE_FEATHER,
                   power=opt.feather_power, workers=workers, cache_mb=opt.cache_mb,
-                  preview_path=preview_path)
+                  preview_path=preview_path, thermal=_thermal_spec(ar, opt, output))
 
     report = dict(
         output=output, preview=preview_path, backend=backend.name,
@@ -166,6 +194,9 @@ def build_orthomosaic(images: Union[str, Sequence[str]], output: str,
         pairs_candidate=cand, pairs_verified=len(pairs),
         georeferenced=al.georeferenced, epsg=epsg if al.georeferenced else None,
         gsd=gsd, match_rms_px=al.residual_px, seconds=round(time.time() - t0, 1),
+        thermal=(dict(raw_range=list(ar.thermal_range), palette=opt.palette,
+                      raw_values=os.path.splitext(output)[0] + "_thermal.tif",
+                      legend=os.path.splitext(output)[0] + "_legend.png") if ar.thermal_range else None),
         options=asdict(opt), **info,
         cameras={frames[k].name: dict(affine=_absolute(al.affines[k], origin if al.georeferenced else (0, 0)),
                                       gain=gains[k].tolist() if k in gains else [1, 1, 1])

@@ -58,20 +58,12 @@ class DenseResult:
     gsd: float
 
 
-def _box(xp, a, r):
-    """Mean over a (2r+1)^2 window (same shape, zero padding), float64 cumsum."""
-    k = 2 * r + 1
-    p = xp.pad(a.astype(xp.float64), ((r + 1, r), (r + 1, r)))
-    c = xp.cumsum(xp.cumsum(p, axis=0), axis=1)
-    s = c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]
-    return s / (k * k)
-
-
 def _median3(xp, a):
+    """3x3 median (sort-based, so it also runs on backends without a median op)."""
     p = xp.pad(a, 1, mode="edge")
     H, W = a.shape
     stack = xp.stack([p[dy:dy + H, dx:dx + W] for dy in range(3) for dx in range(3)])
-    return xp.median(stack, axis=0)
+    return xp.sort(stack, axis=0)[4]
 
 
 class _View:
@@ -185,7 +177,8 @@ def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions
     tiles = [(tx, ty) for ty in range(0, H, T) for tx in range(0, W, T)]
     cam_xy = rec.C[:, :2]
 
-    def process(tile):
+    def tile_setup(tile):
+        """Geometry of a tile and the views to use (cheap; no image access)."""
         tx, ty = tile
         tw, th = min(T, W - tx), min(T, H - ty)
         # padded tile grid (finest level)
@@ -222,6 +215,13 @@ def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions
             cand = (cand + partial)[:opt.max_views]
         if len(cand) < 2:
             return None
+        return tx, ty, tw, th, px0, py0, PW, PH, X0, Y0, zlo, zhi, cand
+
+    def process(tile, st_=None):
+        st_ = tile_setup(tile) if st_ is None else st_
+        if st_ is None:
+            return None
+        tx, ty, tw, th, px0, py0, PW, PH, X0, Y0, zlo, zhi, cand = st_
         views = [cache.get(k) for k in cand]
         topk = max(1, len(views) // 2)
 
@@ -231,41 +231,49 @@ def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions
             """Photo-consistency of every cell at heights Zmap. Each cell is scored against its
             own reference view (the camera most directly above it), so results do not depend on
             how the area is tiled. Returns score (H,W) [and NCC-vs-reference per view, valids]."""
-            HH, WW = Zmap.shape
+            HH, WW = Zmap.shape[-2:]            # Zmap may be a (D, HH, WW) stack of hypotheses
             V = len(views)
             full = 1.0 - 1e-6
-            samples, valids, means, varis, vfull = [], [], [], [], []
+            samples, valids = [], []
             for v in views:
                 img = v.gray_pyr[min(level, len(v.gray_pyr) - 1)]
                 out, valid = backend.sample_view(img, v.cam(level), X0l, Y0l, gsd_l, Zmap)
-                J = out[..., 0]
-                mJ = _box(xp, J, opt.window)
-                samples.append(J)
+                samples.append(out[..., 0])
                 valids.append(valid)
-                means.append(mJ)
-                varis.append(_box(xp, J * J, opt.window) - mJ * mJ)
-                vfull.append(_box(xp, valid.astype(xp.float32), opt.window) >= full)
+            # everything below is a handful of large, batched array operations
+            S = xp.stack(samples)                                    # (V, ...)
+            VA = xp.stack(valids).astype(xp.float32)
+            M = backend.box(S, opt.window)
+            VAR = backend.box(S * S, opt.window) - M * M
+            FULL = backend.box(VA, opt.window) >= full
             # per-cell reference: nearest camera (in XY) among views that see the whole window
-            cxs = X0l + (xp.arange(WW, dtype=xp.float64) + 0.5) * gsd_l
-            cys = Y0l - (xp.arange(HH, dtype=xp.float64) + 0.5) * gsd_l
-            dist = xp.stack([xp.where(vfull[k], (cys[:, None] - c[1]) ** 2 + (cxs[None, :] - c[0]) ** 2, xp.inf)
-                             for k, c in enumerate(cam_c)])
-            ref = xp.argmin(dist, axis=0)
-            st = xp.full((V, HH, WW), -2.0, xp.float32)          # NCC(ref, v); -2 for v == ref
-            for a_ in range(V):
-                for b_ in range(a_ + 1, V):
-                    cov = _box(xp, samples[a_] * samples[b_], opt.window) - means[a_] * means[b_]
-                    ncc = cov / xp.sqrt(xp.maximum(varis[a_], 1e-6) * xp.maximum(varis[b_], 1e-6))
-                    ncc = xp.where(vfull[a_] & vfull[b_], ncc, -1.0).astype(xp.float32)
-                    st[b_] = xp.where(ref == a_, ncc, st[b_])
-                    st[a_] = xp.where(ref == b_, ncc, st[a_])
-            srt = -xp.sort(-st, axis=0)
-            score = xp.mean(srt[:topk], axis=0)
-            varR = xp.take_along_axis(xp.stack(varis), ref[None], axis=0)[0]
+            cxs = backend.asarray(X0l + (np.arange(WW) + 0.5) * gsd_l, xp.float32)
+            cys = backend.asarray(Y0l - (np.arange(HH) + 0.5) * gsd_l, xp.float32)
+            d2 = xp.stack([(cys[:, None] - float(c[1])) ** 2 + (cxs[None, :] - float(c[0])) ** 2 for c in cam_c])
+            d2 = d2.reshape((V,) + (1,) * (Zmap.ndim - 2) + (HH, WW))
+            dist = xp.where(FULL, d2, xp.inf)
+            ref, dmin = backend.argmin0(dist)
+            # NCC of every view pair at once, then pick NCC(ref(cell), v) for each view v
+            ia, ib = np.triu_indices(V, 1)
+            IA, IB = backend.asarray(ia, xp.int32), backend.asarray(ib, xp.int32)
+            COV = backend.box(S[IA] * S[IB], opt.window) - M[IA] * M[IB]
+            NCC = COV / xp.sqrt(xp.maximum(VAR[IA], 1e-6) * xp.maximum(VAR[IB], 1e-6))
+            NCC = xp.where(FULL[IA] & FULL[IB], NCC, -1.0).astype(xp.float32)
+            pair = np.full((V, V), len(ia), np.int32)                 # index into NCC (+ a "self" slot)
+            pair[ia, ib] = np.arange(len(ia))
+            pair[ib, ia] = np.arange(len(ia))
+            NCCx = xp.concatenate([NCC, xp.full((1,) + tuple(NCC.shape[1:]), -2.0, xp.float32)])
+            PAIR = backend.asarray(pair, xp.int32)                     # (V_ref, V)
+            sel = PAIR[ref]                                            # (..., V): pair slot per (cell, v)
+            sel = xp.moveaxis(sel, -1, 0)                              # (V, ...)
+            st = xp.take_along_axis(NCCx, sel, axis=0)                 # (V, ...) NCC(ref, v); -2 for v == ref
+            varis = VAR
+            score = backend.topk_mean(st, topk)
+            varR = xp.take_along_axis(varis, ref[None], axis=0)[0]
             # NCC on near-uniform patches is noise: scale it by texture strength so such cells
             # give a flat (neutral) cost and SGM fills them from their textured surroundings
             tex_w = xp.clip(xp.sqrt(xp.maximum(varR, 0.0)) / opt.full_texture, 0.0, 1.0)
-            ok = xp.isfinite(xp.min(dist, axis=0)) & (varR > opt.min_texture)
+            ok = xp.isfinite(dmin) & (varR > opt.min_texture)
             score = xp.where(ok, score * tex_w, 0.0).astype(xp.float32)
             if not want_rgb:
                 return score
@@ -281,22 +289,26 @@ def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions
                 # textured surfaces (flat roofs, fields) inherit heights from their edges
                 step = gsd_l
                 cands = np.arange(zlo, zhi + step, step).astype(np.float32)
-                vol = np.stack([backend.to_numpy(score_at(xp.full((HH, WW), float(z), xp.float32),
-                                                          level, gsd_l, X0, Y0)) for z in cands])
+                # all height hypotheses in one batched evaluation (few, large GPU launches)
+                vol = []
+                for c0 in range(0, len(cands), 64):
+                    zs = cands[c0:c0 + 64]
+                    Zst = backend.asarray(np.broadcast_to(zs[:, None, None], (len(zs), HH, WW)), xp.float32)
+                    vol.append(backend.to_numpy(score_at(Zst, level, gsd_l, X0, Y0)))
+                vol = np.concatenate(vol)
                 cost = np.ascontiguousarray(1.0 - np.clip(vol, -1.0, 1.0), np.float32)
                 agg = _mvs.sgm(cost, opt.sgm_p1, opt.sgm_p2)
                 bi = np.argmin(agg, axis=0)
-                bestZ = xp.asarray(cands[bi])
+                bestZ = backend.asarray(cands[bi], xp.float32)
             else:
                 prev = xp.repeat(xp.repeat(Zbest, 2, axis=0), 2, axis=1)[:HH, :WW]
                 if prev.shape != (HH, WW):
                     prev = xp.pad(prev, ((0, HH - prev.shape[0]), (0, WW - prev.shape[1])), mode="edge")
                 step = gsd_l
                 offs = np.arange(-opt.refine_steps, opt.refine_steps + 1) * step
-                scores = xp.stack([score_at((prev + xp.float32(o)).astype(xp.float32), level, gsd_l, X0, Y0)
-                                   for o in offs])
-                bi = xp.argmax(scores, axis=0)
-                bestS = xp.take_along_axis(scores, bi[None], axis=0)[0]
+                Zst = (prev[None] + backend.asarray(offs[:, None, None], xp.float32)).astype(xp.float32)
+                scores = score_at(Zst, level, gsd_l, X0, Y0)
+                bi, bestS = backend.argmax0(scores)
                 weak = bestS < opt.refine_min_score    # no texture support: keep the coarse surface
                 bi = xp.where(weak, opt.refine_steps, bi)
                 bestS = xp.take_along_axis(scores, bi[None], axis=0)[0]
@@ -310,7 +322,7 @@ def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions
                     ok = (den < -1e-6) & (bi > 0) & (bi < len(offs) - 1)
                     den = xp.where(ok, den, -1.0)
                     sub = xp.where(ok, xp.clip(0.5 * (s_lo - s_hi) / den, -0.5, 0.5), 0.0)
-                bestZ = prev + xp.asarray(offs, xp.float32)[bi] + sub.astype(xp.float32) * xp.float32(step)
+                bestZ = prev + backend.asarray(offs, xp.float32)[bi] + sub.astype(xp.float32) * float(step)
             Zbest = _median3(xp, bestZ.astype(xp.float32)).astype(xp.float32) if level > 0 else bestZ.astype(xp.float32)
 
         # final pass at the chosen heights: score, agreeing views, colour
@@ -369,8 +381,17 @@ def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions
             for res in ex.map(process, ordered):
                 consume(res)
     else:
-        for t in ordered:
-            consume(process(t))
+        # GPU: tiles run one at a time; decode the views of the next tiles in background threads
+        setups = [tile_setup(t) for t in ordered]
+        prefetched = set()
+        with ThreadPoolExecutor(max(2, workers)) as ex:
+            for k, t in enumerate(ordered):
+                for nxt in setups[k + 1:k + 3]:
+                    for v in (nxt[-1] if nxt else []):
+                        if v not in prefetched:
+                            prefetched.add(v)
+                            ex.submit(cache.get, v)
+                consume(process(t, setups[k]))
     Zout = np.where(Wacc > 0, Zacc / np.maximum(Wacc, 1e-6), np.nan).astype(np.float32)
     del Zacc, Wacc
     log.info("Dense sweep done in %.1fs (%d image loads)", time.time() - t0, cache.loads)

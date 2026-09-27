@@ -1,4 +1,4 @@
-"""Compute backends: Cython (CPU) and CUDA (via CuPy raw kernels).
+"""Compute backends: Cython (CPU), CUDA (CuPy raw kernels) and Apple GPU (Metal via MLX).
 
 Both expose the same small interface used by the pipeline:
 
@@ -11,6 +11,8 @@ Both expose the same small interface used by the pipeline:
     xp                                    -> array module (numpy / cupy) for dense 3D
     sample_view(img, cam, X0, Y0, gsd, Z) -> (samples (H,W,ch) float32, valid (H,W))
     to_numpy(a)                           -> numpy array
+    box(a, r)                             -> (2r+1)^2 window mean (dense matching)
+    asarray(a, dtype)                     -> device array
 """
 from __future__ import annotations
 
@@ -58,16 +60,47 @@ class CPUBackend:
         return _core.finalize(acc, wsum, int(mode))
 
     def sample_view(self, img, cam, X0, Y0, gsd, Z):
+        """Z: (H, W) heights, or a (D, H, W) stack of height hypotheses."""
         R, C, f, k1, k2, cx, cy = cam
         Z = np.ascontiguousarray(Z, np.float32)
         out = np.zeros(Z.shape + (img.shape[2],), np.float32)
         valid = np.zeros(Z.shape, np.uint8)
-        _mvs.sample_view(img, R, C, float(f), float(k1), float(k2), float(cx), float(cy),
-                         float(X0), float(Y0), float(gsd), Z, out, valid)
+        Zs, os_, vs = Z.reshape((-1,) + Z.shape[-2:]), out.reshape((-1,) + out.shape[-3:]), valid.reshape((-1,) + Z.shape[-2:])
+        for d in range(Zs.shape[0]):
+            _mvs.sample_view(img, R, C, float(f), float(k1), float(k2), float(cx), float(cy),
+                             float(X0), float(Y0), float(gsd), Zs[d], os_[d], vs[d])
         return out, valid
 
     def to_numpy(self, a):
         return np.asarray(a)
+
+    def box(self, a, r):
+        return _box_cumsum(np, a, r)
+
+    def asarray(self, a, dtype=None):
+        return np.asarray(a, dtype)
+
+    def argmin0(self, a):
+        idx = np.argmin(a, axis=0)
+        return idx, np.take_along_axis(a, idx[None], axis=0)[0]
+
+    def argmax0(self, a):
+        idx = np.argmax(a, axis=0)
+        return idx, np.take_along_axis(a, idx[None], axis=0)[0]
+
+    def topk_mean(self, st, k):
+        """Mean of the k largest values along axis 0."""
+        n = st.shape[0]
+        return np.partition(st, n - k, axis=0)[n - k:].mean(axis=0)
+
+
+def _box_cumsum(xp, a, r):
+    """Mean over a (2r+1)^2 window (zero padding) via float64 summed-area tables."""
+    k = 2 * r + 1
+    p = xp.pad(a.astype(xp.float64), [(0, 0)] * (a.ndim - 2) + [(r + 1, r), (r + 1, r)])
+    c = xp.cumsum(xp.cumsum(p, axis=-2), axis=-1)
+    s = c[..., k:, k:] - c[..., :-k, k:] - c[..., k:, :-k] + c[..., :-k, :-k]
+    return (s / (k * k)).astype(xp.float32)
 
 
 def _as_u64(d: np.ndarray) -> np.ndarray:
@@ -107,9 +140,43 @@ def cuda_available() -> bool:
         return False
 
 
+def mps_available() -> bool:
+    """Apple-silicon GPU usable through MLX (pip install "pyOrthomosaic[mps]")."""
+    if os.environ.get("ORTHO_DISABLE_MPS") == "1":
+        return False
+    import platform
+    import sys
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        return False
+    try:
+        import mlx.core as mx
+        return bool(mx.metal.is_available())
+    except Exception:
+        return False
+
+
+def _select_mps(prefer):
+    try:
+        from ._mlx import MLXBackend
+        be = MLXBackend()
+        log.info("Using Apple GPU backend: %s", be.device_name)
+        return be
+    except Exception as exc:
+        msg = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        if prefer in ("mps", "metal"):
+            raise RuntimeError(f"Apple GPU (MPS) backend unusable: {msg}") from exc
+        log.warning("Apple GPU present but unusable (%s); falling back to CPU", msg)
+        return None
+
+
 def select_backend(prefer: str = "auto"):
-    """prefer: 'auto' | 'cuda' | 'cpu'."""
+    """prefer: 'auto' (CUDA > Apple GPU > CPU) | 'cuda' | 'mps' | 'cpu'."""
     prefer = prefer.lower()
+    if prefer in ("mps", "metal"):
+        if not mps_available():
+            raise RuntimeError("MPS backend requested but no Apple-silicon GPU / MLX found. "
+                               'Install it with: pip install "pyOrthomosaic[mps]"')
+        return _select_mps(prefer)
     if prefer in ("auto", "cuda", "gpu"):
         if cuda_available():
             try:
@@ -126,5 +193,9 @@ def select_backend(prefer: str = "auto"):
                 log.warning("CUDA present but unusable (%s); falling back to CPU", msg)
         elif prefer != "auto":
             raise RuntimeError("CUDA backend requested but no CUDA device / CuPy found")
+    if prefer == "auto" and mps_available():
+        be = _select_mps(prefer)
+        if be is not None:
+            return be
     log.info("Using CPU backend (Cython, %d threads)", os.cpu_count() or 1)
     return CPUBackend()
