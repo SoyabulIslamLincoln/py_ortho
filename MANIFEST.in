@@ -1,0 +1,5 @@
+include README.md
+include orthomosaic/*.pyx
+exclude orthomosaic/*.c
+global-exclude *.so *.pyd __pycache__/*
+recursive-include tests *.py

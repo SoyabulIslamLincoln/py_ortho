@@ -1,0 +1,9 @@
+.venv/
+build/
+dist/
+wheelhouse/
+*.egg-info/
+__pycache__/
+orthomosaic/_core.c
+*.so
+*.pyd

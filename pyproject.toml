@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61", "wheel", "cython>=3.0", "numpy>=1.21"]
+build-backend = "setuptools.build_meta"
+
+[project]
+authors = [{ name = "Soyabul Islam Lincoln", email = "islamsoyabul98@gmail.com" }]
+license = "MIT"
+name = "orthomosaic"
+version = "0.1.0"
+description = "Native (Cython + optional CUDA) orthomosaic generator for nadir drone imagery"
+readme = "README.md"
+requires-python = ">=3.9"
+keywords = ["orthomosaic", "drone", "photogrammetry", "gis", "geotiff", "cuda", "cython"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Cython",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = ["numpy>=1.21", "pillow>=9.0"]
+
+[project.optional-dependencies]
+cuda = ["cupy-cuda12x"]
+
+[project.scripts]
+orthomosaic = "orthomosaic.__main__:main"
+
+[tool.setuptools]
+packages = ["orthomosaic"]
+
+[tool.cibuildwheel]
+build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
+skip = "*-musllinux_i686 *-win32 *-manylinux_i686"
+test-command = "python {project}/tests/test_core.py"
