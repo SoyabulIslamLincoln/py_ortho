@@ -185,9 +185,48 @@ def _norm_coords(pts, c, s):
     return np.column_stack([q, np.ones(len(q))])
 
 
+def pair_residuals_px(al: "Alignment", pairs: list[PairMatch]) -> np.ndarray:
+    """RMS disagreement of each pair after the solve, in pixels of image i
+    (NaN for pairs outside the solved block)."""
+    out = np.full(len(pairs), np.nan)
+    for k, p in enumerate(pairs):
+        if p.i in al.affines and p.j in al.affines:
+            Ai, Aj = al.affines[p.i], al.affines[p.j]
+            a = p.pi @ Ai[:, :2].T + Ai[:, 2]
+            b = p.pj @ Aj[:, :2].T + Aj[:, 2]
+            scale_i = np.sqrt(abs(np.linalg.det(Ai[:, :2])))
+            out[k] = np.sqrt(np.mean(np.sum((a - b) ** 2, axis=1))) / max(scale_i, 1e-12)
+    return out
+
+
 def solve_alignment(frames, pairs: list[PairMatch], positions: Optional[np.ndarray],
                     gps_sigma: float = 3.0, match_sigma_px: float = 4.0,
-                    linear_prior_rel: float = 0.1) -> Alignment:
+                    linear_prior_rel: float = 0.1, min_reject_px: float = 10.0,
+                    max_rounds: int = 15) -> tuple[Alignment, list[PairMatch]]:
+    """Robust global alignment: solve, drop pairs that disagree with the block
+    (false matches, e.g. on repetitive roofs), re-solve until stable.
+    Returns (alignment, pairs that survived)."""
+    active = list(pairs)
+    for rnd in range(max_rounds):
+        al = _solve_once(frames, active, positions, gps_sigma, match_sigma_px, linear_prior_rel)
+        r = pair_residuals_px(al, active)
+        ok = np.isfinite(r)
+        med = float(np.median(r[ok])) if ok.any() else 0.0
+        thr = max(min_reject_px, 3.0 * 1.4826 * med)
+        bad = ok & (r > thr)
+        if not bad.any():
+            break
+        # drop the worst offenders first; a single bad pair skews its neighbours too
+        worst = np.argsort(-np.where(bad, r, -np.inf))[:max(1, int(bad.sum()) // 2)]
+        log.info("  robust solve round %d: median pair error %.1f px, dropping %d pair(s) above %.1f px",
+                 rnd + 1, med, len(worst), thr)
+        drop = set(worst)
+        active = [p for k, p in enumerate(active) if k not in drop]
+    return al, active
+
+
+def _solve_once(frames, pairs: list[PairMatch], positions: Optional[np.ndarray],
+                gps_sigma: float, match_sigma_px: float, linear_prior_rel: float) -> Alignment:
     n_all = len(frames)
     used = largest_component(n_all, pairs)
     local = {g: l for l, g in enumerate(used)}

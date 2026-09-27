@@ -114,7 +114,7 @@ def build_orthomosaic(images: Union[str, Sequence[str]], output: str,
         raise RuntimeError("No image pairs could be matched; check overlap / image quality")
 
     # ---- global alignment
-    al = solve_alignment(frames, pairs, positions, opt.gps_sigma, opt.match_sigma_px)
+    al, pairs = solve_alignment(frames, pairs, positions, opt.gps_sigma, opt.match_sigma_px)
     dropped = [frames[k].name for k in range(len(frames)) if k not in set(al.used)]
     if dropped:
         log.warning("%d image(s) not connected to the main block were skipped: %s",
