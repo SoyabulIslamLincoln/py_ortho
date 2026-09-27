@@ -5,7 +5,10 @@ import tempfile
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:  # prefer the installed package (CI tests the built wheel, not the source tree)
+    import orthomosaic._core  # noqa: F401
+except ImportError:  # running from a source checkout after `build_ext --inplace`
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from orthomosaic import _core, align, geo  # noqa: E402
 from orthomosaic.geotiff import GeoTIFFWriter  # noqa: E402
 
