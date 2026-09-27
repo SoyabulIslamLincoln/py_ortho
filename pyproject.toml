@@ -37,3 +37,7 @@ test-command = "python {project}/tests/test_core.py"
 manylinux-x86_64-image = "manylinux_2_28"
 manylinux-aarch64-image = "manylinux_2_28"
 environment = { PIP_PREFER_BINARY = "1" }
+
+[tool.cibuildwheel.macos]
+# macOS 14 (Sonoma) and newer only, on both Apple Silicon and Intel
+environment = { PIP_PREFER_BINARY = "1", MACOSX_DEPLOYMENT_TARGET = "14.0" }
