@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 authors = [{ name = "Soyabul Islam Lincoln", email = "islamsoyabul98@gmail.com" }]
 license = "MIT"
-name = "orthomosaic"
+name = "pyOrthomosaic"
 version = "0.1.0"
 description = "Native (Cython + optional CUDA) orthomosaic generator for nadir drone imagery"
 readme = "README.md"

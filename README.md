@@ -8,6 +8,17 @@ Runtime dependencies: `numpy` and `pillow` (plus `cupy` only if you want the GPU
 
 ## Install
 
+From PyPI (prebuilt wheels for Linux, Windows and macOS 14+):
+
+```bash
+pip install pyOrthomosaic            # CPU
+pip install "pyOrthomosaic[cuda]"    # + NVIDIA GPU support via CuPy
+```
+
+The package is installed as `pyOrthomosaic` but imported as `orthomosaic`.
+
+From source:
+
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install numpy cython pillow setuptools
