@@ -14,12 +14,13 @@ else:
 
 extensions = [
     Extension(
-        "orthomosaic._core",
-        ["orthomosaic/_core.pyx"],
+        f"orthomosaic.{name}",
+        [f"orthomosaic/{name}.pyx"],
         include_dirs=[np.get_include()],
         define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
         extra_compile_args=compile_args,
     )
+    for name in ("_core", "_ba", "_mvs")
 ]
 
 setup(ext_modules=cythonize(extensions, compiler_directives={"language_level": "3"}))

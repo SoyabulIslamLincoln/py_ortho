@@ -4,6 +4,6 @@ dist/
 wheelhouse/
 *.egg-info/
 __pycache__/
-orthomosaic/_core.c
+orthomosaic/*.c
 *.so
 *.pyd

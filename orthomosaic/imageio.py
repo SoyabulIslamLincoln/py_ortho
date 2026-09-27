@@ -28,6 +28,9 @@ class Frame:
     focal_mm: Optional[float] = None
     focal35_mm: Optional[float] = None
     orientation: int = 1
+    rel_alt: Optional[float] = None     # DJI XMP: height above take-off (m)
+    abs_alt: Optional[float] = None     # DJI XMP: absolute altitude (m)
+    gimbal_pitch: Optional[float] = None
     # filled by the pipeline
     E: Optional[float] = None
     N: Optional[float] = None
@@ -67,6 +70,26 @@ def list_images(folder: str) -> list[str]:
     return files
 
 
+_XMP_KEYS = {"RelativeAltitude": "rel_alt", "AbsoluteAltitude": "abs_alt", "GimbalPitchDegree": "gimbal_pitch"}
+
+
+def _read_dji_xmp(path: str, fr: "Frame"):
+    """Pull a few DJI XMP fields straight from the JPEG header (no XML parser needed)."""
+    import re
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(256 * 1024)
+    except OSError:
+        return
+    for key, attr in _XMP_KEYS.items():
+        m = re.search(rb'drone-dji:' + key.encode() + rb'="([-+0-9.eE]+)"', head)
+        if m:
+            try:
+                setattr(fr, attr, float(m.group(1)))
+            except ValueError:
+                pass
+
+
 def read_frame(path: str) -> Frame:
     with Image.open(path) as im:
         w, h = im.size
@@ -96,6 +119,7 @@ def read_frame(path: str) -> Frame:
                 fr.focal35_mm = float(ex[_TAG_FOCAL35])
         except Exception:
             pass
+    _read_dji_xmp(path, fr)
     return fr
 
 

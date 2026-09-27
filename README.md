@@ -24,7 +24,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install numpy cython pillow setuptools
 python setup.py build_ext --inplace          # compiles orthomosaic/_core.pyx
 # optional GPU (Linux/Windows + NVIDIA driver), pick the wheel matching your CUDA major:
-pip install cupy-cuda12x
+pip install "cupy-cuda12x[ctk]"   # [ctk] brings the CUDA headers CuPy compiles kernels with
 ```
 
 `ORTHO_NATIVE=1 python setup.py build_ext --inplace` adds `-march=native` for a few % extra.
@@ -100,19 +100,69 @@ python tests/synthetic.py eval /tmp/syn/images /tmp/syn/ortho.tif
 python tests/test_core.py
 ```
 
+## 3D reconstruction (DSM, true orthophoto, point cloud, mesh)
+
+The 3D mode is for nadir grid flights. It produces a 2.5D reconstruction: surfaces seen from
+above (roofs, ground, trees), but not walls.
+
+```bash
+orthomosaic-3d /path/to/images -o recon/          # or: python -m orthomosaic.reconstruct ...
+```
+
+```python
+from orthomosaic import build_3d, Options3D
+report = build_3d("images/", "recon/", Options3D(dsm_resolution=0.05))
+```
+
+Outputs, all in the same local height datum (height above take-off when DJI relative altitude is
+present; `report.json` gives the offset to absolute altitude):
+
+| File | Content |
+|---|---|
+| `dsm.tif` | Float32 elevation GeoTIFF (nodata -9999) |
+| `orthophoto.tif` | **True** orthophoto rendered on the DSM, so buildings don't lean |
+| `dense.las`, `dense.ply` | Coloured dense point cloud (LAS 1.2 with EPSG, and binary PLY) |
+| `mesh.glb`, `mesh.obj` | Textured surface mesh (glTF 2.0 and OBJ+MTL+JPEG) |
+| `sparse.ply`, `report.json` | SfM points, camera poses and intrinsics, statistics |
+| `dsm_preview.png`, `orthophoto_preview.jpg` | Quick looks |
+
+How it works:
+
+1. **Structure from motion.** The 2D alignment gives the initial poses. Matches are verified with a
+   plane+parallax test, which unlike the 8-point method doesn't degenerate on flat scenes. Matches are
+   linked into multi-view tracks and triangulated. A **Cython bundle adjustment** (Levenberg–Marquardt,
+   Schur complement, Huber loss) refines everything using GPS and DJI altitude priors, and
+   self-calibrates the radial distortion.
+2. **Dense matching.** A coarse-to-fine *height sweep* over a ground grid. Photo-consistency is
+   texture-weighted NCC against a per-cell reference view (the most nadir camera), taken over the
+   best half of the other views to handle occlusion. The coarse level is regularised by 8-direction
+   **semi-global matching**, so weakly textured roofs take their height from their edges. The same
+   code runs on numpy (Cython sampler) or CuPy (CUDA kernel).
+3. **Products.** Outlier removal and smooth push-pull hole filling, a true orthophoto that blends only
+   the views agreeing at each cell's height, point clouds, and a grid mesh that keeps ridges and walls
+   sharp.
+
+Focal length: straight-down imagery can't separate focal length from depth. Scaling both together
+gives identical images, and relative altitude does not resolve this. The focal length is therefore
+held at the EXIF value (35 mm-equivalent), and heights inherit its accuracy (about 1–2%). Pass
+`Options3D(refine_focal=True)` only for flights with large altitude changes.
+
+Synthetic check (`tests/synthetic3d.py`: 48 images, 22 buildings 4–15 m tall with walls, lens
+distortion, 1° tilts, 1.5 m GPS noise):
+- cameras 0.25 m / 0.2° from truth, distortion recovered;
+- confidently matched DSM cells 0.12 m median error at a 10.5 cm cell size;
+- 45 s on 8 CPU cores.
+
+Flat, untextured areas and building edges are the weak spots: they are interpolated or slightly
+"fattened".
+
 ## Scope and limitations
 
-This is a **planar (2D) orthomosaic**: each image is mapped to the ground with an affine transform.
-It is accurate for nadir imagery over terrain that is flat or gently rolling relative to the
-flight altitude, which covers typical agricultural, thermal and mapping surveys.
-
-It does **not** do:
-- full structure-from-motion or DEM-based orthorectification,
-- correction for lens distortion,
-- correction for gimbal pitch.
-
-Tall buildings and steep terrain will therefore show relief displacement or ghosting. `--blend seam`
-reduces the ghosting. The natural next steps are:
-- a Brown–Conrady undistortion pass,
-- a homography or bundle-adjusted camera model,
-- a coarse DEM from triangulated tie points.
+- **2D mode** (`orthomosaic`) is a planar mosaic. It is fast, but tall objects lean. For roofs and
+  other relief, use the true orthophoto from the 3D mode.
+- **3D mode** is 2.5D (one height per ground cell). Walls, overhangs and oblique/orbit flights aren't
+  modelled.
+- Thermal imagery has little texture, so its DSM is noticeably less reliable than RGB. Prefer the RGB
+  DSM for geometry.
+- Gimbal pitch isn't assumed to be nadir: tilts are solved in the bundle adjustment. Strongly oblique
+  shots should still be excluded.

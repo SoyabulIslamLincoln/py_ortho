@@ -52,10 +52,25 @@ def _absolute(A, origin):
     return A.tolist()
 
 
-def build_orthomosaic(images: Union[str, Sequence[str]], output: str,
-                      options: Optional[Options] = None) -> dict:
-    opt = options or Options()
-    t0 = time.time()
+@dataclass
+class AlignResult:
+    """Everything the 2D alignment produced; reused by the 3D reconstruction."""
+    frames: list
+    feats: list
+    work_scale: float
+    pairs: list
+    candidates: int
+    alignment: object
+    positions: Optional[np.ndarray]
+    epsg: Optional[int]
+    origin: tuple
+    backend: object
+    workers: int
+    dropped: list
+
+
+def align_images(images: Union[str, Sequence[str]], opt: Options) -> AlignResult:
+    """Metadata -> features -> matching -> robust global 2D alignment."""
     workers = opt.workers or os.cpu_count() or 1
     backend = select_backend(opt.backend)
 
@@ -82,7 +97,7 @@ def build_orthomosaic(images: Union[str, Sequence[str]], output: str,
         log.info("GPS found for %d/%d images -> UTM zone %d%s (EPSG:%d)",
                  len(gps_idx), len(frames), zone, "N" if north else "S", epsg)
     else:
-        log.warning("No usable GPS: output will be a non-georeferenced mosaic")
+        log.warning("No usable GPS: output will not be georeferenced")
 
     # ---- features
     log.info("Extracting features (%d workers)", workers)
@@ -121,6 +136,17 @@ def build_orthomosaic(images: Union[str, Sequence[str]], output: str,
                     len(dropped), ", ".join(dropped[:10]) + (" ..." if len(dropped) > 10 else ""))
     log.info("Aligned %d images, georeferenced=%s, native GSD=%.4f, match RMS=%.2f px",
              len(al.used), al.georeferenced, al.gsd, al.residual_px)
+    return AlignResult(frames, feats, work_scale, pairs, len(cand), al, positions, epsg, origin,
+                       backend, workers, dropped)
+
+
+def build_orthomosaic(images: Union[str, Sequence[str]], output: str,
+                      options: Optional[Options] = None) -> dict:
+    opt = options or Options()
+    t0 = time.time()
+    ar = align_images(images, opt)
+    frames, pairs, al, backend = ar.frames, ar.pairs, ar.alignment, ar.backend
+    epsg, origin, workers, dropped, cand = ar.epsg, ar.origin, ar.workers, ar.dropped, ar.candidates
 
     gains = solve_gains(al.used, pairs) if opt.exposure_compensation else {}
 
@@ -137,7 +163,7 @@ def build_orthomosaic(images: Union[str, Sequence[str]], output: str,
     report = dict(
         output=output, preview=preview_path, backend=backend.name,
         images_total=len(frames), images_used=len(al.used), images_dropped=dropped,
-        pairs_candidate=len(cand), pairs_verified=len(pairs),
+        pairs_candidate=cand, pairs_verified=len(pairs),
         georeferenced=al.georeferenced, epsg=epsg if al.georeferenced else None,
         gsd=gsd, match_rms_px=al.residual_px, seconds=round(time.time() - t0, 1),
         options=asdict(opt), **info,
