@@ -34,6 +34,8 @@ class Options3D(Options):
     max_views: int = 6
     min_score: float = 0.5
     ncc_window: int = 3
+    dsm_smooth: float = 0.45                 # edge-preserving surface smoothing height scale (m); 0 = off
+    dsm_smooth_iters: int = 2
     tile: int = 160
     cloud_step: int = 1                     # keep every n-th confident DSM cell in the dense cloud
     mesh_max_vertices: int = 1_500_000
@@ -147,7 +149,8 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     dopt = mvs.DenseOptions(gsd=opt.dsm_resolution, max_views=opt.max_views, min_score=opt.min_score,
                             window=opt.ncc_window, tile=opt.tile, cache_mb=opt.cache_mb, workers=ar.workers)
     dense = mvs.dense_reconstruct(ar, rec, gains, al.gsd, dopt)
-    dsm, conf = mvs.postprocess(dense, opt.min_score)
+    dsm, conf = mvs.postprocess(dense, opt.min_score, smooth_range=opt.dsm_smooth,
+                                smooth_iters=opt.dsm_smooth_iters)
     gsd = dense.gsd
     covered = np.isfinite(dsm)
     origin_xy = (dense.minX + ox, dense.maxY + oy)

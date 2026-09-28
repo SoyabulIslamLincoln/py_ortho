@@ -57,10 +57,11 @@ def test_point_prior_pulls_point():
     pw[5] = 1e6
     pt[5] = X[5] + [2.0, -1.0, 0.5]
     S, g, Vinv, gp, cost, dU = _ba.reduced_system(R, C, X, intr, pp, cg, oc, uv, ptr, 1e9, 1e-6, pw, pt)
+    S = S + np.diag(np.full(S.shape[0], 1e10))   # pin cameras + intrinsics: isolate the point prior
     dc = np.linalg.solve(S + 1e-6 * np.eye(S.shape[0]), -g)
     dp = _ba.back_substitute(R, C, X, intr, pp, cg, oc, uv, ptr, 1e9, Vinv, gp, dc)
-    assert np.linalg.norm(dp[5] - [2.0, -1.0, 0.5]) < 0.2                 # point 5 moves to target
-    assert np.median(np.linalg.norm(np.delete(dp, 5, 0), axis=1)) < 0.1   # others barely move
+    assert np.linalg.norm(dp[5] - [2.0, -1.0, 0.5]) < 0.2                 # point 5 moves to its target
+    assert np.median(np.linalg.norm(np.delete(dp, 5, 0), axis=1)) < 0.05  # others barely move
 
 
 def _synthetic_block(shift):

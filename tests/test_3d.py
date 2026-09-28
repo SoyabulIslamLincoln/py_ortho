@@ -71,6 +71,17 @@ def test_sgm_prefers_smooth_labels():
     assert (np.abs(lab - 7) <= 1).mean() > 0.97   # propagated (within one height step) across the rest
 
 
+def test_bilateral_preserves_edges():
+    rng = np.random.default_rng(5)
+    z = np.zeros((60, 60), np.float32)
+    z[:, 30:] = 10.0                                  # a sharp 10 m building edge
+    z += rng.normal(0, 0.25, z.shape).astype(np.float32)   # surface noise
+    v = np.ones((60, 60), np.uint8)
+    o = _mvs.bilateral(np.ascontiguousarray(z), v, 3, 0.5, 2.0)
+    assert o[10:50, 5:20].std() < 0.4 * z[10:50, 5:20].std()   # flat regions much smoother
+    assert abs((o[30, 40] - o[30, 15]) - 10.0) < 0.3           # 10 m step preserved
+
+
 def test_fill_holes_smooth():
     z = np.fromfunction(lambda y, x: 0.01 * x + 0.02 * y, (120, 160)).astype(np.float32)
     t = z.copy()

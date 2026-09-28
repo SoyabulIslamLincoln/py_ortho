@@ -461,15 +461,32 @@ def fill_holes(Z: np.ndarray) -> np.ndarray:
     return filled.astype(np.float32)
 
 
-def postprocess(d: DenseResult, min_score: float, max_dev: float = 1.0):
-    """Returns (dsm_filled, confident_mask). Low-confidence cells and isolated spikes
-    are removed, then holes inside the covered area are interpolated."""
+def postprocess(d: DenseResult, min_score: float, max_dev: float = 1.0,
+                smooth_range: float = 0.4, smooth_iters: int = 2):
+    """Returns (dsm_filled, confident_mask).
+
+    1. Drop low-confidence cells and isolated spikes (blunders that would otherwise pit the roof).
+    2. Interpolate holes inside the covered area.
+    3. Edge-preserving surface smoothing: flat surfaces (roofs, ground) are de-noised while the
+       tall step at a building edge is kept sharp -- this is what makes roofs read flat and edges
+       crisp instead of bumpy and fuzzy. `smooth_range` is the height scale (m) treated as "same
+       surface"; larger values smooth more but may round off low kerbs.
+    """
     conf = (d.score >= min_score) & np.isfinite(d.Z)
     Zc = np.where(conf, d.Z, np.nan).astype(np.float32)
-    med = _nanmedian_filter(Zc, 2)
-    spikes = conf & (np.abs(Zc - med) > max_dev)
-    conf &= ~spikes
-    Zc[spikes] = np.nan
+    # progressive spike removal: coarse blunders first, then finer speckle against a wider median
+    for thr, r in ((max_dev, 2), (0.6 * max_dev, 2), (0.4 * max_dev, 3)):
+        med = _nanmedian_filter(Zc, r)
+        spikes = np.isfinite(Zc) & (np.abs(Zc - med) > thr)
+        conf &= ~spikes
+        Zc[spikes] = np.nan
     filled = fill_holes(Zc)
     filled[~d.covered] = np.nan
+    # edge-preserving smoothing on the covered area
+    if smooth_range > 0 and smooth_iters > 0:
+        vmask = np.isfinite(filled).astype(np.uint8)
+        z = np.nan_to_num(filled, nan=0.0).astype(np.float32)
+        for _ in range(smooth_iters):
+            z = _mvs.bilateral(np.ascontiguousarray(z), vmask, 3, float(smooth_range), 2.0)
+        filled = np.where(d.covered, z, np.nan).astype(np.float32)
     return filled, conf

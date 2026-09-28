@@ -108,3 +108,46 @@ def sgm(const float[:, :, ::1] cost, float P1, float P2):
                     for d in range(D):
                         agg[d, y, x] += L[d, y, x]
     return agg_np
+
+
+def bilateral(const float[:, ::1] Z, const unsigned char[:, ::1] valid, int radius,
+              float sigma_r, float sigma_s):
+    """Edge-preserving surface filter. Each valid cell becomes the range- and distance-weighted
+    average of valid neighbours whose height is close to it, so flat surfaces (roofs, ground) are
+    smoothed while the tall step at a building edge is preserved (its neighbours across the step are
+    down-weighted by the range term). NaN/invalid cells are ignored and stay unchanged."""
+    cdef Py_ssize_t H = Z.shape[0], W = Z.shape[1], y, x, yy, xx
+    cdef int dy, dx
+    out_np = np.array(Z, copy=True)
+    cdef float[:, ::1] out = out_np
+    cdef float z0, zk, wsum, asum, dr, w
+    cdef float inv_r = 1.0 / (2.0 * sigma_r * sigma_r)
+    cdef float inv_s = 1.0 / (2.0 * sigma_s * sigma_s)
+    cdef float[:, ::1] sw = np.empty((2 * radius + 1, 2 * radius + 1), np.float32)
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            sw[dy + radius, dx + radius] = <float>(2.718281828 ** (-(dy * dy + dx * dx) * inv_s))
+    with nogil:
+        for y in range(H):
+            for x in range(W):
+                if valid[y, x] == 0:
+                    continue
+                z0 = Z[y, x]
+                wsum = 0.0
+                asum = 0.0
+                for dy in range(-radius, radius + 1):
+                    yy = y + dy
+                    if yy < 0 or yy >= H:
+                        continue
+                    for dx in range(-radius, radius + 1):
+                        xx = x + dx
+                        if xx < 0 or xx >= W or valid[yy, xx] == 0:
+                            continue
+                        zk = Z[yy, xx]
+                        dr = zk - z0
+                        w = sw[dy + radius, dx + radius] * <float>(2.718281828 ** (-dr * dr * inv_r))
+                        wsum += w
+                        asum += w * zk
+                if wsum > 0:
+                    out[y, x] = asum / wsum
+    return out_np
