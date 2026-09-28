@@ -102,6 +102,41 @@ python tests/synthetic.py eval /tmp/syn/images /tmp/syn/ortho.tif
 python tests/test_core.py
 ```
 
+## Digital Terrain Model
+
+`build_3d` derives the bare ground from the DSM. You can also run it on any existing DSM GeoTIFF:
+
+```bash
+python -m orthomosaic.terrain recon/dsm.tif -o dtm.tif --ndsm height_above_ground.tif --max-object 80
+```
+
+```python
+from orthomosaic import dtm_from_dsm, TerrainOptions
+dtm, ground_mask = dtm_from_dsm(dsm_array, cell_size_m, TerrainOptions(max_object_size=80))
+```
+
+How it works:
+
+1. The DSM is resampled to a coarse grid (0.25–1 m) using each block's 25th percentile, which is
+   robust to stereo noise.
+2. Low blunders (cells more than 1 m below their neighbourhood) are dropped, so they can't dig pits
+   into the terrain.
+3. A **progressive morphological filter** runs openings with windows growing up to
+   `max_object_size`. A slope-dependent height threshold separates objects from ground.
+4. Detected objects are buffered by 1 m to remove stereo "fattening" at edges.
+5. The ground is interpolated underneath the objects, refined at full resolution, lightly smoothed,
+   and never allowed above the real surface.
+
+`max_object_size` (`--dtm-max-object`, default 60 m) must be larger than the short side of your
+largest building. Anything wider is treated as terrain.
+
+Synthetic check (known bare ground under 22 buildings):
+- 99.4% of raised building cells removed;
+- terrain error 0.16 m median in the open and 0.20 m under buildings.
+
+Both are limited mainly by DSM noise. The largest errors sit at the edge of the surveyed area,
+where the DSM itself is extrapolated.
+
 ## GPU backends
 
 | Backend | Hardware | How |
@@ -173,9 +208,11 @@ present; `report.json` gives the offset to absolute altitude):
 
 | File | Content |
 |---|---|
-| `dsm.tif` | Float32 elevation GeoTIFF (nodata -9999) |
+| `dsm.tif` | Digital Surface Model: float32 elevation GeoTIFF including buildings and trees (nodata -9999) |
+| `dtm.tif` | Digital Terrain Model: bare ground, with buildings, vegetation and cars removed |
+| `ndsm.tif` | Height above ground (DSM − DTM): building and tree heights |
 | `orthophoto.tif` | **True** orthophoto rendered on the DSM, so buildings don't lean |
-| `dense.las`, `dense.ply` | Coloured dense point cloud (LAS 1.2 with EPSG, and binary PLY) |
+| `dense.las`, `dense.ply` | Coloured dense point cloud (LAS 1.2 with EPSG, and binary PLY). LAS points are classified ground (2) or unclassified (1). |
 | `mesh.glb`, `mesh.obj` | Textured surface mesh (glTF 2.0 and OBJ+MTL+JPEG) |
 | `sparse.ply`, `report.json` | SfM points, camera poses and intrinsics, statistics |
 | `dsm_preview.png`, `orthophoto_preview.jpg` | Quick looks |

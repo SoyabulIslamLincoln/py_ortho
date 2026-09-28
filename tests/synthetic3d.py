@@ -28,6 +28,13 @@ K1, K2 = -0.04, 0.01
 ALT = 60.0                          # metres above take-off (z = 0)
 
 
+def terrain_truth(h, w):
+    """Bare ground of make_scene (the height field before buildings are added)."""
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    return (1.5 * np.sin(xx / w * 2 * np.pi * 0.7 + 0.3) * np.cos(yy / h * 2 * np.pi * 0.5)
+            + 0.02 * (xx - w / 2) * CELL * 0.05).astype(np.float32)
+
+
 def make_scene(w=4800, h=3600, seed=11):
     rng = np.random.default_rng(seed)
     tex = np.asarray(make_ground(w, h, seed=seed), np.uint8).copy()
@@ -243,6 +250,21 @@ def evaluate(root, outdir):
     if rf.any():
         print(f"   roofs only: median |err| {np.median(np.abs(err[rf])):.3f} m, bias {np.median(err[rf]):+.3f} m "
               f"({rf.sum()} cells)")
+    dtm_path = os.path.join(outdir, "dtm.tif")
+    if os.path.exists(dtm_path):
+        T = terrain_truth(*Zt.shape)
+        Dt = np.asarray(_I.open(dtm_path), np.float32)
+        okd = ok & (Dt > -9000)
+        tt = T[gy[okd], gx[okd]]
+        et = Dt[okd] - tt
+        bld = (Zt - T)[gy[okd], gx[okd]] > 1.0          # under a building (interpolated there)
+        print(f"DTM vs true bare ground: median |err| {np.median(np.abs(et)):.3f} m, "
+              f"p95 {np.percentile(np.abs(et), 95):.3f} m, bias {np.median(et):+.3f} m; "
+              f"open ground {np.median(np.abs(et[~bld])):.3f} m, under buildings {np.median(np.abs(et[bld])):.3f} m")
+        Dsm_ok = D[okd]
+        shown = bld & (Dsm_ok - tt > 1.0)               # building cells the DSM actually shows as raised
+        print(f"   building removal: {100 * np.mean((Dsm_ok - Dt[okd])[shown] > 1.0):.1f}% of raised building "
+              f"cells stand > 1 m above the DTM; open ground within 0.3 m: {100 * np.mean(np.abs(et[~bld]) < 0.3):.1f}%")
 
 
 if __name__ == "__main__":

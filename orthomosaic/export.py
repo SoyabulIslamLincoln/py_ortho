@@ -35,8 +35,9 @@ def write_ply(path: str, xyz: np.ndarray, rgb: np.ndarray, offset=(0.0, 0.0, 0.0
 
 
 def write_las(path: str, xyz_abs: np.ndarray, rgb: np.ndarray, epsg: Optional[int] = None,
-              scale: float = 0.001):
-    """LAS 1.2, point format 2 (XYZ + RGB), absolute coordinates, optional EPSG GeoKey VLR."""
+              scale: float = 0.001, classification: Optional[np.ndarray] = None):
+    """LAS 1.2, point format 2 (XYZ + RGB), absolute coordinates, optional EPSG GeoKey VLR.
+    classification: optional per-point ASPRS class (1 = unclassified, 2 = ground)."""
     n = len(xyz_abs)
     mins, maxs = xyz_abs.min(0), xyz_abs.max(0)
     offset = np.floor(mins)
@@ -65,7 +66,7 @@ def write_las(path: str, xyz_abs: np.ndarray, rgb: np.ndarray, epsg: Optional[in
     q = np.round((xyz_abs - offset) / scale).astype(np.int64)
     pts["X"], pts["Y"], pts["Z"] = q[:, 0], q[:, 1], q[:, 2]
     pts["ret"] = 0b00001001          # return 1 of 1
-    pts["cls"] = 1                   # unclassified
+    pts["cls"] = 1 if classification is None else classification   # ASPRS: 1 unclassified, 2 ground
     rgb16 = rgb.astype(np.uint16) * 257
     pts["R"], pts["G"], pts["B"] = rgb16[:, 0], rgb16[:, 1], rgb16[:, 2]
     with open(path, "wb") as fh:

@@ -179,14 +179,9 @@ def legend(path: str, palette: PaletteSpec, value_range: tuple[float, float], la
 def recolor(thermal_tif: str, out_tif: str, palette: PaletteSpec = DEFAULT_PALETTE,
             value_range: Optional[tuple[float, float]] = None, legend_png: Optional[str] = None) -> str:
     """Re-render a raw-value thermal GeoTIFF (from build_orthomosaic / build_3d) with another palette."""
-    from PIL import Image
-    from .geotiff import GeoTIFFWriter
-    Image.MAX_IMAGE_PIXELS = None
-    im = Image.open(thermal_tif)
-    tags = im.tag_v2
-    val = np.asarray(im, np.float32)
-    nodata = float(tags.get(42113, "nan").strip("\x00") or "nan") if 42113 in tags else float("nan")
-    valid = np.isfinite(val) & (val != nodata)
+    from .geotiff import GeoTIFFWriter, read_geotiff
+    val, geo = read_geotiff(thermal_tif)
+    valid = np.isfinite(val)
     if value_range is None:
         value_range = tuple(float(x) for x in np.percentile(val[valid], [0.5, 99.5])) if valid.any() else (0.0, 1.0)
     lo, hi = value_range
@@ -195,16 +190,6 @@ def recolor(thermal_tif: str, out_tif: str, palette: PaletteSpec = DEFAULT_PALET
     rgba[..., :3] = palette_lut(palette)[gray]
     rgba[..., 3] = valid * 255
     rgba[~valid, :3] = 0
-    scale = tags.get(33550)
-    tie = tags.get(33922)
-    epsg = None
-    keys = tags.get(34735)
-    if keys:
-        k = list(keys)
-        for j in range(4, len(k), 4):
-            if k[j] == 3072:
-                epsg = int(k[j + 3])
-    geo = dict(epsg=epsg, origin=(tie[3], tie[4]), pixel_size=scale[0]) if scale and tie else {}
     H, W = val.shape
     w = GeoTIFFWriter(out_tif, W, H, tile=512, **geo)
     for ty in range(0, H, 512):

@@ -39,6 +39,10 @@ class Options3D(Options):
     mesh_max_vertices: int = 1_500_000
     texture_max: int = 8192
     formats: tuple = ("ply", "las", "obj", "glb")
+    # digital terrain model (bare ground)
+    dtm: bool = True
+    dtm_max_object: float = 60.0            # metres: larger than your largest building's short side
+    dtm_slope: float = 0.3                  # terrain slope tolerated by the ground filter
 
 
 def _colorize(Z, valid):
@@ -144,6 +148,21 @@ def build_3d(images: Union[str, Sequence[str]], out_dir: str, options: Optional[
     bg.paste(prev, mask=prev.split()[3])
     bg.save(os.path.join(out_dir, "orthophoto_preview.jpg"), quality=90)
 
+    # ---- DTM: bare ground under buildings / vegetation, and height above ground
+    dtm, ground = None, None
+    if opt.dtm:
+        from .terrain import TerrainOptions, dtm_from_dsm
+        t = time.time()
+        dtm, ground = dtm_from_dsm(dsm, gsd, TerrainOptions(max_object_size=opt.dtm_max_object,
+                                                             slope=opt.dtm_slope))
+        _write_raster(os.path.join(out_dir, "dtm.tif"), np.where(covered, dtm, NODATA).astype(np.float32),
+                      "float32", epsg, origin_xy, gsd, NODATA)
+        ndsm = np.where(covered, np.maximum(dsm - dtm, 0.0), NODATA).astype(np.float32)
+        _write_raster(os.path.join(out_dir, "ndsm.tif"), ndsm, "float32", epsg, origin_xy, gsd, NODATA)
+        Image.fromarray(_colorize(dtm, covered)[::pf, ::pf]).save(os.path.join(out_dir, "dtm_preview.png"))
+        log.info("DTM: %.0f%% of the surface classified as ground (%.1fs)",
+                 100 * ground.sum() / max(covered.sum(), 1), time.time() - t)
+
     # ---- dense point cloud (confident cells only)
     s = max(1, opt.cloud_step)
     ys, xs = np.nonzero(conf[::s, ::s])
@@ -151,11 +170,14 @@ def build_3d(images: Union[str, Sequence[str]], out_dir: str, options: Optional[
     xyz = np.column_stack([dense.minX + (xs + 0.5) * gsd, dense.maxY - (ys + 0.5) * gsd, dense.Z[ys, xs]])
     col = colors[ys, xs]
     outputs = {"dsm": "dsm.tif", "orthophoto": "orthophoto.tif", "sparse": "sparse.ply"}
+    if dtm is not None:
+        outputs.update(dtm="dtm.tif", ndsm="ndsm.tif")
     if "ply" in opt.formats:
         export.write_ply(os.path.join(out_dir, "dense.ply"), xyz, col, offset3, f"EPSG:{epsg}" if epsg else "")
         outputs["dense_ply"] = "dense.ply"
     if "las" in opt.formats:
-        export.write_las(os.path.join(out_dir, "dense.las"), xyz + np.array(offset3), col, epsg)
+        cls = (np.where(ground[ys, xs], 2, 1).astype(np.uint8) if ground is not None else None)
+        export.write_las(os.path.join(out_dir, "dense.las"), xyz + np.array(offset3), col, epsg, classification=cls)
         outputs["dense_las"] = "dense.las"
 
     # ---- mesh from the DSM
@@ -184,6 +206,10 @@ def build_3d(images: Union[str, Sequence[str]], out_dir: str, options: Optional[
                          origin_xy[1]],
                  confident_fraction=float(conf.sum() / max(covered.sum(), 1)),
                  z_range=[float(np.nanpercentile(dsm, 1)), float(np.nanpercentile(dsm, 99))] if covered.any() else None),
+        dtm=(dict(ground_fraction=float(ground.sum() / max(covered.sum(), 1)),
+                  max_object=opt.dtm_max_object,
+                  z_range=[float(np.nanpercentile(dtm, 1)), float(np.nanpercentile(dtm, 99))])
+             if dtm is not None and covered.any() else None),
         dense_points=int(len(xyz)), outputs=outputs, seconds=round(time.time() - t0, 1),
         thermal=(dict(raw_range=list(ar.thermal_range), palette=opt.palette, raw_values="orthophoto_thermal.tif",
                       legend="thermal_legend.png") if thermal else None),
@@ -212,6 +238,9 @@ def main(argv=None):
     ap.add_argument("--cloud-step", type=int, default=d.cloud_step, help="thin the dense cloud (every n-th cell)")
     ap.add_argument("--mesh-max-vertices", type=int, default=d.mesh_max_vertices)
     ap.add_argument("--formats", default=",".join(d.formats), help="comma list of ply,las,obj,glb")
+    ap.add_argument("--no-dtm", action="store_true", help="skip the bare-ground DTM")
+    ap.add_argument("--dtm-max-object", type=float, default=d.dtm_max_object,
+                    help="largest building/tree size (m) the ground filter removes (default %(default)s)")
     ap.add_argument("--cache-mb", type=int, default=d.cache_mb)
     ap.add_argument("--palette", default=d.palette, help="thermal palette (rainbow, iron, white_hot, ...)")
     ap.add_argument("--no-thermal", action="store_true", help="ignore radiometric data; use JPEG colours")
@@ -222,7 +251,7 @@ def main(argv=None):
     opt = Options3D(backend=a.backend, workers=a.workers, dsm_resolution=a.dsm_resolution, gps_sigma=a.gps_sigma,
                     max_views=a.max_views, min_score=a.min_score, cloud_step=a.cloud_step,
                     mesh_max_vertices=a.mesh_max_vertices, cache_mb=a.cache_mb, palette=a.palette,
-                    thermal="off" if a.no_thermal else "auto",
+                    thermal="off" if a.no_thermal else "auto", dtm=not a.no_dtm, dtm_max_object=a.dtm_max_object,
                     formats=tuple(f.strip() for f in a.formats.split(",") if f.strip()))
     build_3d(a.images, a.output, opt)
 

@@ -144,3 +144,33 @@ class GeoTIFFWriter:
             raise OverflowError("Output exceeds 4 GB; rerun with bigtiff=True")
         self.f.seek(8 if big else 4)
         self.f.write(struct.pack("<Q" if big else "<I", ifd_pos))
+
+
+def read_geotiff(path: str):
+    """Read a single-band or RGBA GeoTIFF (e.g. one written by this library) with Pillow.
+    Returns (array, geo) where geo = dict(epsg, origin=(x, y), pixel_size) or {} if not georeferenced,
+    and single-band nodata values are replaced by NaN."""
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = None
+    im = Image.open(path)
+    tags = im.tag_v2
+    arr = np.asarray(im)
+    if arr.ndim == 2:
+        arr = arr.astype(np.float32)
+        nd = tags.get(42113)
+        if nd is not None:
+            try:
+                v = float(str(nd).strip("\x00 "))
+                if np.isfinite(v):
+                    arr = np.where(arr == v, np.nan, arr)
+            except ValueError:
+                pass
+    scale, tie, keys = tags.get(33550), tags.get(33922), tags.get(34735)
+    epsg = None
+    if keys:
+        k = list(keys)
+        for j in range(4, len(k) - 3, 4):
+            if k[j] == 3072:
+                epsg = int(k[j + 3])
+    geo = dict(epsg=epsg, origin=(float(tie[3]), float(tie[4])), pixel_size=float(scale[0])) if scale and tie else {}
+    return arr, geo
