@@ -112,7 +112,7 @@ class MLXBackend:
         mx.set_cache_limit(256 * 1024 * 1024)
         self.device_name = "Apple GPU (Metal/MLX)"
         try:
-            info = mx.metal.device_info()
+            info = mx.device_info()
             self.device_name = f"{info.get('architecture', 'Apple GPU')} (Metal/MLX)"
         except Exception:
             pass

@@ -137,6 +137,59 @@ Synthetic check (known bare ground under 22 buildings):
 Both are limited mainly by DSM noise. The largest errors sit at the edge of the surveyed area,
 where the DSM itself is extrapolated.
 
+## Ground control points
+
+The 3D pipeline already performs **aerial triangulation** (a bundle block adjustment of all camera
+poses, self-calibrating focal length and distortion). GPS-only, absolute accuracy is limited by the
+onboard receiver (metre-level without RTK). Surveyed **ground control points** anchor the block to
+real-world coordinates and remove doming, taking absolute accuracy to survey level.
+
+Provide a GCP list in the WebODM / Pix4D format (one row per image mark):
+
+```
+EPSG:32646
+230012.5 2635008.1 12.3 2456.0 1810.5 DJI_0001_V.JPG GCP1
+230012.5 2635008.1 12.3 1203.0  905.0 DJI_0002_V.JPG GCP1
+230040.0 2635050.0 10.0  812.0  640.0 DJI_0007_V.JPG GCP2
+```
+
+```bash
+orthomosaic-3d images/ -o recon/ --gcp gcps.txt --gcp-sigma 0.02
+```
+
+Each GCP enters the bundle adjustment as a 3D point pulled toward its surveyed coordinate with a
+tight prior (`--gcp-sigma`, the survey accuracy), while its image marks tie the cameras to it. Three
+or more well-spread GCPs are enough; the marks are never rejected as outliers. `report.json` reports
+the per-GCP world error and the block's control RMSE (3D, horizontal, vertical). A lat/lon header
+(`WGS84`) is projected to the survey's UTM zone automatically.
+
+## Thermal binding (RGB-driven)
+
+A DJI dual sensor (M4T, M3T, H20T, ...) fires its RGB and thermal cameras together from one gimbal.
+The RGB block has strong texture and triangulates precisely; thermal is low-texture, low-resolution
+and its focal length is weakly observable, so a thermal-only reconstruction drifts. **Binding**
+solves the RGB block, then places every thermal image from its RGB twin's pose plus one shared **rig
+offset** (a fixed rotation + translation between the two cameras). The thermal DSM and orthophoto
+then inherit RGB-grade geometry and are pixel-registered to the RGB products — what a radiometric
+overlay needs.
+
+```bash
+# `images` is the RGB set (_V), --bind-thermal is the thermal set (_T)
+orthomosaic-3d rgb_images/ --bind-thermal thermal_images/ -o recon/
+```
+
+```python
+from orthomosaic import build_thermal_bound, Options3D
+build_thermal_bound("rgb/", "thermal/", "recon/", Options3D(backend="mps"))
+```
+
+RGB products land in `recon/rgb`, bound thermal products in `recon/thermal`, and
+`binding_report.json` records the rig (roll/pitch/yaw and baseline) and its consistency across
+frames. Thermal and RGB images are paired by their shared DJI capture filename (the sequence before
+the `_V` / `_T` suffix). The rig is estimated robustly, with outlier frames rejected; a large
+rotation or translation scatter is flagged, since it means the two cameras are not truly rigid or a
+pose set is noisy.
+
 ## GPU backends
 
 | Backend | Hardware | How |

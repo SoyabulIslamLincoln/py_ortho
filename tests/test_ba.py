@@ -58,7 +58,8 @@ def test_schur_matches_dense():
     nc = 6 * N + 3 * G
     huber = 1e9  # pure least squares for the comparison
     lam = 0.0
-    S, g, Vinv, gp, cost, dU = _ba.reduced_system(R, C, X, intr, pp, cg, oc, uv, ptr, huber, lam)
+    zpw = np.zeros((P, 3))
+    S, g, Vinv, gp, cost, dU = _ba.reduced_system(R, C, X, intr, pp, cg, oc, uv, ptr, huber, lam, zpw, zpw)
 
     def unpack(x):
         R2 = np.stack([rodrigues(x[6 * i:6 * i + 3]) @ R[i] for i in range(N)])

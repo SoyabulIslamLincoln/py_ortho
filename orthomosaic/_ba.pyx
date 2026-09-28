@@ -97,8 +97,13 @@ cdef inline void _inv3(const double* A, double* B) noexcept nogil:
 def reduced_system(const double[:, :, ::1] R, const double[:, ::1] C, const double[:, ::1] X,
                    const double[:, ::1] intr, const double[:, ::1] pp, const int32_t[::1] cam_group,
                    const int32_t[::1] obs_cam, const double[:, ::1] obs_uv, const int64_t[::1] pt_ptr,
-                   double huber, double lam):
+                   double huber, double lam,
+                   const double[:, ::1] pw, const double[:, ::1] pt_tgt):
     """Build the damped Schur-reduced normal equations.
+
+    pw, pt_tgt: per-point position-prior weight (1/sigma^2) and target (P, 3). Zero weight = no
+    prior (ordinary tie point). Ground control points enter this way, as points whose world
+    position is pulled toward the surveyed coordinate.
 
     Returns (S (nc,nc), g (nc), Vinv (P,3,3), gp (P,3), cost, diagU (nc)); S is already
     damped with lam * diag(U).
@@ -171,6 +176,12 @@ def reduced_system(const double[:, :, ::1] R, const double[:, ::1] C, const doub
                         gpt[a] += Jp[a] * e[0] + Jp[3 + a] * e[1]
                         for b in range(3):
                             V[a * 3 + b] += Jp[a] * Jp[b] + Jp[3 + a] * Jp[3 + b]
+                # position prior (ground control): adds w*(X-target) to the point normal equations
+                for a in range(3):
+                    if pw[p, a] > 0.0:
+                        gpt[a] += pw[p, a] * (X[p, a] - pt_tgt[p, a])
+                        V[a * 3 + a] += pw[p, a]
+                        cost += pw[p, a] * (X[p, a] - pt_tgt[p, a]) * (X[p, a] - pt_tgt[p, a])
                 for a in range(9):
                     Vd[a] = V[a]
                 for a in range(3):

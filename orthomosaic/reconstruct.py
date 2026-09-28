@@ -43,6 +43,9 @@ class Options3D(Options):
     dtm: bool = True
     dtm_max_object: float = 60.0            # metres: larger than your largest building's short side
     dtm_slope: float = 0.3                  # terrain slope tolerated by the ground filter
+    # ground control points (survey anchors)
+    gcp: Optional[str] = None               # path to a WebODM/Pix4D GCP list file
+    gcp_sigma: float = 0.05                 # surveyed GCP accuracy in metres
 
 
 def _colorize(Z, valid):
@@ -87,18 +90,43 @@ def _block_reduce(a, f, valid):
     return np.where(cnt > 0, a.sum((1, 3)) / np.maximum(cnt, 1), np.nan), cnt >= (f * f) / 2
 
 
-def build_3d(images: Union[str, Sequence[str]], out_dir: str, options: Optional[Options3D] = None) -> dict:
+def _load_gcps(ar, opt):
+    if not opt.gcp:
+        return None
+    from .gcp import load_gcps, to_local
+    if not ar.alignment.georeferenced:
+        log.warning("GCPs given but the survey is not georeferenced (no GPS); ignoring them")
+        return None
+    gset = load_gcps(opt.gcp)
+    return to_local(gset, ar.epsg % 100, ar.epsg < 32700, ar.origin)
+
+
+def sparse_block(images: Union[str, Sequence[str]], opt: Options3D):
+    """Aerial triangulation: align + SfM bundle adjustment (with GCPs if given).
+    Returns (AlignResult, Reconstruction)."""
+    ar = align_images(images, opt)
+    gcps = _load_gcps(ar, opt)
+    rec = sfm.reconstruct(ar, gps_sigma=opt.gps_sigma, alt_sigma=opt.alt_sigma,
+                          refine_focal=opt.refine_focal, gcps=gcps, gcp_sigma=opt.gcp_sigma)
+    return ar, rec
+
+
+def build_3d(images: Union[str, Sequence[str]], out_dir: str, options: Optional[Options3D] = None,
+             pre: Optional[tuple] = None) -> dict:
+    """Full 2.5D reconstruction. `pre` = (AlignResult, Reconstruction) reuses an existing block
+    (e.g. a rig-bound thermal reconstruction) instead of aligning and triangulating again."""
     opt = options or Options3D()
     t0 = time.time()
     os.makedirs(out_dir, exist_ok=True)
-    ar = align_images(images, opt)
+    ar, rec = pre if pre is not None else sparse_block(images, opt)
+    return _products(ar, rec, out_dir, opt, t0)
+
+
+def _products(ar, rec, out_dir, opt, t0) -> dict:
     al = ar.alignment
     georef = bool(al.georeferenced)
     epsg = ar.epsg if georef else None
     ox, oy = ar.origin if georef else (0.0, 0.0)
-
-    # ---- sparse
-    rec = sfm.reconstruct(ar, gps_sigma=opt.gps_sigma, alt_sigma=opt.alt_sigma, refine_focal=opt.refine_focal)
     frames = ar.frames
     offset3 = (ox, oy, 0.0)
     export.write_ply(os.path.join(out_dir, "sparse.ply"), rec.X, rec.color, offset3, "sparse SfM points")
@@ -222,6 +250,49 @@ def build_3d(images: Union[str, Sequence[str]], out_dir: str, options: Optional[
     return report
 
 
+def build_thermal_bound(rgb_images, thermal_images, out_dir, options: Optional[Options3D] = None,
+                        thermal_options: Optional[Options3D] = None) -> dict:
+    """RGB-driven thermal binding: aerial-triangulate the RGB block, then place the thermal images
+    from their RGB twins through a shared rig, so the thermal DSM/orthophoto inherit RGB accuracy
+    and are co-registered with the RGB products.
+
+    Writes RGB products to <out_dir>/rgb and bound thermal products to <out_dir>/thermal.
+    """
+    from .binding import bind_thermal
+    opt = options or Options3D()
+    topt = thermal_options or Options3D(backend=opt.backend, workers=opt.workers, gps_sigma=opt.gps_sigma,
+                                        feature_max_dim=4000, n_features=8000, neighbors=16, min_inliers=15,
+                                        exposure_compensation=False, palette=opt.palette, gcp=opt.gcp,
+                                        gcp_sigma=opt.gcp_sigma, dsm_resolution=opt.dsm_resolution)
+    t0 = time.time()
+    os.makedirs(out_dir, exist_ok=True)
+
+    log.info("== RGB block (aerial triangulation) ==")
+    ar_rgb, rec_rgb = sparse_block(rgb_images, opt)
+    rgb_report = build_3d(None, os.path.join(out_dir, "rgb"), opt, pre=(ar_rgb, rec_rgb))
+
+    log.info("== Thermal block ==")
+    ar_th, rec_th = sparse_block(thermal_images, topt)
+
+    log.info("== Binding thermal to RGB ==")
+    rec_bound, rig = bind_thermal(rec_rgb, ar_rgb.frames, rec_th, ar_th.frames)
+    if rig["translation_scatter_m"] > 0.5 or rig["rotation_scatter_deg"] > 2.0:
+        log.warning("Rig is inconsistent (rotation scatter %.2f deg, translation scatter %.2f m): the two "
+                    "cameras may not be rigidly mounted, or a pose set is noisy", rig["rotation_scatter_deg"],
+                    rig["translation_scatter_m"])
+    th_report = build_3d(None, os.path.join(out_dir, "thermal"), topt, pre=(ar_th, rec_bound))
+    th_report["rig"] = rig
+
+    report = dict(seconds=round(time.time() - t0, 1), rig=rig,
+                  rgb=dict(dir="rgb", **{k: rgb_report[k] for k in ("images_used", "epsg", "dsm")}),
+                  thermal=dict(dir="thermal", **{k: th_report[k] for k in ("images_used", "epsg", "dsm")}))
+    with open(os.path.join(out_dir, "binding_report.json"), "w") as fh:
+        json.dump(report, fh, indent=1)
+    log.info("Thermal binding done in %.1fs: rig baseline %.3f m, rotation %.2f deg -> %s",
+             time.time() - t0, rig["rig_baseline_m"], max(abs(v) for v in rig["rig_rotation_deg"]), out_dir)
+    return report
+
+
 def main(argv=None):
     d = Options3D()
     ap = argparse.ArgumentParser(prog="orthomosaic-3d",
@@ -244,6 +315,11 @@ def main(argv=None):
     ap.add_argument("--cache-mb", type=int, default=d.cache_mb)
     ap.add_argument("--palette", default=d.palette, help="thermal palette (rainbow, iron, white_hot, ...)")
     ap.add_argument("--no-thermal", action="store_true", help="ignore radiometric data; use JPEG colours")
+    ap.add_argument("--gcp", default=None, help="GCP list file (WebODM/Pix4D format) to anchor the block")
+    ap.add_argument("--gcp-sigma", type=float, default=d.gcp_sigma, help="surveyed GCP accuracy in metres")
+    ap.add_argument("--bind-thermal", default=None, metavar="THERMAL_IMAGES",
+                    help="RGB-driven thermal binding: `images` is the RGB set, this is the thermal set; "
+                         "the thermal block is placed from the RGB poses via a shared rig")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
@@ -252,8 +328,12 @@ def main(argv=None):
                     max_views=a.max_views, min_score=a.min_score, cloud_step=a.cloud_step,
                     mesh_max_vertices=a.mesh_max_vertices, cache_mb=a.cache_mb, palette=a.palette,
                     thermal="off" if a.no_thermal else "auto", dtm=not a.no_dtm, dtm_max_object=a.dtm_max_object,
+                    gcp=a.gcp, gcp_sigma=a.gcp_sigma,
                     formats=tuple(f.strip() for f in a.formats.split(",") if f.strip()))
-    build_3d(a.images, a.output, opt)
+    if a.bind_thermal:
+        build_thermal_bound(a.images, a.bind_thermal, a.output, opt)
+    else:
+        build_3d(a.images, a.output, opt)
 
 
 if __name__ == "__main__":

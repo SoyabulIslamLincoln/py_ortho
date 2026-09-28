@@ -42,6 +42,9 @@ class Reconstruction:
     obs_uv: np.ndarray              # (M, 2) full-res pixels
     rms_px: float = 0.0
     stats: dict = field(default_factory=dict)
+    pt_prior_w: Optional[np.ndarray] = None   # (P, 3) point-position prior weight (GCPs > 0)
+    pt_prior_t: Optional[np.ndarray] = None   # (P, 3) surveyed target for control points
+    gcp_names: Optional[list] = None          # name per GCP point (in point order), else None
 
     def intr_array(self):
         return np.array([[it.f, it.k1, it.k2] for it in self.intr], np.float64)
@@ -162,6 +165,13 @@ class Priors:
     C_sigma: np.ndarray             # (N, 3)  inf = no prior
     intr_target: np.ndarray         # (G, 3)
     intr_sigma: np.ndarray          # (G, 3)
+    X_weight: Optional[np.ndarray] = None   # (P, 3) 1/sigma^2 point-position prior (0 = tie point)
+    X_target: Optional[np.ndarray] = None   # (P, 3) surveyed coordinate for control points
+
+    def point_arrays(self, P):
+        if self.X_weight is None:
+            return np.zeros((P, 3)), np.zeros((P, 3))
+        return np.ascontiguousarray(self.X_weight), np.ascontiguousarray(self.X_target)
 
 
 def _apply_priors(S, g, C, intr, pri: Priors, N):
@@ -181,10 +191,13 @@ def _apply_priors(S, g, C, intr, pri: Priors, N):
     return cost
 
 
-def _prior_cost(C, intr, pri: Priors):
+def _prior_cost(C, intr, pri: Priors, X=None):
     wC = np.where(np.isfinite(pri.C_sigma), 1.0 / np.square(pri.C_sigma), 0.0)
     wI = np.where(np.isfinite(pri.intr_sigma), 1.0 / np.square(pri.intr_sigma), 0.0)
-    return float(np.sum(wC * (C - pri.C_target) ** 2) + np.sum(wI * (intr - pri.intr_target) ** 2))
+    cost = float(np.sum(wC * (C - pri.C_target) ** 2) + np.sum(wI * (intr - pri.intr_target) ** 2))
+    if pri.X_weight is not None and X is not None:
+        cost += float(np.sum(pri.X_weight * (X - pri.X_target) ** 2))
+    return cost
 
 
 def bundle_adjust(rec: Reconstruction, pri: Priors, huber: float, max_iter: int = 30,
@@ -201,11 +214,14 @@ def bundle_adjust(rec: Reconstruction, pri: Priors, huber: float, max_iter: int 
     ptr = np.searchsorted(op, np.arange(len(X) + 1)).astype(np.int64)
     N = len(R)
     nc = 6 * N + 3 * len(intr)
+    if rec.pt_prior_w is not None:                     # control-point position priors live on rec
+        pri.X_weight, pri.X_target = rec.pt_prior_w, rec.pt_prior_t
+    pw, pt_tgt = pri.point_arrays(len(X))
     lam = 1e-3
     _, cost0 = _ba.residuals(R, C, X, intr, pp, cg, oc, op, uv, huber)
-    cost = cost0 + _prior_cost(C, intr, pri)
+    cost = cost0 + _prior_cost(C, intr, pri, X)
     for it in range(max_iter):
-        S, g, Vinv, gp, _, _ = _ba.reduced_system(R, C, X, intr, pp, cg, oc, uv, ptr, huber, lam)
+        S, g, Vinv, gp, _, _ = _ba.reduced_system(R, C, X, intr, pp, cg, oc, uv, ptr, huber, lam, pw, pt_tgt)
         _apply_priors(S, g, C, intr, pri, N)
         improved = False
         for _ in range(8):
@@ -220,7 +236,7 @@ def bundle_adjust(rec: Reconstruction, pri: Priors, huber: float, max_iter: int 
             I2 = intr + dc[6 * N:].reshape(-1, 3)
             X2 = X + dp
             _, c2 = _ba.residuals(R2, C2, X2, I2, pp, cg, oc, op, uv, huber)
-            c2 += _prior_cost(C2, I2, pri)
+            c2 += _prior_cost(C2, I2, pri, X2)
             if c2 < cost:
                 R, C, intr, X = R2, C2, I2, np.ascontiguousarray(X2)
                 rel = (cost - c2) / max(cost, 1e-12)
@@ -230,7 +246,7 @@ def bundle_adjust(rec: Reconstruction, pri: Priors, huber: float, max_iter: int 
                 break
             # reject: increase damping and rebuild the damped system
             lam *= 10
-            S, g, Vinv, gp, _, _ = _ba.reduced_system(R, C, X, intr, pp, cg, oc, uv, ptr, huber, lam)
+            S, g, Vinv, gp, _, _ = _ba.reduced_system(R, C, X, intr, pp, cg, oc, uv, ptr, huber, lam, pw, pt_tgt)
             _apply_priors(S, g, C, intr, pri, N)
         if not improved or rel < tol:
             break
@@ -242,10 +258,17 @@ def bundle_adjust(rec: Reconstruction, pri: Priors, huber: float, max_iter: int 
 
 
 def _keep_observations(rec: Reconstruction, keep_obs: np.ndarray, min_views: int = 2):
-    """Drop observations, then points with too few views; re-index and sort by point."""
+    """Drop observations, then points with too few views; re-index and sort by point.
+    Control points (with a position prior) and their marks are always kept."""
+    is_gcp = rec.pt_prior_w is not None and np.any(rec.pt_prior_w > 0, axis=1)
+    keep_obs = keep_obs.copy()
+    if rec.pt_prior_w is not None:
+        keep_obs |= is_gcp[rec.obs_pt]                       # never drop a control-point mark
     oc, op, uv = rec.obs_cam[keep_obs], rec.obs_pt[keep_obs], rec.obs_uv[keep_obs]
     counts = np.bincount(op, minlength=len(rec.X))
     good_pt = counts >= min_views
+    if rec.pt_prior_w is not None:
+        good_pt |= is_gcp                                    # keep control points even with one mark
     m = good_pt[op]
     oc, op, uv = oc[m], op[m], uv[m]
     remap = np.cumsum(good_pt) - 1
@@ -254,15 +277,90 @@ def _keep_observations(rec: Reconstruction, keep_obs: np.ndarray, min_views: int
     rec.obs_cam, rec.obs_pt, rec.obs_uv = oc[order].astype(np.int32), op[order], uv[order]
     rec.X = rec.X[good_pt]
     rec.color = rec.color[good_pt]
+    if rec.pt_prior_w is not None:
+        rec.pt_prior_w = rec.pt_prior_w[good_pt]
+        rec.pt_prior_t = rec.pt_prior_t[good_pt]
 
 
 # --------------------------------------------------------------------------
 # driver
 # --------------------------------------------------------------------------
 
+def _add_gcps(rec: Reconstruction, frames, used, gcps: dict, gcp_sigma: float):
+    """Append ground control points as prior-constrained 3D points with their image marks."""
+    name_to_local = {frames[g].name: k for k, g in enumerate(used)}
+    P = len(rec.X)
+    new_X, new_col, add_cam, add_pt, add_uv, names = [], [], [], [], [], []
+    w = 1.0 / max(gcp_sigma, 1e-6) ** 2
+    pw_extra, pt_extra = [], []
+    for gname, (world, marks) in gcps.items():
+        local_marks = [(name_to_local[img], uv) for img, uv in marks.items() if img in name_to_local]
+        if not local_marks:
+            log.warning("GCP %s: none of its marked images are in the reconstruction; skipped", gname)
+            continue
+        pt = P + len(new_X)
+        new_X.append(np.asarray(world, np.float64))
+        new_col.append([255, 0, 255])
+        names.append(gname)
+        pw_extra.append([w, w, w])
+        pt_extra.append(np.asarray(world, np.float64))
+        for cam, (u, v) in local_marks:
+            add_cam.append(cam)
+            add_pt.append(pt)
+            add_uv.append([u, v])
+    if not new_X:
+        log.warning("No usable GCPs (no marks matched the reconstruction images)")
+        return
+    rec.X = np.vstack([rec.X, np.array(new_X)])
+    rec.color = np.vstack([rec.color, np.array(new_col, np.uint8)])
+    rec.obs_cam = np.concatenate([rec.obs_cam, np.array(add_cam, np.int32)])
+    rec.obs_pt = np.concatenate([rec.obs_pt, np.array(add_pt, np.int32)])
+    rec.obs_uv = np.vstack([rec.obs_uv, np.array(add_uv, np.float64)])
+    order = np.argsort(rec.obs_pt, kind="stable")     # keep observations sorted by point
+    rec.obs_cam, rec.obs_pt, rec.obs_uv = rec.obs_cam[order], rec.obs_pt[order], rec.obs_uv[order]
+    rec.pt_prior_w = np.vstack([np.zeros((P, 3)), np.array(pw_extra)])
+    rec.pt_prior_t = np.vstack([np.zeros((P, 3)), np.array(pt_extra)])
+    rec.gcp_names = names
+    log.info("Added %d ground control point(s) with %d mark(s) (sigma %.3f m)",
+             len(new_X), len(add_cam), gcp_sigma)
+
+
+def gcp_report(rec: Reconstruction, origin3) -> dict:
+    """Per-GCP world error (final point vs surveyed) and reprojection RMS of its marks."""
+    if rec.pt_prior_w is None or rec.gcp_names is None:
+        return {}
+    is_gcp = np.any(rec.pt_prior_w > 0, axis=1)
+    gcp_pts = np.nonzero(is_gcp)[0]
+    err_px, _ = _ba.residuals(np.ascontiguousarray(rec.R), np.ascontiguousarray(rec.C),
+                              np.ascontiguousarray(rec.X), rec.intr_array(), rec.pp_array(),
+                              np.ascontiguousarray(rec.cam_group, np.int32),
+                              np.ascontiguousarray(rec.obs_cam, np.int32),
+                              np.ascontiguousarray(rec.obs_pt, np.int32),
+                              np.ascontiguousarray(rec.obs_uv), 1e9)
+    per = {}
+    for local_idx, name in zip(gcp_pts, rec.gcp_names):
+        m = rec.obs_pt == local_idx
+        dxyz = rec.X[local_idx] - rec.pt_prior_t[local_idx]
+        per[name] = dict(world_error_m=[float(v) for v in dxyz],
+                         world_error_norm_m=float(np.linalg.norm(dxyz)),
+                         n_marks=int(m.sum()),
+                         reproj_rms_px=float(np.sqrt(np.mean(err_px[m] ** 2))) if m.any() else None)
+    errs = np.array([v["world_error_norm_m"] for v in per.values()])
+    horiz = np.array([np.hypot(*v["world_error_m"][:2]) for v in per.values()])
+    vert = np.array([abs(v["world_error_m"][2]) for v in per.values()])
+    summary = dict(count=len(per), rmse_3d_m=float(np.sqrt(np.mean(errs ** 2))),
+                   rmse_horizontal_m=float(np.sqrt(np.mean(horiz ** 2))),
+                   rmse_vertical_m=float(np.sqrt(np.mean(vert ** 2))))
+    return dict(per_gcp=per, summary=summary)
+
+
 def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float = 0.85,
-                min_track: int = 2, refine_focal: Optional[bool] = None) -> Reconstruction:
-    """Sparse reconstruction from an AlignResult (see pipeline.align_images)."""
+                min_track: int = 2, refine_focal: Optional[bool] = None,
+                gcps: Optional[dict] = None, gcp_sigma: float = 0.05) -> Reconstruction:
+    """Sparse reconstruction from an AlignResult (see pipeline.align_images).
+
+    gcps: optional {name: (world_local (3,), {image_basename: (u, v)})} control points
+    (see gcp.to_local). They anchor the block to the survey coordinate system."""
     t0 = time.time()
     frames, feats, al = ar.frames, ar.feats, ar.alignment
     used = list(al.used)
@@ -328,6 +426,10 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
     keep = (err < 0.02 * diag) & (ang[obs_pt] > 1.0)
     _keep_observations(rec, keep)
 
+    # ---- 3b. ground control points (surveyed anchors), if any
+    if gcps:
+        _add_gcps(rec, frames, used, gcps, gcp_sigma)
+
     # ---- 4. priors
     pos = ar.positions
     C_t = rec.C.copy()
@@ -352,7 +454,8 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
     # length is held at the EXIF value; distortion is still self-calibrated.
     if refine_focal is None:
         alt = rec.C[:, 2]
-        refine_focal = bool(has_rel_alt and np.ptp(alt) > 0.25 * np.median(np.abs(alt)))
+        # GCPs fix absolute scale, so focal length becomes observable and can be self-calibrated
+        refine_focal = bool(gcps) or bool(has_rel_alt and np.ptp(alt) > 0.25 * np.median(np.abs(alt)))
     for k, it in enumerate(rec.intr):
         if not it.f_known:
             I_s[k, 0] = 0.2 * it.f
@@ -378,6 +481,13 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
                      rms_px=rec.rms_px, focal_px=[it.f for it in rec.intr],
                      k1=[it.k1 for it in rec.intr], k2=[it.k2 for it in rec.intr],
                      z_datum="take-off (DJI relative altitude)" if has_rel_alt else "mean ground")
+    if gcps:
+        gr = gcp_report(rec, None)
+        rec.stats["gcp"] = gr
+        if gr:
+            s = gr["summary"]
+            log.info("GCP check: %d control points, 3D RMSE %.3f m (horiz %.3f, vert %.3f)",
+                     s["count"], s["rmse_3d_m"], s["rmse_horizontal_m"], s["rmse_vertical_m"])
     log.info("SfM done: %d cameras, %d points, reprojection RMS %.2f px, focal %s in %.1fs",
              N, len(rec.X), rec.rms_px, ", ".join(f"{it.f:.1f}" for it in rec.intr), time.time() - t0)
     return rec

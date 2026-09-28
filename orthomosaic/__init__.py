@@ -1,12 +1,14 @@
 """orthomosaic -- native (Cython + optional CUDA) orthomosaic generation, no Docker/VM."""
 from .backend import cuda_available, select_backend
+from .gcp import load_gcps
 from .pipeline import Options, build_orthomosaic
-from .reconstruct import Options3D, build_3d
+from .reconstruct import Options3D, build_3d, build_thermal_bound
 from .terrain import TerrainOptions, dtm_from_dsm
 from .thermal import apply_palette, palette_names, recolor
 
-__all__ = ["Options", "Options3D", "build_orthomosaic", "build_3d", "cuda_available", "select_backend",
-           "palette_names", "apply_palette", "recolor", "dtm_from_dsm", "TerrainOptions"]
+__all__ = ["Options", "Options3D", "build_orthomosaic", "build_3d", "build_thermal_bound",
+           "cuda_available", "select_backend", "palette_names", "apply_palette", "recolor",
+           "dtm_from_dsm", "TerrainOptions", "load_gcps"]
 try:  # single source of truth: the version in pyproject.toml
     from importlib.metadata import version as _version
     __version__ = _version("pyOrthomosaic")
