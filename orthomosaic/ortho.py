@@ -92,10 +92,17 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
     biases = biases or {}
     zfill = float(np.nanmedian(dsm))
 
+    # Load images at (about) the orthophoto resolution, not full resolution: sampling a 4032 px
+    # image for a 6 cm ortho oversamples ~5x and, at 36 MB/image, blows past the cache so images
+    # are re-decoded hundreds of times. Matching the load scale to the output GSD keeps every
+    # image in cache (one decode each) with no loss of ortho detail.
+    native_gsd = float(getattr(getattr(ar, "alignment", None), "gsd", gsd) or gsd)
+    img_scale = float(np.clip(native_gsd / gsd, 0.1, 1.0))
+
     def load(k):
         i = rec.used[k]
         fr = frames[i]
-        rgb = load_rgb(fr, 1.0).astype(np.float32)
+        rgb = load_rgb(fr, img_scale).astype(np.float32)
         gg = gains.get(i)
         if gg is not None:
             rgb *= np.asarray(gg, np.float32)
