@@ -137,23 +137,31 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
         Y0 = maxY - ty * gsd
         Ztile = np.where(sub, dsm[ty:ty + th, tx:tx + tw], zfill).astype(np.float32)
 
-        # candidate views: those that see the whole tile over its height range, most nadir first
+        # candidate views: those that see the tile (at least its centre over the height range),
+        # nearest/most-nadir first. Per-cell `valid` from the sampler masks parts a view misses,
+        # so we do NOT require a single view to cover the whole tile -- that would skip most tiles
+        # around tall buildings and leave the true orthophoto with big holes.
         zz = Ztile[sub]
         zlo, zhi = float(zz.min()), float(zz.max())
         cxw = X0 + tw * gsd / 2.0
         cyw = Y0 - th * gsd / 2.0
-        corners = np.array([[X0, Y0], [X0 + tw * gsd, Y0], [X0, Y0 - th * gsd], [X0 + tw * gsd, Y0 - th * gsd]])
-        pts = np.concatenate([np.column_stack([corners, np.full(4, z)]) for z in (zlo, zhi)])
+        corners = np.array([[X0, Y0], [X0 + tw * gsd, Y0], [X0, Y0 - th * gsd], [X0 + tw * gsd, Y0 - th * gsd],
+                            [cxw, cyw]])
+        pts = np.concatenate([np.column_stack([corners, np.full(len(corners), z)]) for z in (zlo, zhi)])
+        centre = np.array([[cxw, cyw, 0.5 * (zlo + zhi)]])
         dist = np.hypot(cam_xy[:, 0] - cxw, cam_xy[:, 1] - cyw)
         cand = []
         for k in np.argsort(dist):
             it = rec.intr[rec.cam_group[k]]
             xc = (pts - rec.C[k]) @ rec.R[k].T
-            if np.any(xc[:, 2] <= 0):
-                continue
-            u = it.f * xc[:, 0] / xc[:, 2] + it.cx
-            v = it.f * xc[:, 1] / xc[:, 2] + it.cy
-            if ((u >= 0) & (u <= it.width - 1) & (v >= 0) & (v <= it.height - 1)).all():
+            u = it.f * xc[:, 0] / np.maximum(xc[:, 2], 1e-6) + it.cx
+            v = it.f * xc[:, 1] / np.maximum(xc[:, 2], 1e-6) + it.cy
+            inside = (xc[:, 2] > 0) & (u >= 0) & (u <= it.width - 1) & (v >= 0) & (v <= it.height - 1)
+            cc = (centre - rec.C[k]) @ rec.R[k].T
+            cu = it.f * cc[0, 0] / max(cc[0, 2], 1e-6) + it.cx
+            cv = it.f * cc[0, 1] / max(cc[0, 2], 1e-6) + it.cy
+            sees_centre = cc[0, 2] > 0 and 0 <= cu <= it.width - 1 and 0 <= cv <= it.height - 1
+            if sees_centre or inside.mean() >= 0.5:
                 cand.append(int(k))
             if len(cand) >= max_views:
                 break

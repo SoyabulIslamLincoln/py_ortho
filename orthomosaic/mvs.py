@@ -338,8 +338,8 @@ def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions
         score, st, valids, ref = score_at(Zbest, 0, gsd, X0, Y0, want_rgb=True)
         #changed here: Pix4D view-angle weighting.  The true orthophoto must sample the surface
         # with the least off-nadir stretch, so near-nadir views are favoured by cos(incidence).
-        cxs_w = xp.asarray((X0 + (np.arange(PW) + 0.5) * gsd).astype(np.float32))
-        cys_w = xp.asarray((Y0 - (np.arange(PH) + 0.5) * gsd).astype(np.float32))
+        cxs_w = backend.asarray((X0 + (np.arange(PW) + 0.5) * gsd).astype(np.float32), xp.float32)
+        cys_w = backend.asarray((Y0 - (np.arange(PH) + 0.5) * gsd).astype(np.float32), xp.float32)
         va_power = float(getattr(opt, "view_angle_power", 1.5))
         acc = xp.zeros(Zbest.shape + (3,), xp.float32)
         wsum = xp.zeros(Zbest.shape, xp.float32)

@@ -80,8 +80,18 @@ def solve_radiometric(used, pairs, sigma_n: float = 10.0, gain_prior: float = 0.
         if not np.isfinite(sol).all():
             log.warning("Colour balancing produced non-finite values (channel %d); ignoring", ch)
             continue
-        gains[:, ch] = np.clip(sol[0::2], 1.0 / max_gain, max_gain)
-        biases[:, ch] = np.clip(sol[1::2], -max_bias, max_bias)
+        a, b = sol[0::2].copy(), sol[1::2].copy()
+        # The pairwise constraints a_i*ci+b_i = a_j*cj+b_j are invariant under a global scale and
+        # offset of all (a_i, b_i) -- a gauge freedom that lets the whole block drift dark/bright
+        # (all gains collapsing toward the clamp). Pin the gauge so the correction is *relative*:
+        # mean gain 1 and mean bias 0, which keeps the overall brightness of the mosaic unchanged.
+        am = float(np.mean(a))
+        if am > 1e-3:
+            a = a / am
+            b = b / am
+        b = b - float(np.mean(b))
+        gains[:, ch] = np.clip(a, 1.0 / max_gain, max_gain)
+        biases[:, ch] = np.clip(b, -max_bias, max_bias)
 
     log.info("Radiometric colour balancing: gain median %s, offset median %s",
              np.round(np.median(gains, 0), 3).tolist(), np.round(np.median(biases, 0), 1).tolist())
