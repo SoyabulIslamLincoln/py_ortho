@@ -76,6 +76,29 @@ def write_las(path: str, xyz_abs: np.ndarray, rgb: np.ndarray, epsg: Optional[in
 
 
 # --------------------------------------------------------------------------
+# vector / vectorised elevation products
+# --------------------------------------------------------------------------
+
+def write_geojson_contours(path: str, contours, offset=(0.0, 0.0), epsg: Optional[int] = None):
+    #changed here: Pix4D-style elevation-mapping contour deliverable (GeoJSON).
+    """Write contour segments from `terrain.contour_lines` as a GeoJSON FeatureCollection.
+
+    `contours` is a list of ``(level, segs)``; every level becomes one MultiLineString feature
+    with an ``elevation`` property.  Coordinates are shifted by `offset` (the block origin).
+    """
+    feats = []
+    for level, segs in contours:
+        coords = [[[float(x) + offset[0], float(y) + offset[1]] for x, y in seg] for seg in segs]
+        feats.append({"type": "Feature", "properties": {"elevation": float(level)},
+                      "geometry": {"type": "MultiLineString", "coordinates": coords}})
+    fc = {"type": "FeatureCollection", "features": feats}
+    if epsg:
+        fc["crs"] = {"type": "name", "properties": {"name": f"EPSG:{epsg}"}}
+    with open(path, "w") as fh:
+        json.dump(fc, fh)
+
+
+# --------------------------------------------------------------------------
 # meshes
 # --------------------------------------------------------------------------
 

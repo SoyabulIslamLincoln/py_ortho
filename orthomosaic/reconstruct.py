@@ -30,7 +30,7 @@ class Options3D(Options):
     neighbors: int = 10
     alt_sigma: float = 0.5                  # DJI relative-altitude accuracy (m)
     refine_focal: Optional[bool] = None     # None: refine when an altitude reference exists
-    dsm_resolution: Optional[float] = None  # metres per DSM cell; default 2 x native GSD
+    dsm_resolution: Optional[float] = None  # metres per DSM cell; default = native GSD  #changed here
     max_views: int = 6
     min_score: float = 0.5
     ncc_window: int = 3
@@ -45,6 +45,17 @@ class Options3D(Options):
     dtm: bool = True
     dtm_max_object: float = 60.0            # metres: larger than your largest building's short side
     dtm_slope: float = 0.3                  # terrain slope tolerated by the ground filter
+    #changed here: Pix4D-grade true orthophoto + elevation-mapping controls
+    true_ortho: bool = True                 # re-render the ortho on the final DSM (occlusion-aware)
+    occlusion: bool = True                  # drop views hidden behind buildings/trees
+    occlusion_tol: float = 0.20             # metres a ray may pass under the surface before it blocks
+    occlusion_steps: int = 12               # ray-march samples between camera and surface
+    occlusion_stride: int = 2               # test occlusion on every n-th cell, then grow the mask
+    ortho_tile: int = 256                   # true-orthophoto tile size (cells)
+    view_angle_power: float = 1.5           # nadir preference when blending the true orthophoto
+    color_balance: bool = True              # per-image gain+offset radiometric correction (Pix4D)
+    contour_interval: float = 0.0           # metres between terrain contour lines (0 = off)
+    classify_cloud: bool = True             # ASPRS ground/building/vegetation classes in the LAS
     # ground control points (survey anchors)
     gcp: Optional[str] = None               # path to a WebODM/Pix4D GCP list file
     gcp_sigma: float = 0.05                 # surveyed GCP accuracy in metres
@@ -145,18 +156,43 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
 
     # ---- dense
     thermal = ar.thermal_range is not None          # radiometric thermal: never exposure-compensate
-    gains = solve_gains(al.used, ar.pairs) if (opt.exposure_compensation and not thermal) else {}
+    #changed here: Pix4D radiometric colour balancing -- per-image gain AND offset solved jointly
+    #over the matched point colours (falls back to gains-only when disabled).
+    if opt.exposure_compensation and not thermal:
+        if getattr(opt, "color_balance", True):
+            from .color import solve_radiometric
+            gains, biases = solve_radiometric(al.used, ar.pairs)
+        else:
+            gains, biases = solve_gains(al.used, ar.pairs), {}
+    else:
+        gains, biases = {}, {}
     dopt = mvs.DenseOptions(gsd=opt.dsm_resolution, max_views=opt.max_views, min_score=opt.min_score,
-                            window=opt.ncc_window, tile=opt.tile, cache_mb=opt.cache_mb, workers=ar.workers)
-    dense = mvs.dense_reconstruct(ar, rec, gains, al.gsd, dopt)
+                            window=opt.ncc_window, tile=opt.tile, cache_mb=opt.cache_mb, workers=ar.workers,
+                            view_angle_power=opt.view_angle_power)   #changed here
+    dense = mvs.dense_reconstruct(ar, rec, gains, al.gsd, dopt, biases=biases)   #changed here
     dsm, conf = mvs.postprocess(dense, opt.min_score, smooth_range=opt.dsm_smooth,
                                 smooth_iters=opt.dsm_smooth_iters)
     gsd = dense.gsd
     covered = np.isfinite(dsm)
     origin_xy = (dense.minX + ox, dense.maxY + oy)
 
-    # ---- thermal: the dense colours are raw values (gray); keep them and colour with the palette
+    #changed here: Pix4D "Orthomosaic" stage -- re-render the colours on the FINAL DSM with
+    #occlusion handling (views hidden behind a building are dropped), view-angle weighting and
+    #seam feathering.  This is what turns the dense colours into a true orthophoto.
     colors = dense.rgb
+    ortho_frac = None
+    if getattr(opt, "true_ortho", True) and not thermal and covered.any():
+        from .ortho import true_orthophoto
+        t1 = time.time()
+        ortho_rgb, ortho_cov = true_orthophoto(ar, rec, dsm, dense.minX, dense.maxY, gsd,
+                                               gains, biases, opt)
+        if ortho_cov.any():
+            colors = np.where(ortho_cov[..., None], ortho_rgb, colors)
+            ortho_frac = float(ortho_cov.sum() / max(covered.sum(), 1))
+            log.info("True orthophoto: %.0f%% of DSM cells coloured only from visible views (%.1fs)",
+                     100 * ortho_frac, time.time() - t1)
+
+    # ---- thermal: the dense colours are raw values (gray); keep them and colour with the palette
     if thermal:
         from .thermal import legend, palette_lut
         lo, hi = ar.thermal_range
@@ -180,19 +216,28 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     bg.save(os.path.join(out_dir, "orthophoto_preview.jpg"), quality=90)
 
     # ---- DTM: bare ground under buildings / vegetation, and height above ground
-    dtm, ground = None, None
+    dtm, ground, contours, ndsm_raw = None, None, [], None
     if opt.dtm:
-        from .terrain import TerrainOptions, dtm_from_dsm
+        from .terrain import TerrainOptions, dtm_from_dsm, contour_lines
         t = time.time()
         dtm, ground = dtm_from_dsm(dsm, gsd, TerrainOptions(max_object_size=opt.dtm_max_object,
                                                              slope=opt.dtm_slope))
         _write_raster(os.path.join(out_dir, "dtm.tif"), np.where(covered, dtm, NODATA).astype(np.float32),
                       "float32", epsg, origin_xy, gsd, NODATA)
-        ndsm = np.where(covered, np.maximum(dsm - dtm, 0.0), NODATA).astype(np.float32)
-        _write_raster(os.path.join(out_dir, "ndsm.tif"), ndsm, "float32", epsg, origin_xy, gsd, NODATA)
+        ndsm_raw = np.where(covered, np.maximum(dsm - dtm, 0.0), np.nan)
+        _write_raster(os.path.join(out_dir, "ndsm.tif"), np.where(covered, ndsm_raw, NODATA).astype(np.float32),
+                      "float32", epsg, origin_xy, gsd, NODATA)
         Image.fromarray(_colorize(dtm, covered)[::pf, ::pf]).save(os.path.join(out_dir, "dtm_preview.png"))
         log.info("DTM: %.0f%% of the surface classified as ground (%.1fs)",
                  100 * ground.sum() / max(covered.sum(), 1), time.time() - t)
+        #changed here: Pix4D elevation mapping -- contour lines from the bare-earth DTM
+        if getattr(opt, "contour_interval", 0.0) and opt.contour_interval > 0:
+            contours = contour_lines(np.where(covered, dtm, np.nan), gsd, dense.minX, dense.maxY,
+                                     opt.contour_interval)
+            if contours:
+                export.write_geojson_contours(os.path.join(out_dir, "contours.geojson"), contours,
+                                              offset=(ox, oy), epsg=epsg)
+                log.info("Contours: %d levels at %.2f m", len(contours), opt.contour_interval)
 
     # ---- dense point cloud (confident cells only)
     s = max(1, opt.cloud_step)
@@ -200,14 +245,24 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     ys, xs = ys * s, xs * s
     xyz = np.column_stack([dense.minX + (xs + 0.5) * gsd, dense.maxY - (ys + 0.5) * gsd, dense.Z[ys, xs]])
     col = colors[ys, xs]
+    cls = None                                       #changed here: ASPRS classes (set with the LAS)
     outputs = {"dsm": "dsm.tif", "orthophoto": "orthophoto.tif", "sparse": "sparse.ply"}
     if dtm is not None:
         outputs.update(dtm="dtm.tif", ndsm="ndsm.tif")
+    if contours:                                     #changed here
+        outputs["contours"] = "contours.geojson"
     if "ply" in opt.formats:
         export.write_ply(os.path.join(out_dir, "dense.ply"), xyz, col, offset3, f"EPSG:{epsg}" if epsg else "")
         outputs["dense_ply"] = "dense.ply"
     if "las" in opt.formats:
-        cls = (np.where(ground[ys, xs], 2, 1).astype(np.uint8) if ground is not None else None)
+        #changed here: Pix4D-style point-cloud classification for the LAS deliverable
+        cls = None
+        if ground is not None:
+            if getattr(opt, "classify_cloud", True) and ndsm_raw is not None:
+                from .terrain import classify_surface
+                cls = classify_surface(dsm, ground, ndsm_raw, gsd)[ys, xs]
+            else:
+                cls = np.where(ground[ys, xs], 2, 1).astype(np.uint8)
         export.write_las(os.path.join(out_dir, "dense.las"), xyz + np.array(offset3), col, epsg, classification=cls)
         outputs["dense_las"] = "dense.las"
 
@@ -241,6 +296,21 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                   max_object=opt.dtm_max_object,
                   z_range=[float(np.nanpercentile(dtm, 1)), float(np.nanpercentile(dtm, 99))])
              if dtm is not None and covered.any() else None),
+        #changed here: report the Pix4D-style ortho / colour / elevation-mapping settings and results
+        ortho=dict(true_ortho=bool(getattr(opt, "true_ortho", True)),
+                   occlusion=bool(getattr(opt, "occlusion", True)),
+                   view_angle_power=float(getattr(opt, "view_angle_power", 1.5)),
+                   visible_fraction=ortho_frac),
+        color=dict(balancing=bool(getattr(opt, "color_balance", True)),
+                   gain_median=[float(np.median([g[0] for g in gains.values()])) if gains else 1.0,
+                                float(np.median([g[1] for g in gains.values()])) if gains else 1.0,
+                                float(np.median([g[2] for g in gains.values()])) if gains else 1.0]),
+        contours=dict(interval=float(getattr(opt, "contour_interval", 0.0)), levels=len(contours)) if contours else None,
+        classification=dict(ground=int((cls == 2).sum()) if cls is not None else 0,
+                            building=int((cls == 6).sum()) if cls is not None else 0,
+                            vegetation=int(((cls == 3) | (cls == 5)).sum()) if cls is not None else 0,
+                            classes="ASPRS 2 ground / 3 low veg / 5 high veg / 6 building")
+        if cls is not None else None,
         dense_points=int(len(xyz)), outputs=outputs, seconds=round(time.time() - t0, 1),
         thermal=(dict(raw_range=list(ar.thermal_range), palette=opt.palette, raw_values="orthophoto_thermal.tif",
                       legend="thermal_legend.png") if thermal else None),
@@ -305,10 +375,23 @@ def main(argv=None):
     ap.add_argument("-o", "--output", default="reconstruction", help="output folder")
     ap.add_argument("--backend", choices=["auto", "cuda", "mps", "cpu"], default=d.backend)
     ap.add_argument("--workers", type=int, default=d.workers)
-    ap.add_argument("--dsm-resolution", type=float, default=None, help="DSM cell size in metres (default 2x GSD)")
+    ap.add_argument("--dsm-resolution", type=float, default=None,
+                    help="DSM cell size in metres (default: native GSD, Pix4D-grade)")   #changed here
     ap.add_argument("--gps-sigma", type=float, default=d.gps_sigma)
     ap.add_argument("--max-views", type=int, default=d.max_views)
     ap.add_argument("--min-score", type=float, default=d.min_score, help="NCC needed for a dense point (0-1)")
+    #changed here: Pix4D-grade true-orthophoto / colour / elevation-mapping switches
+    ap.add_argument("--no-true-ortho", action="store_true",
+                    help="keep the in-sweep colours instead of re-rendering an occlusion-aware true orthophoto")
+    ap.add_argument("--no-occlusion", action="store_true",
+                    help="disable occlusion handling in the true orthophoto (faster)")
+    ap.add_argument("--no-color-balance", action="store_true",
+                    help="use gains-only exposure compensation (no per-image offset)")
+    ap.add_argument("--view-angle-power", type=float, default=d.view_angle_power,
+                    help="nadir preference when blending the true orthophoto (0 = off)")
+    ap.add_argument("--contours", type=float, default=d.contour_interval,
+                    help="terrain contour interval in metres (0 = off)")
+    ap.add_argument("--no-classify", action="store_true", help="skip ASPRS cloud classification")
     ap.add_argument("--cloud-step", type=int, default=d.cloud_step, help="thin the dense cloud (every n-th cell)")
     ap.add_argument("--mesh-max-vertices", type=int, default=d.mesh_max_vertices)
     ap.add_argument("--formats", default=",".join(d.formats), help="comma list of ply,las,obj,glb")
@@ -332,6 +415,10 @@ def main(argv=None):
                     mesh_max_vertices=a.mesh_max_vertices, cache_mb=a.cache_mb, palette=a.palette,
                     thermal="off" if a.no_thermal else "auto", dtm=not a.no_dtm, dtm_max_object=a.dtm_max_object,
                     gcp=a.gcp, gcp_sigma=a.gcp_sigma,
+                    #changed here: Pix4D-grade ortho / colour / elevation-mapping switches
+                    true_ortho=not a.no_true_ortho, occlusion=not a.no_occlusion,
+                    color_balance=not a.no_color_balance, view_angle_power=a.view_angle_power,
+                    contour_interval=a.contours, classify_cloud=not a.no_classify,
                     formats=tuple(f.strip() for f in a.formats.split(",") if f.strip()))
     if a.bind_thermal:
         build_thermal_bound(a.images, a.bind_thermal, a.output, opt)

@@ -184,6 +184,108 @@ def _resize_bilinear(a: np.ndarray, shape) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------
+# elevation mapping: ASPRS point classes and contour lines
+# --------------------------------------------------------------------------
+
+def classify_surface(dsm: np.ndarray, ground: np.ndarray, ndsm: np.ndarray, gsd: float,
+                     building_min: float = 2.5, veg_min: float = 0.4,
+                     rough_threshold: float = 0.15) -> np.ndarray:
+    #changed here: Pix4D-style point-cloud classification (elevation mapping deliverable).
+    """ASPRS-style classes for the dense cloud.
+
+    Ground (2) comes from the morphological DTM filter; above it, flat plateaus are buildings
+    (6) and rough surfaces are vegetation (5 high / 3 low).  `rough_threshold` is the local DSM
+    standard deviation (m) over ~1 m used to tell a flat roof from a bumpy canopy.
+    """
+    from .backend import _box_cumsum
+    valid = np.isfinite(dsm)
+    cls = np.ones(dsm.shape, np.uint8)                          # 1 = unclassified
+    hgt = np.where(valid, np.maximum(np.nan_to_num(ndsm), 0.0), 0.0).astype(np.float32)
+    r = max(1, int(round(0.5 / max(gsd, 1e-6))))
+    cnt = _box_cumsum(np, np.ones_like(hgt), r)
+    mean = _box_cumsum(np, hgt, r) / np.maximum(cnt, 1e-6)
+    sq = _box_cumsum(np, hgt * hgt, r) / np.maximum(cnt, 1e-6)
+    rough = np.sqrt(np.maximum(sq - mean * mean, 0.0))
+    low = valid & (hgt > veg_min) & (hgt <= building_min)
+    high = valid & (hgt > building_min)
+    cls[low] = 3                                                # 3 = low vegetation
+    cls[high & (rough > rough_threshold)] = 5                   # 5 = high vegetation
+    cls[high & (rough <= rough_threshold)] = 6                  # 6 = building
+    if ground is not None:
+        cls[ground & valid] = 2                                 # 2 = ground
+    return cls
+
+
+def contour_lines(Z: np.ndarray, gsd: float, minX: float, maxY: float, interval: float,
+                  nodata=None):
+    #changed here: marching-squares contour lines (Pix4D elevation-mapping deliverable).
+    """Contour segments at multiples of `interval` for a height grid.
+
+    Returns a list of ``(level, segs)`` where `segs` is ``(M, 2, 2)`` world-coordinate line
+    segments.  `minX`/`maxY` are the world coordinates of the first cell *corner* (the same
+    origin the DSM writer uses).  Rows are processed in bands to bound memory.
+    """
+    z = np.asarray(Z, np.float64)
+    if nodata is not None:
+        z = np.where(z <= nodata + 1e-6, np.nan, z)
+    H, W = z.shape
+    if H < 2 or W < 2 or interval <= 0 or not np.isfinite(z).any():
+        return []
+    Xn = minX + (np.arange(W) + 0.5) * gsd
+    Yn = maxY - (np.arange(H) + 0.5) * gsd
+    lo, hi = float(np.nanmin(z)), float(np.nanmax(z))
+    start = math.floor(lo / interval) * interval
+    levels = np.arange(start + interval, hi + 1e-9, interval)
+    band = max(64, min(1024, 2_000_000 // max(W, 1)))       # rows per pass (memory bound)
+    out = []
+    for L in levels:
+        seg_list = []
+        for r0 in range(0, H - 1, band):
+            r1 = min(r0 + band, H - 1)
+            a, b = z[r0:r1, :-1], z[r0:r1, 1:]
+            c, d = z[r0 + 1:r1 + 1, :-1], z[r0 + 1:r1 + 1, 1:]
+            X0g = np.broadcast_to(Xn[:-1], a.shape)
+            X1g = np.broadcast_to(Xn[1:], a.shape)
+            Y0g = np.broadcast_to(Yn[r0:r1][:, None], a.shape)
+            Y1g = np.broadcast_to(Yn[r0 + 1:r1 + 1][:, None], a.shape)
+            edges = [(a, b, X0g, Y0g, X1g, Y0g),          # top
+                     (b, d, X1g, Y0g, X1g, Y1g),          # right
+                     (c, d, X0g, Y1g, X1g, Y1g),          # bottom
+                     (a, c, X0g, Y0g, X0g, Y1g)]          # left
+            finite = np.isfinite(a) & np.isfinite(b) & np.isfinite(c) & np.isfinite(d)
+            cx = np.empty((4,) + a.shape)
+            cy = np.empty((4,) + a.shape)
+            ck = np.empty((4,) + a.shape, bool)
+            for e, (za, zb, xa, ya, xb, yb) in enumerate(edges):
+                den = zb - za
+                safe = np.where(den == 0, 1.0, den)
+                t = np.clip((L - za) / safe, 0.0, 1.0)
+                ck[e] = finite & (den != 0) & (((za - L) * (zb - L)) < 0)
+                cx[e] = xa + t * (xb - xa)
+                cy[e] = ya + t * (yb - ya)
+            cnt = ck.sum(0)
+            for i in range(4):                            # exactly two crossings -> one segment
+                for j in range(i + 1, 4):
+                    m = (cnt == 2) & ck[i] & ck[j]
+                    if m.any():
+                        seg_list.append(np.stack([np.stack([cx[i][m], cy[i][m]], 1),
+                                                  np.stack([cx[j][m], cy[j][m]], 1)], 1))
+            m4 = cnt == 4                                 # saddle -> two segments
+            if m4.any():
+                cen = (a + b + c + d) * 0.25
+                for m, pairs4 in ((m4 & (cen >= L), ((0, 1), (2, 3))),
+                                  (m4 & (cen < L), ((0, 3), (1, 2)))):
+                    if not m.any():
+                        continue
+                    for i, j in pairs4:
+                        seg_list.append(np.stack([np.stack([cx[i][m], cy[i][m]], 1),
+                                                  np.stack([cx[j][m], cy[j][m]], 1)], 1))
+        if seg_list:
+            out.append((float(L), np.concatenate(seg_list, 0)))
+    return out
+
+
+# --------------------------------------------------------------------------
 # command line: DTM from an existing dsm.tif
 # --------------------------------------------------------------------------
 

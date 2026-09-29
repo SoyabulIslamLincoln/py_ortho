@@ -43,6 +43,8 @@ class DenseOptions:
     sgm_p1: float = 0.05              # SGM penalty for a one-step height change (cost = 1 - NCC)
     sgm_p2: float = 0.6               # SGM penalty for a larger jump (building edges)
     refine_min_score: float = 0.2     # finer levels only override the coarse height above this
+    #changed here: Pix4D-style true-orthophoto cue -- near-nadir views get more colour weight
+    view_angle_power: float = 1.5     # cos(incidence) exponent when blending true-ortho colour
     cache_mb: int = 1536
     workers: int = 0
 
@@ -96,12 +98,15 @@ def _pyramid(gray, n):
     return [np.ascontiguousarray(g) for g in out]
 
 
-def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions) -> DenseResult:
+def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions,
+                      biases: Optional[dict] = None) -> DenseResult:
+    #changed here: `biases` (optional) carries the Pix4D colour-balancing per-image offsets.
     backend = ar.backend
     xp = backend.xp
     frames = ar.frames
     t0 = time.time()
-    gsd = opt.gsd or 2.0 * native_gsd
+    #changed here: Pix4D-grade resolution -- the DSM/ortho default to the native GSD (was 2x)
+    gsd = opt.gsd or native_gsd
     img_scale = min(1.0, native_gsd / gsd)          # decode images so 1 px ~ 1 DSM cell
     workers = opt.workers or ar.workers
 
@@ -146,6 +151,10 @@ def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions
         g = gains.get(i)
         if g is not None:
             rgb *= np.asarray(g, np.float32)
+        #changed here: apply the Pix4D colour-balancing offset (black level) when present
+        b = None if biases is None else biases.get(i)
+        if b is not None:
+            rgb += np.asarray(b, np.float32)
         gray = (0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2])[..., None]
         pyr = _pyramid(np.ascontiguousarray(gray, np.float32), levels)
         # 4th channel: feather weight (distance to the image border), so colours blend smoothly
@@ -327,13 +336,24 @@ def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions
 
         # final pass at the chosen heights: score, agreeing views, colour
         score, st, valids, ref = score_at(Zbest, 0, gsd, X0, Y0, want_rgb=True)
+        #changed here: Pix4D view-angle weighting.  The true orthophoto must sample the surface
+        # with the least off-nadir stretch, so near-nadir views are favoured by cos(incidence).
+        cxs_w = xp.asarray((X0 + (np.arange(PW) + 0.5) * gsd).astype(np.float32))
+        cys_w = xp.asarray((Y0 - (np.arange(PH) + 0.5) * gsd).astype(np.float32))
+        va_power = float(getattr(opt, "view_angle_power", 1.5))
         acc = xp.zeros(Zbest.shape + (3,), xp.float32)
         wsum = xp.zeros(Zbest.shape, xp.float32)
         for vi, v in enumerate(views):
             rgbw, valid = backend.sample_view(v.rgb, v.cam(0), X0, Y0, gsd, Zbest)
             # views that disagree with the cell's reference at this height are likely occluded
             agree = xp.where(ref == vi, 1.0, xp.clip((st[vi] + 0.2) / 0.6, 0.0, 1.0))
-            w = rgbw[..., 3] ** 2 * agree * valid.astype(xp.float32)
+            #changed here: cos(angle between the local up normal and the view direction)
+            Cv = cam_c[vi]
+            dz = float(Cv[2]) - Zbest
+            dx = cxs_w[None, :] - float(Cv[0])
+            dy = cys_w[:, None] - float(Cv[1])
+            cos_inc = xp.clip(dz / xp.sqrt(dx * dx + dy * dy + dz * dz + 1e-6), 0.0, 1.0)
+            w = rgbw[..., 3] ** 2 * agree * valid.astype(xp.float32) * cos_inc ** va_power
             acc = acc + rgbw[..., :3] * w[..., None]
             wsum = wsum + w
         color = acc / xp.maximum(wsum, 1e-6)[..., None]
