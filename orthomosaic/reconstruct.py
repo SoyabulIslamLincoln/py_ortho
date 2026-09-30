@@ -40,7 +40,15 @@ class Options3D(Options):
     cloud_step: int = 1                     # keep every n-th confident DSM cell in the dense cloud
     mesh_max_vertices: int = 1_500_000
     texture_max: int = 8192
-    formats: tuple = ("ply", "las", "obj", "glb")
+    formats: tuple = ("ply", "laz", "obj", "glb")   # laz falls back to las without laspy[lazrs]
+    # densification (Pix4D stage 2): "depthmap" = per-image depth maps fused into a 3D dense cloud,
+    # the DSM is rasterised from that cloud; "sweep" = legacy ground-grid height sweep (2.5D only,
+    # used automatically for radiometric thermal, whose low texture suits its SGM regularisation)
+    dense_method: str = "depthmap"
+    depth_max_image: int = 1600             # matching image long side (~Pix4D "1/2 image scale")
+    depth_neighbors: int = 4
+    depth_min_views: int = 3                # images that must agree on a dense point (Pix4D: min. matches 3)
+    mesh_method: str = "auto"               # "auto": Poisson from the dense cloud (needs open3d), else DSM grid
     # digital terrain model (bare ground)
     dtm: bool = True
     dtm_max_object: float = 60.0            # metres: larger than your largest building's short side
@@ -172,10 +180,20 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
             gains, biases = solve_gains(al.used, ar.pairs), {}
     else:
         gains, biases = {}, {}
-    dopt = mvs.DenseOptions(gsd=opt.dsm_resolution, max_views=opt.max_views, min_score=opt.min_score,
-                            window=opt.ncc_window, tile=opt.tile, cache_mb=opt.cache_mb, workers=ar.workers,
-                            view_angle_power=opt.view_angle_power)   #changed here
-    dense = mvs.dense_reconstruct(ar, rec, gains, al.gsd, dopt, biases=biases)   #changed here
+    cloud = None
+    if opt.dense_method == "depthmap" and not thermal:
+        from .densify import DepthOptions, densify, rasterize
+        cloud = densify(ar, rec, gains, biases, out_dir,
+                        DepthOptions(max_image_dim=opt.depth_max_image, neighbors=opt.depth_neighbors,
+                                     min_views=opt.depth_min_views, workers=ar.workers))
+        minX, maxY, W, H, gsd, _ = mvs.grid_extent(rec, opt.dsm_resolution or al.gsd, al.gsd)
+        log.info("Dense cloud -> DSM: %d x %d cells at %.3f m (top-layer median per cell)", W, H, gsd)
+        dense = rasterize(cloud, minX, maxY, W, H, gsd)
+    else:
+        dopt = mvs.DenseOptions(gsd=opt.dsm_resolution, max_views=opt.max_views, min_score=opt.min_score,
+                                window=opt.ncc_window, tile=opt.tile, cache_mb=opt.cache_mb, workers=ar.workers,
+                                view_angle_power=opt.view_angle_power)
+        dense = mvs.dense_reconstruct(ar, rec, gains, al.gsd, dopt, biases=biases)
     gsd = dense.gsd
     max_fill = -1 if opt.dsm_max_fill < 0 else int(math.ceil(opt.dsm_max_fill / gsd))
     dsm, conf, support = mvs.postprocess(dense, opt.min_score, smooth_range=opt.dsm_smooth,
@@ -189,13 +207,18 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     colors = dense.rgb
     ortho_frac = None
     src_id = count = None
+    ortho_valid = covered              # cells of the orthomosaic that carry colour (alpha)
     if getattr(opt, "true_ortho", True) and not thermal and covered.any():
         from .ortho import true_orthophoto
         t1 = time.time()
         ortho_rgb, ortho_cov, src_id, count = true_orthophoto(ar, rec, dsm, dense.minX, dense.maxY, gsd,
                                                               gains, biases, opt)
+        # Only cells a calibrated photo actually sees are coloured. Cells hidden in every photo
+        # stay transparent (NoData): they cannot be recovered, and filling them with the dense
+        # matching colours would paint walls/roofs onto the hidden ground.
+        colors = ortho_rgb
+        ortho_valid = ortho_cov & covered
         if ortho_cov.any():
-            colors = np.where(ortho_cov[..., None], ortho_rgb, colors)
             ortho_frac = float(ortho_cov.sum() / max(covered.sum(), 1))
             log.info("True orthophoto: %.0f%% of DSM cells coloured only from visible views (%.1fs)",
                      100 * ortho_frac, time.time() - t1)
@@ -224,8 +247,8 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                       epsg, origin_xy, gsd, -1.0)
         _write_raster(os.path.join(out_dir, "coverage_count.tif"), count.astype(np.float32), "float32",
                       epsg, origin_xy, gsd)
-    rgba = np.dstack([colors, (covered * 255).astype(np.uint8)])
-    rgba[~covered, :3] = 0
+    rgba = np.dstack([colors, (ortho_valid * 255).astype(np.uint8)])
+    rgba[~ortho_valid, :3] = 0
     _write_raster(os.path.join(out_dir, "orthophoto.tif"), rgba, "rgba", epsg, origin_xy, gsd)
     pf = max(1, math.ceil(max(dsm.shape) / 2048))
     Image.fromarray(_colorize(dsm, covered)[::pf, ::pf]).save(os.path.join(out_dir, "dsm_preview.png"))
@@ -258,12 +281,17 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                                               offset=(ox, oy), epsg=epsg)
                 log.info("Contours: %d levels at %.2f m", len(contours), opt.contour_interval)
 
-    # ---- dense point cloud (confident cells only)
+    # ---- dense point cloud: the fused 3D cloud (walls included) or, for the sweep, confident DSM cells
     s = max(1, opt.cloud_step)
-    ys, xs = np.nonzero(conf[::s, ::s])
-    ys, xs = ys * s, xs * s
-    xyz = np.column_stack([dense.minX + (xs + 0.5) * gsd, dense.maxY - (ys + 0.5) * gsd, dense.Z[ys, xs]])
-    col = colors[ys, xs]
+    if cloud is not None:
+        xyz, col = cloud.xyz[::s], cloud.rgb[::s]
+        xs = np.clip(((xyz[:, 0] - dense.minX) / gsd).astype(np.int64), 0, dsm.shape[1] - 1)
+        ys = np.clip(((dense.maxY - xyz[:, 1]) / gsd).astype(np.int64), 0, dsm.shape[0] - 1)
+    else:
+        ys, xs = np.nonzero(conf[::s, ::s])
+        ys, xs = ys * s, xs * s
+        xyz = np.column_stack([dense.minX + (xs + 0.5) * gsd, dense.maxY - (ys + 0.5) * gsd, dense.Z[ys, xs]])
+        col = colors[ys, xs]
     cls = None                                       #changed here: ASPRS classes (set with the LAS)
     outputs = {"dsm": "dsm.tif", "orthophoto": "orthophoto.tif", "sparse": "sparse.ply",
                "valid_mask": "valid_mask.tif", "dsm_support": "dsm_support.tif"}
@@ -276,7 +304,7 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     if "ply" in opt.formats:
         export.write_ply(os.path.join(out_dir, "dense.ply"), xyz, col, offset3, f"EPSG:{epsg}" if epsg else "")
         outputs["dense_ply"] = "dense.ply"
-    if "las" in opt.formats:
+    if "las" in opt.formats or "laz" in opt.formats:
         #changed here: Pix4D-style point-cloud classification for the LAS deliverable
         cls = None
         if ground is not None:
@@ -285,23 +313,62 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                 cls = classify_surface(dsm, ground, ndsm_raw, gsd)[ys, xs]
             else:
                 cls = np.where(ground[ys, xs], 2, 1).astype(np.uint8)
-        export.write_las(os.path.join(out_dir, "dense.las"), xyz + np.array(offset3), col, epsg, classification=cls)
+            if cloud is not None and cls is not None:
+                # a point well below the surface of its cell (wall, under canopy) is not ground
+                below = xyz[:, 2] < dsm[ys, xs] - 1.0
+                cls = np.where(below & (cls == 2), 1, cls).astype(np.uint8)
+        las_path = os.path.join(out_dir, "dense.las")
+        export.write_las(las_path, xyz + np.array(offset3), col, epsg, classification=cls)
         outputs["dense_las"] = "dense.las"
+        if "laz" in opt.formats:
+            laz = export.las_to_laz(las_path)
+            if laz:
+                outputs["dense_laz"] = "dense.laz"
+                if "las" not in opt.formats:
+                    os.remove(las_path)
+                    outputs.pop("dense_las")
+            else:
+                log.warning("LAZ needs `pip install \"laspy[lazrs]\"`; wrote dense.las instead")
 
-    # ---- mesh from the DSM
-    if any(f in opt.formats for f in ("obj", "glb")):
+    # ---- mesh: Poisson surface from the dense cloud (Pix4D stage 2), else a 2.5D mesh from the DSM
+    mesh_info = None
+    want_mesh = any(f in opt.formats for f in ("obj", "glb"))
+    if want_mesh and cloud is not None and opt.mesh_method in ("auto", "poisson"):
+        t = time.time()
+        log.info("Meshing the dense cloud (screened Poisson)")
+        vdir = rec.C[cloud.cam] - cloud.xyz
+        vdir /= np.linalg.norm(vdir, axis=1, keepdims=True)
+        m = export.poisson_mesh(cloud.xyz, cloud.rgb, vdir, cloud.spacing,
+                                max_points=2 * opt.mesh_max_vertices, max_vertices=opt.mesh_max_vertices)
+        if m is None:
+            log.warning("Poisson mesh unavailable (install open3d, see above for errors): mesh built from the DSM")
+        else:
+            V, F, VC = m
+            if "obj" in opt.formats:
+                export.write_obj_colored(os.path.join(out_dir, "mesh.obj"), V, F, VC, offset3)
+                outputs["mesh_obj"] = "mesh.obj"
+            if "glb" in opt.formats:
+                export.write_glb(os.path.join(out_dir, "mesh.glb"), V, F, None, None, offset3, vertex_rgb=VC)
+                outputs["mesh_glb"] = "mesh.glb"
+            mesh_info = dict(method="poisson (dense cloud)", vertices=int(len(V)), triangles=int(len(F)))
+            log.info("Mesh: %d vertices, %d triangles from the dense cloud (%.1fs)", len(V), len(F), time.time() - t)
+            want_mesh = False
+    if want_mesh:
         n_valid = int(covered.sum())
         f = max(1, int(math.ceil(math.sqrt(n_valid / max(opt.mesh_max_vertices, 1)))))
         Zm, vm = _block_reduce(dsm, f, covered)
         V, F, UV = export.grid_mesh(Zm, vm & np.isfinite(Zm), dense.minX, dense.maxY, gsd * f)
         th = max(1, math.ceil(max(rgba.shape[:2]) / opt.texture_max))
-        tex = Image.fromarray(np.ascontiguousarray(colors[::th, ::th]))
+        # 3D-model texture only: cells no photo sees take the dense-matching colour instead of black
+        tex_rgb = np.where(ortho_valid[..., None], colors, dense.rgb)
+        tex = Image.fromarray(np.ascontiguousarray(tex_rgb[::th, ::th]))
         if "obj" in opt.formats:
             export.write_obj(os.path.join(out_dir, "mesh.obj"), V, F, UV, tex, offset3)
             outputs["mesh_obj"] = "mesh.obj"
         if "glb" in opt.formats:
             export.write_glb(os.path.join(out_dir, "mesh.glb"), V, F, UV, tex, offset3)
             outputs["mesh_glb"] = "mesh.glb"
+        mesh_info = dict(method="DSM grid (2.5D)", vertices=int(len(V)), triangles=int(len(F)))
         log.info("Mesh: %d vertices, %d triangles at %.3f m", len(V), len(F), gsd * f)
 
     report = dict(
@@ -309,6 +376,12 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         backend=ar.backend.name, georeferenced=georef, epsg=epsg, origin=[ox, oy],
         z_datum=rec.stats.get("z_datum"), z_to_absolute_offset=z_abs_offset,
         sfm=rec.stats,
+        dense=dict(method="depth maps -> fused 3D cloud -> DSM" if cloud is not None else "ground-grid height sweep",
+                   points=int(len(cloud.xyz)) if cloud is not None else None,
+                   median_views=int(np.median(cloud.views)) if cloud is not None else None,
+                   min_views=opt.depth_min_views if cloud is not None else None,
+                   point_spacing_m=float(cloud.spacing) if cloud is not None else None),
+        mesh=mesh_info,
         dsm=dict(gsd=gsd, width=int(dsm.shape[1]), height=int(dsm.shape[0]),
                  bounds=[origin_xy[0], origin_xy[1] - dsm.shape[0] * gsd, origin_xy[0] + dsm.shape[1] * gsd,
                          origin_xy[1]],
@@ -324,7 +397,7 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         ortho=dict(true_ortho=bool(getattr(opt, "true_ortho", True)),
                    occlusion=bool(getattr(opt, "occlusion", True)),
                    view_angle_power=float(getattr(opt, "view_angle_power", 1.5)),
-                   visible_fraction=ortho_frac, blend=opt.ortho_blend,
+                   visible_fraction=ortho_frac, hidden_cells_transparent=True, blend=opt.ortho_blend,
                    source_weights=list(opt.source_weights),
                    coverage_median=float(np.median(count[covered])) if count is not None and covered.any() else None,
                    single_view_fraction=float((count[covered] == 1).mean()) if count is not None and covered.any() else None),
@@ -428,7 +501,14 @@ def main(argv=None):
     ap.add_argument("--no-classify", action="store_true", help="skip ASPRS cloud classification")
     ap.add_argument("--cloud-step", type=int, default=d.cloud_step, help="thin the dense cloud (every n-th cell)")
     ap.add_argument("--mesh-max-vertices", type=int, default=d.mesh_max_vertices)
-    ap.add_argument("--formats", default=",".join(d.formats), help="comma list of ply,las,obj,glb")
+    ap.add_argument("--formats", default=",".join(d.formats), help="comma list of ply,las,laz,obj,glb")
+    ap.add_argument("--dense-method", choices=["depthmap", "sweep"], default=d.dense_method,
+                    help="depthmap: per-image depth maps fused into a 3D cloud, DSM from the cloud (Pix4D); "
+                         "sweep: legacy 2.5D height sweep")
+    ap.add_argument("--depth-max-image", type=int, default=d.depth_max_image,
+                    help="long side (px) of the images used for depth maps")
+    ap.add_argument("--depth-min-views", type=int, default=d.depth_min_views,
+                    help="images that must agree on a dense point")
     ap.add_argument("--no-dtm", action="store_true", help="skip the bare-ground DTM")
     ap.add_argument("--dtm-max-object", type=float, default=d.dtm_max_object,
                     help="largest building/tree size (m) the ground filter removes (default %(default)s)")
@@ -452,7 +532,8 @@ def main(argv=None):
                     #changed here: Pix4D-grade ortho / colour / elevation-mapping switches
                     true_ortho=not a.no_true_ortho, occlusion=not a.no_occlusion,
                     color_balance=not a.no_color_balance, view_angle_power=a.view_angle_power,
-                    ortho_blend=a.ortho_blend, seam_smoothness=a.seam_smoothness, dsm_max_fill=a.dsm_max_fill,
+                    dense_method=a.dense_method, depth_max_image=a.depth_max_image,
+                    depth_min_views=a.depth_min_views, ortho_blend=a.ortho_blend, seam_smoothness=a.seam_smoothness, dsm_max_fill=a.dsm_max_fill,
                     contour_interval=a.contours, classify_cloud=not a.no_classify,
                     formats=tuple(f.strip() for f in a.formats.split(",") if f.strip()))
     if a.bind_thermal:

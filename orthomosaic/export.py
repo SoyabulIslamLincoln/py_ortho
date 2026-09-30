@@ -1,10 +1,14 @@
-"""Writers for 3D outputs: PLY / LAS point clouds, OBJ and GLB textured meshes.
-All pure Python + numpy (no PDAL / Open3D / trimesh)."""
+"""Writers for 3D outputs: PLY / LAS / LAZ point clouds, OBJ and GLB meshes.
+
+PLY, LAS, OBJ and GLB are pure Python + numpy. Two outputs need optional packages:
+LAZ compression (`pip install "laspy[lazrs]"`) and the Poisson mesh from the dense cloud
+(`pip install open3d`); without them the LAS file / the DSM mesh is kept instead."""
 from __future__ import annotations
 
 import datetime
 import io
 import json
+import math
 import struct
 from typing import Optional
 
@@ -75,6 +79,21 @@ def write_las(path: str, xyz_abs: np.ndarray, rgb: np.ndarray, epsg: Optional[in
         fh.write(pts.tobytes())
 
 
+def las_to_laz(las_path: str) -> Optional[str]:
+    """Compress a LAS file to LAZ (same header, VLRs and points). Returns the LAZ path, or None
+    when no LAZ backend is installed (the LAS file is then kept)."""
+    try:
+        import laspy
+    except ImportError:
+        return None
+    if not laspy.LazBackend.detect_available():
+        return None
+    import os
+    laz = os.path.splitext(las_path)[0] + ".laz"
+    laspy.read(las_path).write(laz)
+    return laz
+
+
 # --------------------------------------------------------------------------
 # vector / vectorised elevation products
 # --------------------------------------------------------------------------
@@ -123,6 +142,91 @@ def grid_mesh(Z: np.ndarray, valid: np.ndarray, minX: float, maxY: float, cell: 
     return V, F, UV
 
 
+def poisson_mesh(xyz: np.ndarray, rgb: np.ndarray, view_dirs: np.ndarray, spacing: float,
+                 max_points: int = 3_000_000, max_vertices: int = 1_500_000, trim_quantile: float = 0.08):
+    """Screened Poisson surface from the dense cloud (Open3D). Returns (V, F, vertex_rgb uint8),
+    or None when Open3D is missing or fails.
+
+    Runs in a child process: Open3D's Poisson iso-surface extraction can abort the whole process
+    from C++ ("Failed to close loop"), which Python cannot catch; it is also forced single-threaded,
+    which avoids that abort in practice. Normals come from local PCA and are flipped towards the
+    camera that saw each point. The lowest-density vertices (`trim_quantile`) and triangles longer
+    than 4x the point spacing are removed: that is surface Poisson invents where there are no
+    points (the "bubble" effect over gaps and edges).
+    """
+    try:
+        import open3d  # noqa: F401
+    except ImportError:
+        return None
+    import os
+    import subprocess
+    import sys
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        src, dst = os.path.join(td, "in.npz"), os.path.join(td, "out.npz")
+        np.savez(src, xyz=np.asarray(xyz, np.float64), rgb=np.asarray(rgb, np.uint8),
+                 vdir=np.asarray(view_dirs, np.float32),
+                 args=np.array([spacing, max_points, max_vertices, trim_quantile], np.float64))
+        r = subprocess.run([sys.executable, "-c", "from orthomosaic.export import _poisson_worker as w; "
+                            "import sys; w(sys.argv[1], sys.argv[2])", src, dst],
+                           capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.exists(dst):
+            import logging
+            logging.getLogger(__name__).warning(
+                "Poisson meshing failed (exit %s): %s", r.returncode, (r.stderr or "").strip()[-300:])
+            return None
+        z = np.load(dst)
+        return z["V"], z["F"], z["C"]
+
+
+def _poisson_worker(src: str, dst: str):
+    import open3d as o3d
+    z = np.load(src)
+    spacing, max_points, max_vertices, trim_q = z["args"]
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(z["xyz"])
+    pcd.colors = o3d.utility.Vector3dVector(z["rgb"] / 255.0)
+    pcd.normals = o3d.utility.Vector3dVector(z["vdir"].astype(np.float64))  # carried through the voxel filter
+    ext = np.ptp(z["xyz"], axis=0)
+    area = max(float(ext[0] * ext[1]), 1e-6)
+    if len(pcd.points) > max_points:
+        pcd = pcd.voxel_down_sample(max(spacing, math.sqrt(area / max_points)))
+    step = max(spacing, math.sqrt(area / max(len(pcd.points), 1)))
+    view = np.asarray(pcd.normals).copy()
+    pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=4 * step, max_nn=30))
+    n = np.asarray(pcd.normals)
+    n[np.sum(n * view, 1) < 0] *= -1
+    pcd.normals = o3d.utility.Vector3dVector(n)
+    # octree depth: finest cell ~ max(point spacing, the size that meets the vertex budget)
+    cell = max(step, math.sqrt(area / max_vertices))
+    depth = int(np.clip(math.floor(math.log2(max(float(ext.max()) * 1.05 / cell, 2.0))), 6, 12))
+    mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=depth, scale=1.05, linear_fit=False, n_threads=1)
+    dens = np.asarray(dens)
+    mesh.remove_vertices_by_mask(dens < np.quantile(dens, trim_q))
+    mesh = mesh.crop(pcd.get_axis_aligned_bounding_box())
+    V, F = np.asarray(mesh.vertices), np.asarray(mesh.triangles)
+    if len(F):
+        e = np.max([np.linalg.norm(V[F[:, a]] - V[F[:, b]], axis=1) for a, b in ((0, 1), (1, 2), (2, 0))], 0)
+        mesh.remove_triangles_by_mask(e > 4 * max(step, cell))
+        mesh.remove_unreferenced_vertices()
+    V = np.asarray(mesh.vertices)
+    C = ((np.clip(np.asarray(mesh.vertex_colors), 0, 1) * 255 + 0.5).astype(np.uint8)
+         if mesh.has_vertex_colors() else np.full((len(V), 3), 200, np.uint8))
+    np.savez(dst, V=V, F=np.asarray(mesh.triangles), C=C)
+
+
+def write_obj_colored(path: str, V: np.ndarray, F: np.ndarray, rgb: np.ndarray, offset=(0.0, 0.0, 0.0)):
+    """Wavefront OBJ with per-vertex colours (`v x y z r g b`, read by MeshLab, CloudCompare,
+    Blender 4.x, Pix4D/Agisoft viewers). Vertices relative to `offset`."""
+    Vl = V - np.asarray(offset)
+    with open(path, "w") as fh:
+        fh.write(f"# pyOrthomosaic mesh from the dense point cloud; add offset {offset[0]:.3f} {offset[1]:.3f} "
+                 f"{offset[2]:.3f} for absolute coordinates\n")
+        np.savetxt(fh, np.column_stack([Vl, rgb / 255.0]), fmt="v %.3f %.3f %.3f %.4f %.4f %.4f")
+        np.savetxt(fh, F + 1, fmt="f %d %d %d")
+
+
 def write_obj(path: str, V: np.ndarray, F: np.ndarray, UV: np.ndarray, texture: Image.Image,
               offset=(0.0, 0.0, 0.0)):
     """Wavefront OBJ + MTL + JPEG texture (vertices relative to `offset`)."""
@@ -143,14 +247,17 @@ def write_obj(path: str, V: np.ndarray, F: np.ndarray, UV: np.ndarray, texture: 
                    fmt="f %d/%d %d/%d %d/%d")
 
 
-def write_glb(path: str, V: np.ndarray, F: np.ndarray, UV: np.ndarray, texture: Image.Image,
-              offset=(0.0, 0.0, 0.0)):
-    """Binary glTF 2.0 with an embedded JPEG texture. glTF is Y-up: (E, N, Z) -> (E, Z, -N)."""
+def write_glb(path: str, V: np.ndarray, F: np.ndarray, UV: Optional[np.ndarray], texture: Optional[Image.Image],
+              offset=(0.0, 0.0, 0.0), vertex_rgb: Optional[np.ndarray] = None):
+    """Binary glTF 2.0 with an embedded JPEG texture, or per-vertex colours (`vertex_rgb`).
+    glTF is Y-up: (E, N, Z) -> (E, Z, -N)."""
     Vl = (V - np.asarray(offset)).astype(np.float32)
     pos = np.column_stack([Vl[:, 0], Vl[:, 2], -Vl[:, 1]]).astype(np.float32)
+    ind = F.astype(np.uint32).ravel()
+    if vertex_rgb is not None:
+        return _write_glb_colored(path, pos, ind, vertex_rgb, offset)
     # glTF UV origin is top-left
     uv = np.column_stack([UV[:, 0], 1.0 - UV[:, 1]]).astype(np.float32)
-    ind = F.astype(np.uint32).ravel()
     buf = io.BytesIO()
     texture.convert("RGB").save(buf, "JPEG", quality=90)
     jpg = buf.getvalue()
@@ -195,5 +302,36 @@ def write_glb(path: str, V: np.ndarray, F: np.ndarray, UV: np.ndarray, texture: 
     total = 12 + 8 + len(js) + 8 + len(binary)
     with open(path, "wb") as fh:
         fh.write(struct.pack("<III", 0x46546C67, 2, total))
+        fh.write(struct.pack("<II", len(js), 0x4E4F534A) + js)
+        fh.write(struct.pack("<II", len(binary), 0x004E4942) + binary)
+
+
+def _write_glb_colored(path, pos, ind, rgb, offset):
+    col = np.ascontiguousarray(rgb, np.uint8)
+    col = np.column_stack([col, np.full(len(col), 255, np.uint8)])
+    blobs = [pos.tobytes(), col.tobytes(), ind.tobytes()]
+    views, off = [], 0
+    for b, tgt in zip(blobs, (34962, 34962, 34963)):
+        views.append({"buffer": 0, "byteOffset": off, "byteLength": len(b), "target": tgt})
+        off += len(b) + (-len(b) % 4)
+    binary = b"".join(b + b"\0" * (-len(b) % 4) for b in blobs)
+    gltf = {
+        "asset": {"version": "2.0", "generator": "pyOrthomosaic"},
+        "scene": 0, "scenes": [{"nodes": [0]}], "nodes": [{"mesh": 0}],
+        "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "COLOR_0": 1}, "indices": 2, "material": 0}]}],
+        "materials": [{"pbrMetallicRoughness": {"metallicFactor": 0.0, "roughnessFactor": 1.0}, "doubleSided": True}],
+        "accessors": [
+            {"bufferView": 0, "componentType": 5126, "count": len(pos), "type": "VEC3",
+             "min": pos.min(0).tolist(), "max": pos.max(0).tolist()},
+            {"bufferView": 1, "componentType": 5121, "normalized": True, "count": len(col), "type": "VEC4"},
+            {"bufferView": 2, "componentType": 5125, "count": len(ind), "type": "SCALAR"},
+        ],
+        "bufferViews": views, "buffers": [{"byteLength": len(binary)}],
+        "extras": {"offset": list(map(float, offset)), "axes": "x=East, y=Up, z=-North"},
+    }
+    js = json.dumps(gltf, separators=(",", ":")).encode()
+    js += b" " * (-len(js) % 4)
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<III", 0x46546C67, 2, 12 + 8 + len(js) + 8 + len(binary)))
         fh.write(struct.pack("<II", len(js), 0x4E4F534A) + js)
         fh.write(struct.pack("<II", len(binary), 0x004E4942) + binary)

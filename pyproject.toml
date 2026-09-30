@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 authors = [{ name = "Soyabul Islam Lincoln", email = "islamsoyabul98@gmail.com" }]
 license = "MIT"
 name = "pyOrthomosaic"
-version = "0.3.4"
+version = "0.4.0"
 description = "Native (Cython + optional CUDA) orthomosaic generator for nadir drone imagery"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -22,6 +22,8 @@ dependencies = ["numpy>=1.21", "pillow>=9.0"]
 [project.optional-dependencies]
 cuda = ["cupy-cuda12x[ctk]"]   # [ctk] = CUDA headers needed for runtime kernel compilation
 mps = ["mlx>=0.25; sys_platform == 'darwin' and platform_machine == 'arm64'"]   # Apple-silicon GPU
+mesh = ["open3d>=0.18"]          # Poisson mesh from the dense cloud (macOS: also `brew install libusb`)
+laz = ["laspy[lazrs]>=2.4"]      # LAZ-compressed dense point cloud
 
 [project.scripts]
 orthomosaic = "orthomosaic.__main__:main"

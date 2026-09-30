@@ -98,19 +98,13 @@ def _pyramid(gray, n):
     return [np.ascontiguousarray(g) for g in out]
 
 
-def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions,
-                      biases: Optional[dict] = None) -> DenseResult:
-    #changed here: `biases` (optional) carries the Pix4D colour-balancing per-image offsets.
-    backend = ar.backend
-    xp = backend.xp
-    frames = ar.frames
-    t0 = time.time()
-    #changed here: Pix4D-grade resolution -- the DSM/ortho default to the native GSD (was 2x)
-    gsd = opt.gsd or native_gsd
-    img_scale = min(1.0, native_gsd / gsd)          # decode images so 1 px ~ 1 DSM cell
-    workers = opt.workers or ar.workers
+def grid_extent(rec, gsd: float, native_gsd: float, max_cells: float = 40e6):
+    """North-up DSM grid covering the camera footprints at typical ground height.
 
-    # ---- extent: camera footprints at the typical ground height
+    Returns (minX, maxY, W, H, gsd, img_scale); minX/maxY are the top-left cell *corner*, the
+    extent is snapped to multiples of the cell size and the cell size grows if the area would
+    need more than `max_cells` cells."""
+    img_scale = min(1.0, native_gsd / gsd)
     zg = float(np.percentile(rec.X[:, 2], 20)) if len(rec.X) else 0.0
     corners = []
     for k, i in enumerate(rec.used):
@@ -126,14 +120,31 @@ def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions
     maxX = math.ceil(np.percentile(corners[:, 0], 99) / gsd) * gsd
     minY = math.floor(np.percentile(corners[:, 1], 1) / gsd) * gsd
     maxY = math.ceil(np.percentile(corners[:, 1], 99) / gsd) * gsd
-    if (maxX - minX) * (maxY - minY) / gsd ** 2 > opt.max_cells:
-        gsd = math.sqrt((maxX - minX) * (maxY - minY) / opt.max_cells)
+    if (maxX - minX) * (maxY - minY) / gsd ** 2 > max_cells:
+        gsd = math.sqrt((maxX - minX) * (maxY - minY) / max_cells)
         img_scale = min(1.0, native_gsd / gsd)
-        log.info("Dense: cell size raised to %.3f m to stay under %.0fM cells", gsd, opt.max_cells / 1e6)
+        log.info("Dense: cell size raised to %.3f m to stay under %.0fM cells", gsd, max_cells / 1e6)
         minX, maxX = math.floor(minX / gsd) * gsd, math.ceil(maxX / gsd) * gsd
         minY, maxY = math.floor(minY / gsd) * gsd, math.ceil(maxY / gsd) * gsd
     W = int(round((maxX - minX) / gsd))
     H = int(round((maxY - minY) / gsd))
+    return minX, maxY, W, H, gsd, img_scale
+
+
+def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions,
+                      biases: Optional[dict] = None) -> DenseResult:
+    #changed here: `biases` (optional) carries the Pix4D colour-balancing per-image offsets.
+    backend = ar.backend
+    xp = backend.xp
+    frames = ar.frames
+    t0 = time.time()
+    #changed here: Pix4D-grade resolution -- the DSM/ortho default to the native GSD (was 2x)
+    gsd = opt.gsd or native_gsd
+    img_scale = min(1.0, native_gsd / gsd)          # decode images so 1 px ~ 1 DSM cell
+    workers = opt.workers or ar.workers
+
+    minX, maxY, W, H, gsd, img_scale = grid_extent(rec, gsd, native_gsd, opt.max_cells)
+    zg = float(np.percentile(rec.X[:, 2], 20)) if len(rec.X) else 0.0
     log.info("Dense: %d x %d cells at %.3f m, images at %.2f scale, %s backend", W, H, gsd, img_scale, backend.name)
 
     Zacc = np.zeros((H, W), np.float32)
