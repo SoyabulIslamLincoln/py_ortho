@@ -49,10 +49,16 @@ class Options3D(Options):
     true_ortho: bool = True                 # re-render the ortho on the final DSM (occlusion-aware)
     occlusion: bool = True                  # drop views hidden behind buildings/trees
     occlusion_tol: float = 0.20             # metres a ray may pass under the surface before it blocks
-    occlusion_steps: int = 12               # ray-march samples between camera and surface
+    occlusion_steps: int = 96               # max line-of-sight samples per ray (1 DSM cell apart when possible)
     occlusion_stride: int = 2               # test occlusion on every n-th cell, then grow the mask
     ortho_tile: int = 256                   # true-orthophoto tile size (cells)
     view_angle_power: float = 1.5           # nadir preference when blending the true orthophoto
+    ortho_blend: str = "seam"               # "seam": one source per cell + seam optimisation; "feather": average
+    source_weights: tuple = (1.0, 0.5, 0.7, 0.3)   # angle, resolution, border distance, exposure
+    seam_smoothness: float = 0.6            # weight of the seam (colour-disagreement) term
+    seam_iters: int = 4
+    seam_band: int = 3                      # cells blended on each side of a seam
+    dsm_max_fill: float = 2.0               # metres a hole may be interpolated from measured cells (-1 = all)
     color_balance: bool = True              # per-image gain+offset radiometric correction (Pix4D)
     contour_interval: float = 0.0           # metres between terrain contour lines (0 = off)
     classify_cloud: bool = True             # ASPRS ground/building/vegetation classes in the LAS
@@ -170,9 +176,10 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                             window=opt.ncc_window, tile=opt.tile, cache_mb=opt.cache_mb, workers=ar.workers,
                             view_angle_power=opt.view_angle_power)   #changed here
     dense = mvs.dense_reconstruct(ar, rec, gains, al.gsd, dopt, biases=biases)   #changed here
-    dsm, conf = mvs.postprocess(dense, opt.min_score, smooth_range=opt.dsm_smooth,
-                                smooth_iters=opt.dsm_smooth_iters)
     gsd = dense.gsd
+    max_fill = -1 if opt.dsm_max_fill < 0 else int(math.ceil(opt.dsm_max_fill / gsd))
+    dsm, conf, support = mvs.postprocess(dense, opt.min_score, smooth_range=opt.dsm_smooth,
+                                         smooth_iters=opt.dsm_smooth_iters, max_fill_cells=max_fill)
     covered = np.isfinite(dsm)
     origin_xy = (dense.minX + ox, dense.maxY + oy)
 
@@ -181,11 +188,12 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     #seam feathering.  This is what turns the dense colours into a true orthophoto.
     colors = dense.rgb
     ortho_frac = None
+    src_id = count = None
     if getattr(opt, "true_ortho", True) and not thermal and covered.any():
         from .ortho import true_orthophoto
         t1 = time.time()
-        ortho_rgb, ortho_cov = true_orthophoto(ar, rec, dsm, dense.minX, dense.maxY, gsd,
-                                               gains, biases, opt)
+        ortho_rgb, ortho_cov, src_id, count = true_orthophoto(ar, rec, dsm, dense.minX, dense.maxY, gsd,
+                                                              gains, biases, opt)
         if ortho_cov.any():
             colors = np.where(ortho_cov[..., None], ortho_rgb, colors)
             ortho_frac = float(ortho_cov.sum() / max(covered.sum(), 1))
@@ -205,6 +213,17 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     # ---- rasters
     dsm_out = np.where(covered, dsm, NODATA).astype(np.float32)
     _write_raster(os.path.join(out_dir, "dsm.tif"), dsm_out, "float32", epsg, origin_xy, gsd, NODATA)
+    # inspection rasters on the same grid: 1/0 validity, support (1 measured, 2 interpolated),
+    # chosen source image (index into report["source_images"]) and number of seeing views
+    _write_raster(os.path.join(out_dir, "valid_mask.tif"), covered.astype(np.float32), "float32", epsg,
+                  origin_xy, gsd)
+    _write_raster(os.path.join(out_dir, "dsm_support.tif"), support.astype(np.float32), "float32", epsg,
+                  origin_xy, gsd, 0.0)
+    if src_id is not None:
+        _write_raster(os.path.join(out_dir, "source_image_id.tif"), src_id.astype(np.float32), "float32",
+                      epsg, origin_xy, gsd, -1.0)
+        _write_raster(os.path.join(out_dir, "coverage_count.tif"), count.astype(np.float32), "float32",
+                      epsg, origin_xy, gsd)
     rgba = np.dstack([colors, (covered * 255).astype(np.uint8)])
     rgba[~covered, :3] = 0
     _write_raster(os.path.join(out_dir, "orthophoto.tif"), rgba, "rgba", epsg, origin_xy, gsd)
@@ -246,7 +265,10 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     xyz = np.column_stack([dense.minX + (xs + 0.5) * gsd, dense.maxY - (ys + 0.5) * gsd, dense.Z[ys, xs]])
     col = colors[ys, xs]
     cls = None                                       #changed here: ASPRS classes (set with the LAS)
-    outputs = {"dsm": "dsm.tif", "orthophoto": "orthophoto.tif", "sparse": "sparse.ply"}
+    outputs = {"dsm": "dsm.tif", "orthophoto": "orthophoto.tif", "sparse": "sparse.ply",
+               "valid_mask": "valid_mask.tif", "dsm_support": "dsm_support.tif"}
+    if src_id is not None:
+        outputs.update(source_image_id="source_image_id.tif", coverage_count="coverage_count.tif")
     if dtm is not None:
         outputs.update(dtm="dtm.tif", ndsm="ndsm.tif")
     if contours:                                     #changed here
@@ -291,6 +313,8 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                  bounds=[origin_xy[0], origin_xy[1] - dsm.shape[0] * gsd, origin_xy[0] + dsm.shape[1] * gsd,
                          origin_xy[1]],
                  confident_fraction=float(conf.sum() / max(covered.sum(), 1)),
+                 measured_cells=int((support == 1).sum()), interpolated_cells=int((support == 2).sum()),
+                 max_fill_m=opt.dsm_max_fill,
                  z_range=[float(np.nanpercentile(dsm, 1)), float(np.nanpercentile(dsm, 99))] if covered.any() else None),
         dtm=(dict(ground_fraction=float(ground.sum() / max(covered.sum(), 1)),
                   max_object=opt.dtm_max_object,
@@ -300,7 +324,11 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         ortho=dict(true_ortho=bool(getattr(opt, "true_ortho", True)),
                    occlusion=bool(getattr(opt, "occlusion", True)),
                    view_angle_power=float(getattr(opt, "view_angle_power", 1.5)),
-                   visible_fraction=ortho_frac),
+                   visible_fraction=ortho_frac, blend=opt.ortho_blend,
+                   source_weights=list(opt.source_weights),
+                   coverage_median=float(np.median(count[covered])) if count is not None and covered.any() else None,
+                   single_view_fraction=float((count[covered] == 1).mean()) if count is not None and covered.any() else None),
+        source_images=[frames[i].name for i in rec.used],
         color=dict(balancing=bool(getattr(opt, "color_balance", True)),
                    gain_median=[float(np.median([g[0] for g in gains.values()])) if gains else 1.0,
                                 float(np.median([g[1] for g in gains.values()])) if gains else 1.0,
@@ -389,6 +417,12 @@ def main(argv=None):
                     help="use gains-only exposure compensation (no per-image offset)")
     ap.add_argument("--view-angle-power", type=float, default=d.view_angle_power,
                     help="nadir preference when blending the true orthophoto (0 = off)")
+    ap.add_argument("--ortho-blend", choices=["seam", "feather"], default=d.ortho_blend,
+                    help="seam: one source image per cell with optimised seams (no ghosting); "
+                         "feather: weighted average of all visible views")
+    ap.add_argument("--seam-smoothness", type=float, default=d.seam_smoothness)
+    ap.add_argument("--dsm-max-fill", type=float, default=d.dsm_max_fill,
+                    help="metres a DSM hole may be interpolated from measurements (-1 = fill all)")
     ap.add_argument("--contours", type=float, default=d.contour_interval,
                     help="terrain contour interval in metres (0 = off)")
     ap.add_argument("--no-classify", action="store_true", help="skip ASPRS cloud classification")
@@ -418,6 +452,7 @@ def main(argv=None):
                     #changed here: Pix4D-grade ortho / colour / elevation-mapping switches
                     true_ortho=not a.no_true_ortho, occlusion=not a.no_occlusion,
                     color_balance=not a.no_color_balance, view_angle_power=a.view_angle_power,
+                    ortho_blend=a.ortho_blend, seam_smoothness=a.seam_smoothness, dsm_max_fill=a.dsm_max_fill,
                     contour_interval=a.contours, classify_cloud=not a.no_classify,
                     formats=tuple(f.strip() for f in a.formats.split(",") if f.strip()))
     if a.bind_thermal:

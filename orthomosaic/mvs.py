@@ -481,12 +481,31 @@ def fill_holes(Z: np.ndarray) -> np.ndarray:
     return filled.astype(np.float32)
 
 
+def _near(mask: np.ndarray, cells: int) -> np.ndarray:
+    """Cells within `cells` (chessboard distance) of a True cell, by repeated 3x3 dilation."""
+    out = mask.copy()
+    for _ in range(max(0, int(cells))):
+        grown = out.copy()
+        grown[1:] |= out[:-1]
+        grown[:-1] |= out[1:]
+        grown[:, 1:] |= out[:, :-1]
+        grown[:, :-1] |= out[:, 1:]
+        if (grown == out).all():
+            break
+        out = grown
+    return out
+
+
 def postprocess(d: DenseResult, min_score: float, max_dev: float = 1.0,
-                smooth_range: float = 0.4, smooth_iters: int = 2):
-    """Returns (dsm_filled, confident_mask).
+                smooth_range: float = 0.4, smooth_iters: int = 2, max_fill_cells: int = -1):
+    """Returns (dsm, confident_mask, support).
+
+    `support` codes every cell: 0 no data, 1 measured (confident stereo), 2 interpolated.
+    Interpolated cells are never presented as measurements.
 
     1. Drop low-confidence cells and isolated spikes (blunders that would otherwise pit the roof).
-    2. Interpolate holes inside the covered area.
+    2. Interpolate holes inside the covered area, but only up to `max_fill_cells` from a measured
+       cell (-1 = unlimited); farther cells stay NoData instead of being invented.
     3. Edge-preserving surface smoothing: flat surfaces (roofs, ground) are de-noised while the
        tall step at a building edge is kept sharp -- this is what makes roofs read flat and edges
        crisp instead of bumpy and fuzzy. `smooth_range` is the height scale (m) treated as "same
@@ -501,12 +520,14 @@ def postprocess(d: DenseResult, min_score: float, max_dev: float = 1.0,
         conf &= ~spikes
         Zc[spikes] = np.nan
     filled = fill_holes(Zc)
-    filled[~d.covered] = np.nan
+    keep = d.covered if max_fill_cells < 0 else (d.covered & _near(conf, max_fill_cells))
+    filled[~keep] = np.nan
     # edge-preserving smoothing on the covered area
     if smooth_range > 0 and smooth_iters > 0:
         vmask = np.isfinite(filled).astype(np.uint8)
         z = np.nan_to_num(filled, nan=0.0).astype(np.float32)
         for _ in range(smooth_iters):
             z = _mvs.bilateral(np.ascontiguousarray(z), vmask, 3, float(smooth_range), 2.0)
-        filled = np.where(d.covered, z, np.nan).astype(np.float32)
-    return filled, conf
+        filled = np.where(keep, z, np.nan).astype(np.float32)
+    support = np.where(conf & keep, 1, np.where(np.isfinite(filled), 2, 0)).astype(np.uint8)
+    return filled, conf, support

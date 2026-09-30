@@ -1,4 +1,5 @@
 .venv/
+.venv-dsm/
 build/
 dist/
 wheelhouse/
@@ -7,3 +8,4 @@ __pycache__/
 orthomosaic/*.c
 *.so
 *.pyd
+.DS_Store
