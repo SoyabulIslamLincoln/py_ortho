@@ -28,6 +28,11 @@ class Options:
     # features / matching
     feature_max_dim: int = 2000        # detect features on images downscaled to this
     n_features: int = 5000
+    # ODM-style masks and rolling shutter (see masks.py / rollingshutter.py)
+    sky_removal: bool = False          # AI sky masks for non-nadir images (needs onnxruntime)
+    bg_removal: bool = False           # AI background masks (U^2-Net, needs onnxruntime)
+    rolling_shutter: bool = False      # correct electronic-shutter distortion in the bundle adjustment
+    rolling_shutter_readout: float = 0.0   # ms; 0 = ODM readout database / 30 ms default
     neighbors: int = 8                 # candidate pairs per image (GPS kNN)
     ratio: float = 0.8
     min_inliers: int = 25
@@ -124,6 +129,13 @@ def align_images(images: Union[str, Sequence[str]], opt: Options) -> AlignResult
                  len(gps_idx), len(frames), zone, "N" if north else "S", epsg)
     else:
         log.warning("No usable GPS: output will not be georeferenced")
+
+    # ---- masks (user <stem>_mask.png, or ODM-style AI sky/background masks)
+    from . import masks as _masks
+    _masks.generate_masks(frames, opt.sky_removal, opt.bg_removal, workers)
+    n_masked = sum(os.path.isfile(_masks.mask_path(f.path)) for f in frames)
+    if n_masked:
+        log.info("Masks found for %d/%d images (masked pixels are ignored)", n_masked, len(frames))
 
     # ---- features
     log.info("Extracting features (%d workers)", workers)

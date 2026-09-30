@@ -356,6 +356,7 @@ def gcp_report(rec: Reconstruction, origin3) -> dict:
 
 def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float = 0.85,
                 min_track: int = 2, refine_focal: Optional[bool] = None,
+                rolling_shutter: bool = False, rolling_shutter_readout: float = 0.0,
                 gcps: Optional[dict] = None, gcp_sigma: float = 0.05) -> Reconstruction:
     """Sparse reconstruction from an AlignResult (see pipeline.align_images).
 
@@ -475,12 +476,19 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
         log.info("  BA round %d: %d points, %d obs, median err %.2f px, dropping %d obs > %.1f px (%.1fs)",
                  rnd + 1, len(rec.X), len(err), float(np.median(err)), int((~keep).sum()), thr, time.time() - t)
         _keep_observations(rec, keep)
+        if rnd == 0 and rolling_shutter:
+            # poses and points are now reliable: move observations to the global-shutter
+            # position (OpenSfM/ODM rolling-shutter correction), later rounds refine on them
+            from .rollingshutter import correct_observations
+            rs_stats = correct_observations(rec, ar.frames, rolling_shutter_readout)
     err = bundle_adjust(rec, pri, 2 * px)
     rec.rms_px = float(np.sqrt(np.mean(np.square(err))))
     rec.stats = dict(points=int(len(rec.X)), observations=int(len(err)), pairs=len(results),
                      rms_px=rec.rms_px, focal_px=[it.f for it in rec.intr],
                      k1=[it.k1 for it in rec.intr], k2=[it.k2 for it in rec.intr],
                      z_datum="take-off (DJI relative altitude)" if has_rel_alt else "mean ground")
+    if rolling_shutter:
+        rec.stats["rolling_shutter"] = rs_stats
     if gcps:
         gr = gcp_report(rec, None)
         rec.stats["gcp"] = gr

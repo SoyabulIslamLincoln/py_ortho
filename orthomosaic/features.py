@@ -113,4 +113,11 @@ def extract(frame: Frame, max_dim: int = 2000, n_features: int = 5000, levels: i
     col /= 25.0
 
     xy_full = (xy + 0.5) * np.array([frame.width / w0, frame.height / h0]) - 0.5
+    from .masks import load_mask
+    m = load_mask(frame.path, frame.width, frame.height)
+    if m is not None:                   # no features on masked pixels (sky, background, ...)
+        xi = np.clip(np.round(xy_full[:, 0]).astype(int), 0, frame.width - 1)
+        yi = np.clip(np.round(xy_full[:, 1]).astype(int), 0, frame.height - 1)
+        keep = m[yi, xi]
+        xy_full, desc, col = xy_full[keep], desc[keep], col[keep]
     return Features(xy_full, desc, col), s

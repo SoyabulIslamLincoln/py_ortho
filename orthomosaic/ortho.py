@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 from .imageio import load_rgb
+from .masks import load_mask
 from .mvs import _View
 from .render import ImageCache
 
@@ -191,7 +192,11 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
         # 4th channel: feather weight (distance to the image border) -> smooth view seams
         fy = np.minimum(np.arange(h) + 0.5, h - 0.5 - np.arange(h)) / (0.5 * min(h, w))
         fx = np.minimum(np.arange(w) + 0.5, w - 0.5 - np.arange(w)) / (0.5 * min(h, w))
-        rgb = np.dstack([rgb, np.clip(np.minimum(fy[:, None], fx[None, :]), 0, 1).astype(np.float32)])
+        feather = np.clip(np.minimum(fy[:, None], fx[None, :]), 0, 1).astype(np.float32)
+        m = load_mask(fr.path, w, h)
+        if m is not None:
+            feather[~m] = 0.0                    # masked pixels: weight 0 = not a valid sample
+        rgb = np.dstack([rgb, feather])
         it = rec.intr[rec.cam_group[k]]
         sx = rgb.shape[1] / fr.width
         return _View([], backend.upload(np.ascontiguousarray(rgb)),
@@ -284,7 +289,7 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
         for j, (k, v) in enumerate(zip(cand, views)):
             rv, vv = backend.sample_view(v.rgb, v.cam(0), X0, Y0, gsd, Ztile)
             rgbw = backend.to_numpy(rv)
-            valid = backend.to_numpy(vv)[rr, cc] > 0
+            valid = (backend.to_numpy(vv)[rr, cc] > 0) & (rgbw[rr, cc, 3] > 0)
             C = rec.C[k].astype(np.float64)
             ray = np.column_stack([C[0] - wx, C[1] - wy, C[2] - wz])
             rng_ = np.linalg.norm(ray, axis=1) + 1e-9

@@ -10,7 +10,7 @@ DSM cell directly and so can never produce wall points or a true 3D cloud.
    (uniform in inverse depth, range from the image's own tie points) are back-projected with
    the full camera model, projected into the source views and scored with windowed NCC.
    The score is the mean of the best `top_k` source views, so a view that is occluded at that
-   pixel does not veto it. Coarse-to-fine: full sweep at half resolution, then a local refine.
+   pixel does not veto it. Coarse-to-fine: full sweep at 1/4 resolution, then local refinements at 1/2 and full.
    Weakly textured pixels (reference window std below `min_texture`) get no depth rather than a
    guess.
 3. **Geometric consistency + fusion.** A depth is kept only when at least `min_views - 1`
@@ -42,6 +42,7 @@ from typing import Optional
 import numpy as np
 
 from .imageio import load_rgb
+from .masks import load_mask
 from .mvs import DenseResult, _near
 
 log = logging.getLogger(__name__)
@@ -192,7 +193,8 @@ def _ncc_views(ref, ref_stats, srcs, cam_r, cams_s, rays_w, depth, r, top_k):
         xc2 = b[2] + depth * A[2]
         u, v = cs.project_cam(xc0, xc1, xc2)
         val, ok = _bilinear(img, u, v)
-        ok &= xc2 > 0
+        ok &= (xc2 > 0) & np.isfinite(val)          # NaN = masked source pixel
+        val = np.where(ok, val, 0.0)
         okf = ok.astype(np.float32)
         val = val * okf
         cover = _box(okf, r)
@@ -260,6 +262,8 @@ def depth_map(k, nbrs, rec, views, opt: DepthOptions):
         return None
     ref_rgb, cam_r = views(k)
     ref = _norm(ref_rgb[..., :3].mean(-1))
+    ref_mask = ~np.isfinite(ref)
+    ref = np.where(ref_mask, 0.0, ref).astype(np.float32)
     src = [views(j) for j in nbrs]
     srcs = [_norm(s[0][..., :3].mean(-1)) for s in src]
     cams_s = [s[1] for s in src]
@@ -291,7 +295,7 @@ def depth_map(k, nbrs, rec, views, opt: DepthOptions):
         dstep /= 2
     depth = d
     sd = sd * 64.0                                   # back to 0-255 grey units
-    bad = (score < opt.min_ncc) | (sd < opt.min_texture) | (depth < rng[0]) | (depth > rng[1])
+    bad = ref_mask | (score < opt.min_ncc) | (sd < opt.min_texture) | (depth < rng[0]) | (depth > rng[1])
     depth[bad] = np.nan
     return depth, score
 
@@ -328,6 +332,9 @@ def densify(ar, rec, gains: dict, biases: Optional[dict], out_dir: str, opt: Dep
             b = None if biases is None else biases.get(i)
             if b is not None:
                 rgb += np.asarray(b, np.float32)
+            m = load_mask(frames[i].path, rgb.shape[1], rgb.shape[0])
+            if m is not None:
+                rgb[~m] = np.nan                       # masked: never matched, never fused
             v = (rgb, cams[k])
             with lock:                       # bounded: drop the oldest entry
                 if len(cache) > 2 * workers * (opt.neighbors + 1):
@@ -426,10 +433,24 @@ def densify(ar, rec, gains: dict, biases: Optional[dict], out_dir: str, opt: Dep
 
 
 # ------------------------------------------------------------------ DSM from the cloud
+def radius_steps(spacing: float, steps: int = 3, multiplier: float = 1.0) -> list:
+    """ODM's DEM search radii: point spacing * multiplier, growing by sqrt(2) per step."""
+    r = [spacing * multiplier]
+    for _ in range(max(1, steps) - 1):
+        r.append(r[-1] * math.sqrt(2))
+    return r
+
+
 def rasterize(cloud: DenseCloud, minX: float, maxY: float, W: int, H: int, gsd: float,
-              layer_gap: float = 1.0, covered: Optional[np.ndarray] = None) -> DenseResult:
-    """Top-layer DSM from the dense cloud (see module docstring). Returns a DenseResult whose
-    `score` is 1 for measured cells and 0 elsewhere."""
+              layer_gap: float = 1.0, covered: Optional[np.ndarray] = None,
+              radii: Optional[list] = None) -> DenseResult:
+    """Top-layer DSM from the dense cloud (see module docstring).
+
+    Empty cells are filled radius by radius (ODM's stepped radii, `radius_steps`): a cell within
+    the current radius of measured cells takes the *lower median* of its measured neighbours, so
+    no value is averaged across a height step. `score` is 1 for cells with points or within the
+    first radius (the point footprint), 0.25 for cells filled at a larger radius (reported as
+    interpolated), 0 elsewhere."""
     col = np.floor((cloud.xyz[:, 0] - minX) / gsd).astype(np.int64)
     row = np.floor((maxY - cloud.xyz[:, 1]) / gsd).astype(np.int64)
     ok = (col >= 0) & (col < W) & (row >= 0) & (row < H)
@@ -451,25 +472,28 @@ def rasterize(cloud: DenseCloud, minX: float, maxY: float, W: int, H: int, gsd: 
     RGB = np.zeros((H * W, 3), np.uint8)
     RGB[uc] = np.clip(csum[uc] / ncell[uc, None], 0, 255).astype(np.uint8)
     Z, RGB = Z.reshape(H, W), RGB.reshape(H, W, 3)
+    score = np.isfinite(Z).astype(np.float32)
 
-    # cells inside a point's footprint (point spacing > DSM cell): lower median of measured
-    # neighbours, never an average across a step
-    for _ in range(max(0, int(round(cloud.spacing / gsd / 2)))):
-        miss = ~np.isfinite(Z)
-        p = np.pad(Z, 1, constant_values=np.nan)
-        st = np.stack([p[dy:dy + H, dx:dx + W] for dy in range(3) for dx in range(3)])
-        n = np.isfinite(st).sum(0)
-        srt = np.sort(np.where(np.isfinite(st), st, np.inf), 0)
-        lower = np.take_along_axis(srt, np.maximum(n - 1, 0)[None] // 2, 0)[0]
-        fill = miss & (n >= 3)
-        if not fill.any():
-            break
-        pc = np.pad(RGB, ((1, 1), (1, 1), (0, 0)))
-        best = np.argmin(np.abs(np.where(np.isfinite(st), st, np.inf) - lower[None]), 0)
-        dy, dx = np.divmod(best, 3)
-        yy, xx = np.mgrid[0:H, 0:W]
-        Z = np.where(fill, lower, Z).astype(np.float32)
-        RGB = np.where(fill[..., None], pc[yy + dy, xx + dx], RGB)
-    measured = np.isfinite(Z)
-    cov = covered if covered is not None else _near(measured, 8)
-    return DenseResult(Z, measured.astype(np.float32), RGB, cov, minX, maxY, gsd)
+    grown = 0
+    yy, xx = np.mgrid[0:H, 0:W]
+    for step, r in enumerate(radii or [cloud.spacing]):
+        target = int(math.ceil(r / gsd - 0.5))
+        for _ in range(max(0, target - grown)):
+            miss = ~np.isfinite(Z)
+            p = np.pad(Z, 1, constant_values=np.nan)
+            st = np.stack([p[dy:dy + H, dx:dx + W] for dy in range(3) for dx in range(3)])
+            n = np.isfinite(st).sum(0)
+            fill = miss & (n >= 3)
+            if not fill.any():
+                break
+            srt = np.sort(np.where(np.isfinite(st), st, np.inf), 0)
+            lower = np.take_along_axis(srt, np.maximum(n - 1, 0)[None] // 2, 0)[0]
+            best = np.argmin(np.abs(np.where(np.isfinite(st), st, np.inf) - lower[None]), 0)
+            dy, dx = np.divmod(best, 3)
+            pc = np.pad(RGB, ((1, 1), (1, 1), (0, 0)))
+            Z = np.where(fill, lower, Z).astype(np.float32)
+            RGB = np.where(fill[..., None], pc[yy + dy, xx + dx], RGB)
+            score = np.where(fill, 1.0 if step == 0 else 0.25, score).astype(np.float32)
+        grown = max(grown, target)
+    cov = covered if covered is not None else _near(np.isfinite(Z), 8)
+    return DenseResult(Z, score, RGB, cov, minX, maxY, gsd, stepped=(score > 0) & (score < 1))

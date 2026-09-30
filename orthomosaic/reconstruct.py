@@ -48,6 +48,8 @@ class Options3D(Options):
     depth_max_image: int = 1600             # matching image long side (~Pix4D "1/2 image scale")
     depth_neighbors: int = 4
     depth_min_views: int = 3                # images that must agree on a dense point (Pix4D: min. matches 3)
+    dem_gapfill_steps: int = 3              # ODM radius steps: point spacing * sqrt(2)^k, k < steps
+    ignore_gsd: bool = False                # ODM: never allow a DSM/ortho finer than GSD * (1 - 10%)
     mesh_method: str = "auto"               # "auto": Poisson from the dense cloud (needs open3d), else DSM grid
     # digital terrain model (bare ground)
     dtm: bool = True
@@ -117,6 +119,25 @@ def _block_reduce(a, f, valid):
     return np.where(cnt > 0, a.sum((1, 3)) / np.maximum(cnt, 1), np.nan), cnt >= (f * f) / 2
 
 
+def cap_resolution(requested, gsd: float, ignore_gsd: bool = False, error: float = 0.1) -> float:
+    """ODM's gsd.cap_resolution: the output cell may not be finer than GSD * (1 - error)."""
+    if requested is None:
+        return gsd
+    floor = gsd * (1.0 - error)
+    if not ignore_gsd and requested < floor:
+        log.warning("Requested resolution %.2f cm is finer than the GSD allows; capped to %.2f cm "
+                    "(GSD - %d%%). Use ignore_gsd=True to force it.", requested * 100, floor * 100, int(error * 100))
+        return floor
+    return requested
+
+
+def las_scale(spacing: Optional[float]) -> float:
+    """ODM: LAS coordinate scale = a tenth of the point spacing (rounded to a power of 10), max 1 mm."""
+    if not spacing or spacing <= 0:
+        return 0.001
+    return min(10 ** round(math.log10(spacing)) / 10, 0.001)
+
+
 def _load_gcps(ar, opt):
     if not opt.gcp:
         return None
@@ -134,6 +155,7 @@ def sparse_block(images: Union[str, Sequence[str]], opt: Options3D):
     ar = align_images(images, opt)
     gcps = _load_gcps(ar, opt)
     rec = sfm.reconstruct(ar, gps_sigma=opt.gps_sigma, alt_sigma=opt.alt_sigma,
+                          rolling_shutter=opt.rolling_shutter, rolling_shutter_readout=opt.rolling_shutter_readout,
                           refine_focal=opt.refine_focal, gcps=gcps, gcp_sigma=opt.gcp_sigma)
     return ar, rec
 
@@ -180,17 +202,21 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
             gains, biases = solve_gains(al.used, ar.pairs), {}
     else:
         gains, biases = {}, {}
+    res = cap_resolution(opt.dsm_resolution, al.gsd, opt.ignore_gsd)
     cloud = None
     if opt.dense_method == "depthmap" and not thermal:
         from .densify import DepthOptions, densify, rasterize
         cloud = densify(ar, rec, gains, biases, out_dir,
                         DepthOptions(max_image_dim=opt.depth_max_image, neighbors=opt.depth_neighbors,
                                      min_views=opt.depth_min_views, workers=ar.workers))
-        minX, maxY, W, H, gsd, _ = mvs.grid_extent(rec, opt.dsm_resolution or al.gsd, al.gsd)
-        log.info("Dense cloud -> DSM: %d x %d cells at %.3f m (top-layer median per cell)", W, H, gsd)
-        dense = rasterize(cloud, minX, maxY, W, H, gsd)
+        from .densify import radius_steps
+        minX, maxY, W, H, gsd, _ = mvs.grid_extent(rec, res, al.gsd)
+        radii = radius_steps(max(cloud.spacing, gsd), opt.dem_gapfill_steps)
+        log.info("Dense cloud -> DSM: %d x %d cells at %.3f m (top-layer median per cell, radius steps %s m)",
+                 W, H, gsd, ", ".join(f"{r:.3f}" for r in radii))
+        dense = rasterize(cloud, minX, maxY, W, H, gsd, radii=radii)
     else:
-        dopt = mvs.DenseOptions(gsd=opt.dsm_resolution, max_views=opt.max_views, min_score=opt.min_score,
+        dopt = mvs.DenseOptions(gsd=res, max_views=opt.max_views, min_score=opt.min_score,
                                 window=opt.ncc_window, tile=opt.tile, cache_mb=opt.cache_mb, workers=ar.workers,
                                 view_angle_power=opt.view_angle_power)
         dense = mvs.dense_reconstruct(ar, rec, gains, al.gsd, dopt, biases=biases)
@@ -318,7 +344,9 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                 below = xyz[:, 2] < dsm[ys, xs] - 1.0
                 cls = np.where(below & (cls == 2), 1, cls).astype(np.uint8)
         las_path = os.path.join(out_dir, "dense.las")
-        export.write_las(las_path, xyz + np.array(offset3), col, epsg, classification=cls)
+        spacing = cloud.spacing if cloud is not None else gsd * max(1, opt.cloud_step)
+        export.write_las(las_path, xyz + np.array(offset3), col, epsg, scale=las_scale(spacing),
+                         classification=cls)
         outputs["dense_las"] = "dense.las"
         if "laz" in opt.formats:
             laz = export.las_to_laz(las_path)
@@ -387,7 +415,8 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                          origin_xy[1]],
                  confident_fraction=float(conf.sum() / max(covered.sum(), 1)),
                  measured_cells=int((support == 1).sum()), interpolated_cells=int((support == 2).sum()),
-                 max_fill_m=opt.dsm_max_fill,
+                 max_fill_m=opt.dsm_max_fill, requested_resolution=opt.dsm_resolution,
+                 native_gsd=float(al.gsd), gapfill_steps=opt.dem_gapfill_steps,
                  z_range=[float(np.nanpercentile(dsm, 1)), float(np.nanpercentile(dsm, 99))] if covered.any() else None),
         dtm=(dict(ground_fraction=float(ground.sum() / max(covered.sum(), 1)),
                   max_object=opt.dtm_max_object,
@@ -496,6 +525,13 @@ def main(argv=None):
     ap.add_argument("--seam-smoothness", type=float, default=d.seam_smoothness)
     ap.add_argument("--dsm-max-fill", type=float, default=d.dsm_max_fill,
                     help="metres a DSM hole may be interpolated from measurements (-1 = fill all)")
+    ap.add_argument("--dem-gapfill-steps", type=int, default=d.dem_gapfill_steps,
+                    help="ODM radius steps for filling DSM cells from nearby points")
+    ap.add_argument("--ignore-gsd", action="store_true", help="allow a resolution finer than the GSD")
+    ap.add_argument("--sky-removal", action="store_true", help="AI sky masks for oblique images (onnxruntime)")
+    ap.add_argument("--bg-removal", action="store_true", help="AI background masks (onnxruntime)")
+    ap.add_argument("--rolling-shutter", action="store_true", help="correct electronic (rolling) shutter distortion")
+    ap.add_argument("--rolling-shutter-readout", type=float, default=0.0, help="sensor readout time in ms (0 = database)")
     ap.add_argument("--contours", type=float, default=d.contour_interval,
                     help="terrain contour interval in metres (0 = off)")
     ap.add_argument("--no-classify", action="store_true", help="skip ASPRS cloud classification")
@@ -532,7 +568,9 @@ def main(argv=None):
                     #changed here: Pix4D-grade ortho / colour / elevation-mapping switches
                     true_ortho=not a.no_true_ortho, occlusion=not a.no_occlusion,
                     color_balance=not a.no_color_balance, view_angle_power=a.view_angle_power,
-                    dense_method=a.dense_method, depth_max_image=a.depth_max_image,
+                    dem_gapfill_steps=a.dem_gapfill_steps, ignore_gsd=a.ignore_gsd,
+                    sky_removal=a.sky_removal, bg_removal=a.bg_removal, rolling_shutter=a.rolling_shutter,
+                    rolling_shutter_readout=a.rolling_shutter_readout, dense_method=a.dense_method, depth_max_image=a.depth_max_image,
                     depth_min_views=a.depth_min_views, ortho_blend=a.ortho_blend, seam_smoothness=a.seam_smoothness, dsm_max_fill=a.dsm_max_fill,
                     contour_interval=a.contours, classify_cloud=not a.no_classify,
                     formats=tuple(f.strip() for f in a.formats.split(",") if f.strip()))

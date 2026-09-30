@@ -31,6 +31,12 @@ class Frame:
     rel_alt: Optional[float] = None     # DJI XMP: height above take-off (m)
     abs_alt: Optional[float] = None     # DJI XMP: absolute altitude (m)
     gimbal_pitch: Optional[float] = None
+    speed_x: Optional[float] = None     # DJI XMP FlightXSpeed (m/s, north)
+    speed_y: Optional[float] = None     # DJI XMP FlightYSpeed (m/s, east)
+    speed_z: Optional[float] = None     # DJI XMP FlightZSpeed (m/s, down)
+    shutter: Optional[str] = None       # DJI XMP ShutterType ("Electronic" = rolling shutter)
+    make: str = ""
+    model: str = ""
     raw_shape: Optional[tuple] = None     # (h, w) of embedded radiometric thermal data (DJI R-JPEG)
     thermal_range: Optional[tuple] = None  # set by the pipeline: decode raw thermal with this range
     # filled by the pipeline
@@ -72,7 +78,8 @@ def list_images(folder: str) -> list[str]:
     return files
 
 
-_XMP_KEYS = {"RelativeAltitude": "rel_alt", "AbsoluteAltitude": "abs_alt", "GimbalPitchDegree": "gimbal_pitch"}
+_XMP_KEYS = {"RelativeAltitude": "rel_alt", "AbsoluteAltitude": "abs_alt", "GimbalPitchDegree": "gimbal_pitch",
+             "FlightXSpeed": "speed_x", "FlightYSpeed": "speed_y", "FlightZSpeed": "speed_z"}
 
 
 def _read_dji_xmp(path: str, fr: "Frame"):
@@ -90,6 +97,9 @@ def _read_dji_xmp(path: str, fr: "Frame"):
                 setattr(fr, attr, float(m.group(1)))
             except ValueError:
                 pass
+    m = re.search(rb'drone-dji:ShutterType="([A-Za-z]+)"', head)
+    if m:
+        fr.shutter = m.group(1).decode()
 
 
 def read_frame(path: str) -> Frame:
@@ -97,9 +107,11 @@ def read_frame(path: str) -> Frame:
         w, h = im.size
         exif = im.getexif()
         orientation = int(exif.get(_TAG_ORIENTATION, 1) or 1)
+        make = str(exif.get(271, "") or "").strip("\x00 ")
+        model = str(exif.get(272, "") or "").strip("\x00 ")
         if orientation in (5, 6, 7, 8):
             w, h = h, w
-        fr = Frame(path=path, width=w, height=h, orientation=orientation)
+        fr = Frame(path=path, width=w, height=h, orientation=orientation, make=make, model=model)
         try:
             gps = exif.get_ifd(_TAG_GPS_IFD)
         except Exception:

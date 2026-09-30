@@ -58,6 +58,7 @@ class DenseResult:
     minX: float
     maxY: float
     gsd: float
+    stepped: Optional[np.ndarray] = None   # (H, W) bool: filled from nearby points at a larger radius
 
 
 def _median3(xp, a):
@@ -531,7 +532,15 @@ def postprocess(d: DenseResult, min_score: float, max_dev: float = 1.0,
         conf &= ~spikes
         Zc[spikes] = np.nan
     filled = fill_holes(Zc)
+    # heights already filled from nearby points (densify radius steps, 0 < score < min_score)
+    # are better than the push-pull estimate: keep them where they are not spikes
+    stepped = (np.zeros(d.Z.shape, bool) if d.stepped is None else d.stepped & np.isfinite(d.Z))
+    if stepped.any():
+        med = _nanmedian_filter(np.where(conf | stepped, d.Z, np.nan).astype(np.float32), 2)
+        stepped &= ~(np.abs(d.Z - med) > max_dev)
+        filled = np.where(stepped, d.Z, filled)
     keep = d.covered if max_fill_cells < 0 else (d.covered & _near(conf, max_fill_cells))
+    keep = keep | (stepped & d.covered)          # radius-filled cells lie within the fill radius
     filled[~keep] = np.nan
     # edge-preserving smoothing on the covered area
     if smooth_range > 0 and smooth_iters > 0:
