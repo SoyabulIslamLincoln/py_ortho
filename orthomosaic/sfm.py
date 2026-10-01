@@ -481,12 +481,14 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
             # position (OpenSfM/ODM rolling-shutter correction), later rounds refine on them
             from .rollingshutter import correct_observations
             rs_stats = correct_observations(rec, ar.frames, rolling_shutter_readout)
+
     err = bundle_adjust(rec, pri, 2 * px)
     rec.rms_px = float(np.sqrt(np.mean(np.square(err))))
     rec.stats = dict(points=int(len(rec.X)), observations=int(len(err)), pairs=len(results),
                      rms_px=rec.rms_px, focal_px=[it.f for it in rec.intr],
                      k1=[it.k1 for it in rec.intr], k2=[it.k2 for it in rec.intr],
-                     z_datum="take-off (DJI relative altitude)" if has_rel_alt else "mean ground")
+                     z_datum="take-off (DJI relative altitude)" if has_rel_alt else "mean ground",
+                     mean_track_length=float(len(rec.obs_pt) / max(len(rec.X), 1)))
     if rolling_shutter:
         rec.stats["rolling_shutter"] = rs_stats
     if gcps:

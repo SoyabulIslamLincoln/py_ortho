@@ -28,6 +28,8 @@ NODATA = -9999.0
 
 @dataclass
 class Options3D(Options):
+    n_features: int = 12000                 # features per image for the tie points (2D default 5000):
+                                            # ~2.3x more tie points and a stiffer block, for ~15 s more SfM
     neighbors: int = 10
     alt_sigma: float = 0.5                  # DJI relative-altitude accuracy (m)
     refine_focal: Optional[bool] = None     # None: refine when an altitude reference exists
