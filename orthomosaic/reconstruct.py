@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import math
@@ -38,7 +39,7 @@ class Options3D(Options):
     dsm_smooth_iters: int = 2
     tile: int = 160
     cloud_step: int = 1                     # keep every n-th confident DSM cell in the dense cloud
-    mesh_max_vertices: int = 1_500_000
+    mesh_max_vertices: int = 600_000        # Poisson budget (time and RAM grow with it; 8 GB machines)
     texture_max: int = 8192
     formats: tuple = ("ply", "laz", "obj", "glb")   # laz falls back to las without laspy[lazrs]
     # densification (Pix4D stage 2): "depthmap" = per-image depth maps fused into a 3D dense cloud,
@@ -68,9 +69,12 @@ class Options3D(Options):
     seam_smoothness: float = 0.6            # weight of the seam (colour-disagreement) term
     seam_iters: int = 4
     seam_band: int = 3                      # cells blended on each side of a seam
-    dsm_max_fill: float = 2.0               # metres a hole may be interpolated from measured cells (-1 = all)
+    dsm_max_fill: float = -1.0              # metres a hole may be interpolated from measured cells;
+                                            # -1 = fill every hole photographed by >= 2 cameras (as 0.3.3 / Pix4D);
+                                            # filled cells are flagged 2 (interpolated) in dsm_support.tif
     color_balance: bool = True              # per-image gain+offset radiometric correction (Pix4D)
     contour_interval: float = 0.0           # metres between terrain contour lines (0 = off)
+    contour_resolution: float = 1.0         # m: contours are traced on the DTM resampled to this (Pix4D: 100 cm)
     classify_cloud: bool = True             # ASPRS ground/building/vegetation classes in the LAS
     # ground control points (survey anchors)
     gcp: Optional[str] = None               # path to a WebODM/Pix4D GCP list file
@@ -99,14 +103,21 @@ def _write_raster(path, arr, kind, epsg, origin_xy, gsd, nodata=None, tile=512):
     H, W = arr.shape[:2]
     geo = dict(epsg=epsg, origin=origin_xy, pixel_size=gsd)
     w = GeoTIFFWriter(path, W, H, tile=tile, kind=kind, nodata=nodata, **geo)
-    for ty in range(0, H, tile):
-        for tx in range(0, W, tile):
-            blk = arr[ty:ty + tile, tx:tx + tile]
-            if kind == "rgba" and not blk[..., 3].any():
-                continue
-            if kind == "float32" and nodata is not None and np.all(blk == nodata):
-                continue
-            w.write_tile(tx // tile, ty // tile, w.compress_tile(blk))
+
+    def job(t):
+        tx, ty = t
+        blk = arr[ty:ty + tile, tx:tx + tile]
+        if kind == "rgba" and not blk[..., 3].any():
+            return None
+        if kind == "float32" and nodata is not None and np.all(blk == nodata):
+            return None
+        return w.compress_tile(blk)                 # zlib releases the GIL: tiles compress in parallel
+
+    tiles = [(tx, ty) for ty in range(0, H, tile) for tx in range(0, W, tile)]
+    with ThreadPoolExecutor(os.cpu_count() or 1) as ex:
+        for (tx, ty), data in zip(tiles, ex.map(job, tiles)):
+            if data is not None:
+                w.write_tile(tx // tile, ty // tile, data)
     w.close()
 
 
@@ -209,12 +220,14 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         cloud = densify(ar, rec, gains, biases, out_dir,
                         DepthOptions(max_image_dim=opt.depth_max_image, neighbors=opt.depth_neighbors,
                                      min_views=opt.depth_min_views, workers=ar.workers))
-        from .densify import radius_steps
+        from .densify import camera_coverage, radius_steps
         minX, maxY, W, H, gsd, _ = mvs.grid_extent(rec, res, al.gsd)
         radii = radius_steps(max(cloud.spacing, gsd), opt.dem_gapfill_steps)
         log.info("Dense cloud -> DSM: %d x %d cells at %.3f m (top-layer median per cell, radius steps %s m)",
                  W, H, gsd, ", ".join(f"{r:.3f}" for r in radii))
-        dense = rasterize(cloud, minX, maxY, W, H, gsd, radii=radii)
+        # holes may only be filled where >= 2 calibrated photos actually see the ground
+        dense = rasterize(cloud, minX, maxY, W, H, gsd, radii=radii,
+                          covered=camera_coverage(rec, minX, maxY, W, H, gsd, min_views=2))
     else:
         dopt = mvs.DenseOptions(gsd=res, max_views=opt.max_views, min_score=opt.min_score,
                                 window=opt.ncc_window, tile=opt.tile, cache_mb=opt.cache_mb, workers=ar.workers,
@@ -300,8 +313,13 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                  100 * ground.sum() / max(covered.sum(), 1), time.time() - t)
         #changed here: Pix4D elevation mapping -- contour lines from the bare-earth DTM
         if getattr(opt, "contour_interval", 0.0) and opt.contour_interval > 0:
-            contours = contour_lines(np.where(covered, dtm, np.nan), gsd, dense.minX, dense.maxY,
-                                     opt.contour_interval)
+            cf = max(1, int(round(opt.contour_resolution / gsd)))
+            if cf > 1:
+                dtm_c, ok_c = _block_reduce(dtm, cf, covered)
+                dtm_c = np.where(ok_c, dtm_c, np.nan)
+            else:
+                dtm_c = np.where(covered, dtm, np.nan)
+            contours = contour_lines(dtm_c, gsd * cf, dense.minX, dense.maxY, opt.contour_interval)
             if contours:
                 export.write_geojson_contours(os.path.join(out_dir, "contours.geojson"), contours,
                                               offset=(ox, oy), epsg=epsg)

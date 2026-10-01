@@ -35,12 +35,14 @@ import os
 import shutil
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 
+from . import _dense
 from .imageio import load_rgb
 from .masks import load_mask
 from .mvs import DenseResult, _near
@@ -62,7 +64,9 @@ class DepthOptions:
     consistency_px: float = 1.0       # forward-backward reprojection tolerance (px)
     consistency_depth: float = 0.01   # relative depth tolerance
     layer_gap: float = 1.0            # metres: points this far below the cell top are another layer
-    keep_depthmaps: bool = False      # keep <out>/depthmaps/*.npy after fusion
+    keep_depthmaps: bool = False      # keep <out>/depthmaps/*.npy after fusion (deleted even on errors)
+    point_stride: int = 2             # fuse every n-th reference pixel per axis (Pix4D "optimal" density)
+    cache_mb: int = 1200              # decoded-image cache for matching (8 GB machines: keep ~1.2 GB)
     workers: int = 0
 
 
@@ -183,68 +187,43 @@ def _depth_range(rec, k):
 
 
 # ------------------------------------------------------------------ depth map of one image
-def _ncc_views(ref, ref_stats, srcs, cam_r, cams_s, rays_w, depth, r, top_k):
-    """Aggregated NCC of the reference against its sources at per-pixel `depth` (H, W)."""
-    mu_i, sd_i = ref_stats
-    scores = []
-    for img, cs, (A, b) in zip(srcs, cams_s, rays_w):
-        xc0 = b[0] + depth * A[0]
-        xc1 = b[1] + depth * A[1]
-        xc2 = b[2] + depth * A[2]
-        u, v = cs.project_cam(xc0, xc1, xc2)
-        val, ok = _bilinear(img, u, v)
-        ok &= (xc2 > 0) & np.isfinite(val)          # NaN = masked source pixel
-        val = np.where(ok, val, 0.0)
-        okf = ok.astype(np.float32)
-        val = val * okf
-        cover = _box(okf, r)
-        mu_j = _box(val, r) / np.maximum(cover, 1e-6)
-        m2 = _box(val * val, r) / np.maximum(cover, 1e-6)
-        mij = _box(val * ref, r) / np.maximum(cover, 1e-6)
-        sd_j = np.sqrt(np.maximum(m2 - mu_j * mu_j, 1e-6))
-        ncc = (mij - mu_i * mu_j) / (sd_i * sd_j)
-        scores.append(np.where(cover > 0.9, np.clip(ncc, -1, 1), -1.0).astype(np.float32))
-    s = np.sort(np.stack(scores), axis=0)[::-1]
-    return s[:min(top_k, len(scores))].mean(0)
-
-
-def _prepare(ref_img, cam_r, src_imgs, cams_s):
-    H, W = ref_img.shape
+def _rays_world(shape, cam_r):
+    """(3, H, W) float32 world direction of every reference pixel (camera-axis depth 1)."""
+    H, W = shape
     vv, uu = np.mgrid[0:H, 0:W].astype(np.float64)
     x, y = cam_r.rays(uu, vv)
-    ray_c = np.stack([x, y, np.ones_like(x)])                     # camera frame, z = 1
-    ray_w = np.einsum("ji,jhw->ihw", cam_r.R, ray_c)              # R^T ray: world direction
-    geo = []
-    for cs in cams_s:
-        A = np.einsum("ij,jhw->ihw", cs.R, ray_w).astype(np.float32)  # R_s R_r^T ray
-        b = (cs.R @ (cam_r.C - cs.C)).astype(np.float32)[:, None, None]
-        geo.append((A, b))
-    return geo
+    ray_c = np.stack([x, y, np.ones_like(x)])
+    return np.ascontiguousarray(np.einsum("ji,jhw->ihw", cam_r.R, ray_c), np.float32)
 
 
-def _sweep(ref, cam_r, srcs, cams_s, inv_list, opt):
+def _sweep(ref, cam_r, srcs, cams_s, inv_list, opt, ray=None):
     """Winner-take-all over inverse-depth hypotheses `inv_list` (per-pixel maps, uniformly
     spaced), refined to sub-step precision with a parabola through the best score and its two
-    neighbours. Streams over hypotheses, so memory does not grow with their number."""
+    neighbours. The warp + NCC (``_dense.ncc_warp``) and the top-k / winner bookkeeping
+    (``_dense.combine``) are C kernels that release the GIL; memory does not grow with the
+    number of hypotheses."""
     r = opt.window
-    geo = _prepare(ref, cam_r, srcs, cams_s)
-    mu = _box(ref, r)
-    sd = np.sqrt(np.maximum(_box(ref * ref, r) - mu * mu, 1e-6))
-    best = np.full(ref.shape, -2.0, np.float32)
-    s_prev_best = np.full(ref.shape, -2.0, np.float32)   # score at best index - 1
-    s_next_best = np.full(ref.shape, -2.0, np.float32)   # score at best index + 1
-    idx = np.full(ref.shape, -1, np.int32)
-    prev = np.full(ref.shape, -2.0, np.float32)
+    H, W = ref.shape
+    if ray is None:
+        ray = _rays_world(ref.shape, cam_r)
+    mu = np.ascontiguousarray(_box(ref, r), np.float32)
+    sd = np.ascontiguousarray(np.sqrt(np.maximum(_box(ref * ref, r) - mu * mu, 1e-6)), np.float32)
+    geo = [(np.ascontiguousarray(cs.R, np.float64), np.ascontiguousarray(cs.R @ (cam_r.C - cs.C), np.float64))
+           for cs in cams_s]
+    S = np.empty((len(srcs), H, W), np.float32)
+    J = np.empty((H, W), np.float32)
+    V = np.empty((H, W), np.float32)
+    hs = np.empty((4, H, W), np.float32)
+    best = np.full((H, W), -2.0, np.float32)
+    s_prev_best = np.full((H, W), -2.0, np.float32)
+    s_next_best = np.full((H, W), -2.0, np.float32)
+    prev = np.full((H, W), -2.0, np.float32)
+    idx = np.full((H, W), -1, np.int32)
     for i, inv in enumerate(inv_list):
-        s = _ncc_views(ref, (mu, sd), srcs, cam_r, cams_s, geo, 1.0 / inv, r, opt.top_k)
-        nxt = idx == i - 1
-        s_next_best[nxt] = s[nxt]
-        better = s > best
-        best = np.where(better, s, best)
-        s_prev_best = np.where(better, prev, s_prev_best)
-        s_next_best = np.where(better, -2.0, s_next_best)
-        idx = np.where(better, i, idx)
-        prev = s
+        inv = np.ascontiguousarray(inv, np.float32)
+        for j, (src, cs, (Rs, b)) in enumerate(zip(srcs, cams_s, geo)):
+            _dense.ncc_warp(ref, mu, sd, src, ray, Rs, b, cs.f, cs.k1, cs.k2, cs.cx, cs.cy, inv, r, S[j], J, V, hs)
+        _dense.combine(S, opt.top_k, i, best, prev, s_prev_best, s_next_best, idx)
     n = len(inv_list)
     inv0 = inv_list[0]
     dinv = inv_list[1] - inv_list[0] if n > 1 else np.zeros_like(inv0)
@@ -260,29 +239,38 @@ def depth_map(k, nbrs, rec, views, opt: DepthOptions):
     rng = _depth_range(rec, k)
     if rng is None or not nbrs:
         return None
-    ref_rgb, cam_r = views(k)
-    ref = _norm(ref_rgb[..., :3].mean(-1))
+    ref, _, cam_r = views(k)
     ref_mask = ~np.isfinite(ref)
-    ref = np.where(ref_mask, 0.0, ref).astype(np.float32)
+    ref = np.ascontiguousarray(np.where(ref_mask, 0.0, ref), np.float32)
     src = [views(j) for j in nbrs]
-    srcs = [_norm(s[0][..., :3].mean(-1)) for s in src]
-    cams_s = [s[1] for s in src]
+    srcs = [s[0] for s in src]
+    cams_s = [s[2] for s in src]
 
     # pyramid: level 0 = matching resolution, level L = 1/2^L
     L = 2
     pyr_r, pyr_c, pyr_s, pyr_cs = [ref], [cam_r], [srcs], [cams_s]
     for _ in range(L):
-        r_ = _half(pyr_r[-1])
+        r_ = np.ascontiguousarray(_half(pyr_r[-1]))
         pyr_r.append(r_)
         pyr_c.append(pyr_c[-1].scaled(0.5, r_.shape[1], r_.shape[0]))
-        s_ = [_half(x) for x in pyr_s[-1]]
+        s_ = [np.ascontiguousarray(_half(x)) for x in pyr_s[-1]]
         pyr_s.append(s_)
         pyr_cs.append([c.scaled(0.5, x.shape[1], x.shape[0]) for c, x in zip(pyr_cs[-1], s_)])
+
+    # pixel rays once at full resolution; coarser levels by 2x2 averaging (exact for the pinhole
+    # part: every ray has camera-axis component 1; distortion makes a negligible difference)
+    rays = [_rays_world(ref.shape, cam_r)]
+    for lvl in range(1, L + 1):
+        h, w = pyr_r[lvl].shape
+        r0 = rays[-1][:, :2 * h, :2 * w]
+        rays.append(np.ascontiguousarray(0.25 * (r0[:, 0::2, 0::2] + r0[:, 1::2, 0::2] + r0[:, 0::2, 1::2]
+                                                 + r0[:, 1::2, 1::2]), np.float32))
 
     # full sweep at the coarsest level, uniform in inverse depth
     inv = np.linspace(1 / rng[1], 1 / rng[0], opt.num_depths).astype(np.float32)
     shape = pyr_r[L].shape
-    d, _, _ = _sweep(pyr_r[L], pyr_c[L], pyr_s[L], pyr_cs[L], [np.full(shape, i, np.float32) for i in inv], opt)
+    d, _, _ = _sweep(pyr_r[L], pyr_c[L], pyr_s[L], pyr_cs[L], [np.full(shape, i, np.float32) for i in inv], opt,
+                     rays[L])
     dstep = (inv[1] - inv[0]) / 2
     # refine: at each finer level search +-refine_steps around the upsampled depth, half the spacing
     for lvl in range(L - 1, -1, -1):
@@ -291,7 +279,7 @@ def depth_map(k, nbrs, rec, views, opt: DepthOptions):
         up = np.pad(up, ((0, H - up.shape[0]), (0, W - up.shape[1])), mode="edge")
         hyp = [np.maximum(1.0 / up + t * dstep, 1e-6).astype(np.float32)
                for t in range(-opt.refine_steps, opt.refine_steps + 1)]
-        d, score, sd = _sweep(pyr_r[lvl], pyr_c[lvl], pyr_s[lvl], pyr_cs[lvl], hyp, opt)
+        d, score, sd = _sweep(pyr_r[lvl], pyr_c[lvl], pyr_s[lvl], pyr_cs[lvl], hyp, opt, rays[lvl])
         dstep /= 2
     depth = d
     sd = sd * 64.0                                   # back to 0-255 grey units
@@ -302,12 +290,24 @@ def depth_map(k, nbrs, rec, views, opt: DepthOptions):
 
 # ------------------------------------------------------------------ main entry
 def densify(ar, rec, gains: dict, biases: Optional[dict], out_dir: str, opt: DepthOptions) -> DenseCloud:
+    """Depth maps -> fused dense cloud. The per-image depth maps live in <out_dir>/depthmaps only
+    while this runs: the folder is cleared first and removed afterwards, also when the run fails
+    or is interrupted (unless ``opt.keep_depthmaps``)."""
+    wd = os.path.join(out_dir, "depthmaps")
+    shutil.rmtree(wd, ignore_errors=True)               # leftovers of an interrupted run
+    os.makedirs(wd, exist_ok=True)
+    try:
+        return _densify(ar, rec, gains, biases, wd, opt)
+    finally:
+        if not opt.keep_depthmaps:
+            shutil.rmtree(wd, ignore_errors=True)
+
+
+def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
     frames = ar.frames
     N = len(rec.used)
     workers = opt.workers or ar.workers or os.cpu_count()
     t0 = time.time()
-    wd = os.path.join(out_dir, "depthmaps")
-    os.makedirs(wd, exist_ok=True)
 
     scales, cams = {}, {}
     for k, i in enumerate(rec.used):
@@ -318,28 +318,39 @@ def densify(ar, rec, gains: dict, biases: Optional[dict], out_dir: str, opt: Dep
         cams[k] = _Cam(rec.R[k], rec.C[k], it.f, it.k1, it.k2, it.cx, it.cy, fr.width, fr.height).scaled(w / fr.width, w, h)
         scales[k] = s
 
-    cache, lock = {}, threading.Lock()
+    cache, lock = OrderedDict(), threading.Lock()
+    budget = int(opt.cache_mb) * 1024 * 1024
+    used_bytes = [0]
 
     def views(k):
+        """(normalised grey float32 with NaN = masked, uint8 RGB, camera), LRU-cached by bytes."""
         with lock:
             v = cache.get(k)
-        if v is None:
-            i = rec.used[k]
-            rgb = load_rgb(frames[i], scales[k]).astype(np.float32)
-            g = gains.get(i)
-            if g is not None:
-                rgb *= np.asarray(g, np.float32)
-            b = None if biases is None else biases.get(i)
-            if b is not None:
-                rgb += np.asarray(b, np.float32)
-            m = load_mask(frames[i].path, rgb.shape[1], rgb.shape[0])
-            if m is not None:
-                rgb[~m] = np.nan                       # masked: never matched, never fused
-            v = (rgb, cams[k])
-            with lock:                       # bounded: drop the oldest entry
-                if len(cache) > 2 * workers * (opt.neighbors + 1):
-                    cache.pop(next(iter(cache)))
+            if v is not None:
+                cache.move_to_end(k)
+                return v
+        i = rec.used[k]
+        rgb = load_rgb(frames[i], scales[k]).astype(np.float32)
+        g = gains.get(i)
+        if g is not None:
+            rgb *= np.asarray(g, np.float32)
+        b = None if biases is None else biases.get(i)
+        if b is not None:
+            rgb += np.asarray(b, np.float32)
+        grey = np.ascontiguousarray(_norm(rgb.mean(-1)))
+        m = load_mask(frames[i].path, rgb.shape[1], rgb.shape[0])
+        if m is not None:
+            grey[~m] = np.nan                          # masked: never matched, never fused
+        rgb8 = np.clip(rgb + 0.5, 0, 255).astype(np.uint8)
+        v = (grey, rgb8, cams[k])
+        nb = grey.nbytes + rgb8.nbytes
+        with lock:
+            if k not in cache:
                 cache[k] = v
+                used_bytes[0] += nb
+                while used_bytes[0] > budget and len(cache) > 1:
+                    _, old = cache.popitem(last=False)
+                    used_bytes[0] -= old[0].nbytes + old[1].nbytes
         return v
 
     nbrs = _neighbours(rec, opt.neighbors)
@@ -377,7 +388,12 @@ def densify(ar, rec, gains: dict, biases: Optional[dict], out_dir: str, opt: Dep
     for n_done, k in enumerate(sorted(have)):
         D = np.asarray(dm[k])
         cr = cams[k]
-        vv, uu = np.nonzero(np.isfinite(D) & ~used[k])
+        cand = np.isfinite(D) & ~used[k]
+        if opt.point_stride > 1:                         # one point per stride x stride pixels
+            sub = np.zeros_like(cand)
+            sub[::opt.point_stride, ::opt.point_stride] = True
+            cand &= sub
+        vv, uu = np.nonzero(cand)
         if len(vv) == 0:
             continue
         d = D[vv, uu].astype(np.float64)
@@ -412,27 +428,46 @@ def densify(ar, rec, gains: dict, biases: Optional[dict], out_dir: str, opt: Dep
         for j, vi, ui, ok in marks:
             sel = keep[ok]
             used[j][vi[sel], ui[sel]] = True
-        rgb, _ = views(k)
+        _, rgb, _ = views(k)
         pts.append((acc[keep] / cnt[keep, None]))
-        cols.append(np.clip(rgb[vv[keep], uu[keep], :3], 0, 255).astype(np.uint8))
+        cols.append(rgb[vv[keep], uu[keep]])
         nv.append(np.minimum(cnt[keep], 255).astype(np.uint8))
         owner.append(np.full(int(keep.sum()), k, np.int32))
         cache.clear()
         if (n_done + 1) % step == 0:
             log.info("  fusion: %d/%d", n_done + 1, len(have))
     del dm
-    if not opt.keep_depthmaps:
-        shutil.rmtree(wd, ignore_errors=True)
     if not pts:
         raise RuntimeError("Densification produced no consistent points: too little overlap or texture "
                            "(try min_views=2 or a larger max_image_dim)")
-    cloud = DenseCloud(np.concatenate(pts), np.concatenate(cols), np.concatenate(nv), np.concatenate(owner), med_gsd)
+    cloud = DenseCloud(np.concatenate(pts), np.concatenate(cols), np.concatenate(nv), np.concatenate(owner),
+                       med_gsd * max(1, opt.point_stride))
     log.info("Dense cloud: %d points (median %d views/point) fused in %.1fs",
              len(cloud.xyz), int(np.median(cloud.views)), time.time() - t1)
     return cloud
 
 
 # ------------------------------------------------------------------ DSM from the cloud
+def camera_coverage(rec, minX: float, maxY: float, W: int, H: int, gsd: float, min_views: int = 2,
+                    step: int = 16) -> np.ndarray:
+    """(H, W) bool: cells photographed by at least `min_views` calibrated cameras (cell centres at
+    the typical ground height projected inside the image), on a coarse grid of `step` cells."""
+    zg = float(np.percentile(rec.X[:, 2], 20)) if len(rec.X) else 0.0
+    hs, ws = (H + step - 1) // step, (W + step - 1) // step
+    yy, xx = np.mgrid[0:hs, 0:ws]
+    P = np.stack([minX + (xx.ravel() * step + step / 2) * gsd, maxY - (yy.ravel() * step + step / 2) * gsd,
+                  np.full(xx.size, zg)], 1)
+    count = np.zeros(xx.size, np.int32)
+    for k in range(len(rec.used)):
+        it = rec.intr[rec.cam_group[k]]
+        cam = _Cam(rec.R[k], rec.C[k], it.f, it.k1, it.k2, it.cx, it.cy, it.width, it.height)
+        xc = (P - cam.C) @ cam.R.T
+        u, v = cam.project_cam(xc[:, 0], xc[:, 1], xc[:, 2])
+        count += (xc[:, 2] > 0) & (u >= 0) & (v >= 0) & (u <= it.width - 1) & (v <= it.height - 1)
+    m = (count >= min_views).reshape(hs, ws)
+    return np.repeat(np.repeat(m, step, 0), step, 1)[:H, :W]
+
+
 def radius_steps(spacing: float, steps: int = 3, multiplier: float = 1.0) -> list:
     """ODM's DEM search radii: point spacing * multiplier, growing by sqrt(2) per step."""
     r = [spacing * multiplier]
@@ -444,7 +479,9 @@ def radius_steps(spacing: float, steps: int = 3, multiplier: float = 1.0) -> lis
 def rasterize(cloud: DenseCloud, minX: float, maxY: float, W: int, H: int, gsd: float,
               layer_gap: float = 1.0, covered: Optional[np.ndarray] = None,
               radii: Optional[list] = None) -> DenseResult:
-    """Top-layer DSM from the dense cloud (see module docstring).
+    """Top-layer DSM from the dense cloud: per cell the median height (mean colour) of the points within
+    `layer_gap` of the cell's highest point (roof points are never mixed with wall or ground
+    points below them; ``_dense.top_layer``).
 
     Empty cells are filled radius by radius (ODM's stepped radii, `radius_steps`): a cell within
     the current radius of measured cells takes the *lower median* of its measured neighbours, so
@@ -455,45 +492,27 @@ def rasterize(cloud: DenseCloud, minX: float, maxY: float, W: int, H: int, gsd: 
     row = np.floor((maxY - cloud.xyz[:, 1]) / gsd).astype(np.int64)
     ok = (col >= 0) & (col < W) & (row >= 0) & (row < H)
     cell = (row * W + col)[ok]
-    z = cloud.xyz[ok, 2]
-    rgb = cloud.rgb[ok].astype(np.float32)
-    zmax = np.full(H * W, -np.inf)
-    np.maximum.at(zmax, cell, z)
-    top = z >= zmax[cell] - layer_gap
-    cell, z, rgb = cell[top], z[top], rgb[top]
-    o = np.lexsort((z, cell))
-    cell, z, rgb = cell[o], z[o], rgb[o]
-    uc, start, cnt = np.unique(cell, return_index=True, return_counts=True)
-    med = 0.5 * (z[start + (cnt - 1) // 2] + z[start + cnt // 2])
-    Z = np.full(H * W, np.nan, np.float32)
-    Z[uc] = med
-    csum = np.stack([np.bincount(cell, rgb[:, c], H * W) for c in range(3)], 1)
-    ncell = np.bincount(cell, minlength=H * W)
-    RGB = np.zeros((H * W, 3), np.uint8)
-    RGB[uc] = np.clip(csum[uc] / ncell[uc, None], 0, 255).astype(np.uint8)
-    Z, RGB = Z.reshape(H, W), RGB.reshape(H, W, 3)
+    # work on the occupied cells only (memory ~ points, not ~ raster): C top-layer kernel
+    uc, inv = np.unique(cell, return_inverse=True)
+    del cell, col, row
+    Zc, RGBc, _ = _dense.top_layer(np.ascontiguousarray(inv, np.int64), np.ascontiguousarray(cloud.xyz[ok, 2]),
+                                   np.ascontiguousarray(cloud.rgb[ok]), len(uc), float(layer_gap))
+    del inv
+    Z = np.full((H, W), np.nan, np.float32)
+    Z.ravel()[uc] = Zc
+    RGB = np.zeros((H, W, 3), np.uint8)
+    RGB.reshape(-1, 3)[uc] = RGBc
+    del uc, Zc, RGBc
     score = np.isfinite(Z).astype(np.float32)
 
     grown = 0
-    yy, xx = np.mgrid[0:H, 0:W]
     for step, r in enumerate(radii or [cloud.spacing]):
         target = int(math.ceil(r / gsd - 0.5))
         for _ in range(max(0, target - grown)):
-            miss = ~np.isfinite(Z)
-            p = np.pad(Z, 1, constant_values=np.nan)
-            st = np.stack([p[dy:dy + H, dx:dx + W] for dy in range(3) for dx in range(3)])
-            n = np.isfinite(st).sum(0)
-            fill = miss & (n >= 3)
-            if not fill.any():
+            filled = _dense.fill_lower_median(Z.copy(), RGB.copy(), Z, RGB, score,
+                                              1.0 if step == 0 else 0.25, 3)
+            if filled == 0:
                 break
-            srt = np.sort(np.where(np.isfinite(st), st, np.inf), 0)
-            lower = np.take_along_axis(srt, np.maximum(n - 1, 0)[None] // 2, 0)[0]
-            best = np.argmin(np.abs(np.where(np.isfinite(st), st, np.inf) - lower[None]), 0)
-            dy, dx = np.divmod(best, 3)
-            pc = np.pad(RGB, ((1, 1), (1, 1), (0, 0)))
-            Z = np.where(fill, lower, Z).astype(np.float32)
-            RGB = np.where(fill[..., None], pc[yy + dy, xx + dx], RGB)
-            score = np.where(fill, 1.0 if step == 0 else 0.25, score).astype(np.float32)
         grown = max(grown, target)
     cov = covered if covered is not None else _near(np.isfinite(Z), 8)
     return DenseResult(Z, score, RGB, cov, minX, maxY, gsd, stepped=(score > 0) & (score < 1))

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -435,17 +436,14 @@ def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions
 # --------------------------------------------------------------------------
 
 def _nanmedian_filter(Z, r=2, rows=256):
-    """NaN-aware median filter, processed in row bands to bound memory."""
-    import warnings
-    H, W = Z.shape
-    p = np.pad(Z, r, mode="constant", constant_values=np.nan)
+    """NaN-aware median filter over a (2r+1)^2 window (C kernel, row bands on all cores)."""
+    from . import _dense
+    Z = np.ascontiguousarray(Z, np.float32)
+    H = Z.shape[0]
     out = np.empty_like(Z)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        for y0 in range(0, H, rows):
-            y1 = min(H, y0 + rows)
-            stack = np.stack([p[y0 + dy:y1 + dy, dx:dx + W] for dy in range(2 * r + 1) for dx in range(2 * r + 1)])
-            out[y0:y1] = np.nanmedian(stack, axis=0)
+    bands = [(y0, min(H, y0 + rows)) for y0 in range(0, H, rows)]
+    with ThreadPoolExecutor(os.cpu_count() or 1) as ex:
+        list(ex.map(lambda b: _dense.nanmedian_filter(Z, r, out, b[0], b[1]), bands))
     return out
 
 
@@ -494,7 +492,12 @@ def fill_holes(Z: np.ndarray) -> np.ndarray:
 
 
 def _near(mask: np.ndarray, cells: int) -> np.ndarray:
-    """Cells within `cells` (chessboard distance) of a True cell, by repeated 3x3 dilation."""
+    """Cells within `cells` (city-block distance) of a True cell (= repeated 4-neighbour dilation)."""
+    try:
+        from . import _dense
+        return _dense.near(np.ascontiguousarray(mask, np.uint8), int(max(0, cells)))
+    except ImportError:
+        pass
     out = mask.copy()
     for _ in range(max(0, int(cells))):
         grown = out.copy()
@@ -505,6 +508,48 @@ def _near(mask: np.ndarray, cells: int) -> np.ndarray:
         if (grown == out).all():
             break
         out = grown
+    return out
+
+
+def fill_holes_lower(Z: np.ndarray, f: int = 4) -> np.ndarray:
+    """Fill NaN holes by growing the *lower* median of measured neighbours inwards (never an
+    average across a height step, so a hole between a roof and the ground takes the ground
+    height instead of an invented ramp). Grown at 1/f resolution (block medians), then the
+    coarse values fill the full-resolution holes."""
+    import warnings
+    from . import _dense
+    H, W = Z.shape
+    h, w = -(-H // f), -(-W // f)
+    P = np.full((h * f, w * f), np.nan, np.float32)
+    P[:H, :W] = Z
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        C = np.nanmedian(P.reshape(h, f, w, f).transpose(0, 2, 1, 3).reshape(h, w, f * f), axis=2).astype(np.float32)
+    if not np.isfinite(C).any():
+        return Z.copy()
+    rgb = np.zeros((h, w, 3), np.uint8)
+    sc = np.zeros((h, w), np.float32)
+    while True:
+        if _dense.fill_lower_median(C.copy(), rgb.copy(), C, rgb, sc, 1.0, 1) == 0:
+            break
+    up = np.repeat(np.repeat(C, f, 0), f, 1)[:H, :W]
+    return np.where(np.isfinite(Z), Z, up).astype(np.float32)
+
+
+def _bilateral_parallel(z, vmask, radius, sigma_z, sigma_s, rows=256):
+    """_mvs.bilateral on overlapping row bands in parallel (the kernel releases the GIL); each band
+    carries `radius` extra rows on both sides, so the result equals the single-call result."""
+    H = z.shape[0]
+    out = np.empty_like(z)
+
+    def band(y0):
+        y1 = min(H, y0 + rows)
+        a, b = max(0, y0 - radius), min(H, y1 + radius)
+        r = _mvs.bilateral(np.ascontiguousarray(z[a:b]), np.ascontiguousarray(vmask[a:b]), radius, sigma_z, sigma_s)
+        out[y0:y1] = np.asarray(r)[y0 - a:y0 - a + (y1 - y0)]
+
+    with ThreadPoolExecutor(os.cpu_count() or 1) as ex:
+        list(ex.map(band, range(0, H, rows)))
     return out
 
 
@@ -531,7 +576,9 @@ def postprocess(d: DenseResult, min_score: float, max_dev: float = 1.0,
         spikes = np.isfinite(Zc) & (np.abs(Zc - med) > thr)
         conf &= ~spikes
         Zc[spikes] = np.nan
-    filled = fill_holes(Zc)
+    # depth-map DSMs: holes are mostly ground hidden/shadowed beside objects -> fill from the lower
+    # surface; the sweep DSM keeps its smooth push-pull fill
+    filled = fill_holes_lower(Zc) if d.stepped is not None else fill_holes(Zc)
     # heights already filled from nearby points (densify radius steps, 0 < score < min_score)
     # are better than the push-pull estimate: keep them where they are not spikes
     stepped = (np.zeros(d.Z.shape, bool) if d.stepped is None else d.stepped & np.isfinite(d.Z))
@@ -547,7 +594,7 @@ def postprocess(d: DenseResult, min_score: float, max_dev: float = 1.0,
         vmask = np.isfinite(filled).astype(np.uint8)
         z = np.nan_to_num(filled, nan=0.0).astype(np.float32)
         for _ in range(smooth_iters):
-            z = _mvs.bilateral(np.ascontiguousarray(z), vmask, 3, float(smooth_range), 2.0)
+            z = _bilateral_parallel(z, vmask, 3, float(smooth_range), 2.0)
         filled = np.where(keep, z, np.nan).astype(np.float32)
     support = np.where(conf & keep, 1, np.where(np.isfinite(filled), 2, 0)).astype(np.uint8)
     return filled, conf, support

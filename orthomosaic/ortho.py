@@ -25,6 +25,10 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 from .imageio import load_rgb
+try:
+    from . import _dense
+except ImportError:                       # source tree without the compiled kernel
+    _dense = None
 from .masks import load_mask
 from .mvs import _View
 from .render import ImageCache
@@ -47,11 +51,18 @@ def _visibility(dsm, minX, maxY, gsd, C, X, Y, Z, max_steps, tol, zmax=None):
     """
     H, W = dsm.shape
     X, Y, Z = (np.asarray(a, np.float64) for a in (X, Y, Z))
-    vis = np.ones(Z.shape, bool)
+    vis = np.ones(np.shape(Z), bool)
     if zmax is None:
         zmax = float(np.nanmax(dsm)) if np.isfinite(dsm).any() else None
     if zmax is None:
         return vis
+    if _dense is not None:                       # C kernel: per-ray early exit, releases the GIL
+        out = np.empty(vis.size, np.uint8)
+        _dense.visibility(np.ascontiguousarray(dsm, np.float32), float(minX), float(maxY), float(gsd),
+                          float(C[0]), float(C[1]), float(C[2]),
+                          np.ascontiguousarray(np.ravel(X), np.float64), np.ascontiguousarray(np.ravel(Y), np.float64),
+                          np.ascontiguousarray(np.ravel(Z), np.float64), int(max_steps), float(tol), float(zmax), out)
+        return out.reshape(vis.shape).astype(bool)
     ux, uy = C[0] - X, C[1] - Y
     dh = np.hypot(ux, uy)
     rise = (C[2] - Z) / np.maximum(dh, 1e-6)          # ray height gain per horizontal metre
@@ -97,6 +108,11 @@ def _seam_labels(cost, cols, smooth, iters):
     L = cost.shape[0]
     lab = np.argmin(cost, 0)
     if L < 2 or smooth <= 0:
+        return lab
+    if _dense is not None:                       # C kernel, same energy and update rule
+        lab = np.ascontiguousarray(lab, np.int32)
+        _dense.seam_icm(np.ascontiguousarray(cost, np.float32), np.ascontiguousarray(cols, np.float32),
+                        lab, float(smooth), int(iters))
         return lab
     for _ in range(iters):
         tot = cost.copy()
@@ -159,6 +175,11 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
     opt = opt if opt is not None else _Defaults()
     g = lambda name: getattr(opt, name, getattr(_Defaults, name))
     backend = ar.backend
+    if not backend.parallel_blocks and backend.name == "mps":
+        # On Apple GPUs the per-tile work is mostly CPU (scoring, visibility, seams), and GPU
+        # backends process tiles one at a time: use the C sampler with all cores instead.
+        from .backend import CPUBackend
+        backend = CPUBackend()
     frames = ar.frames
     dsm = np.ascontiguousarray(dsm, np.float32)
     H, W = dsm.shape
@@ -220,13 +241,21 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
     pad = band + 8 if blend == "seam" else 0     # context so seams/feathering continue across tiles
     zmax = float(np.nanmax(dsm))
 
-    # surface normals from the DSM (for the viewing-angle term)
-    gy, gx = np.gradient(np.where(covered, dsm, zfill).astype(np.float32), gsd)
-    nrm = np.dstack([gx, -gy, -np.ones_like(gx)])          # d/dx, d/dy(north-up rows) -> normal
-    nrm /= -np.linalg.norm(nrm, axis=2, keepdims=True)
-    # steep cells are facades/edge ramps of the 2.5D surface: scoring them against their tilted
-    # normal would favour oblique views that look *at* the wall, so use the vertical there
-    nrm[nrm[..., 2] < np.cos(np.radians(30))] = (0.0, 0.0, 1.0)
+    dsm_c = np.ascontiguousarray(dsm, np.float32)       # one contiguous copy for the C visibility kernel
+
+    def normals(y0, y1, x0, x1):
+        """Surface normals of a DSM window (computed per tile: a full-raster normal map costs
+        12 bytes/cell). Steep cells are facades/edge ramps of the 2.5D surface: scoring them
+        against their tilted normal would favour oblique views that look *at* the wall, so the
+        vertical is used there."""
+        a0, a1 = max(0, y0 - 1), min(H, y1 + 1)
+        b0, b1 = max(0, x0 - 1), min(W, x1 + 1)
+        win = np.where(covered[a0:a1, b0:b1], dsm[a0:a1, b0:b1], zfill).astype(np.float32)
+        gy_, gx_ = np.gradient(win, gsd) if min(win.shape) > 1 else (np.zeros_like(win), np.zeros_like(win))
+        n = np.dstack([gx_, -gy_, -np.ones_like(gx_)])
+        n /= -np.linalg.norm(n, axis=2, keepdims=True)
+        n[n[..., 2] < np.cos(np.radians(30))] = (0.0, 0.0, 1.0)
+        return n[y0 - a0:y0 - a0 + (y1 - y0), x0 - b0:x0 - b0 + (x1 - x0)]
 
     cam_xy = rec.C[:, :2]
     SRC = np.full((H, W), -1, np.int32)                       # index into rec.used, -1 = none
@@ -280,7 +309,7 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
         wx = X0 + (cc + 0.5) * gsd                 # map coordinates of cell centres
         wy = Y0 - (rr + 0.5) * gsd
         wz = dsm[py0 + rr, px0 + cc].astype(np.float64)
-        n_c = nrm[py0 + rr, px0 + cc]
+        n_c = normals(py0, py1, px0, px1)[rr, cc]
         vis_h, vis_w = -(-ph // occ_stride), -(-pw // occ_stride)
         L = len(cand)
         cols = np.zeros((L, ph, pw, 3), np.float32)
@@ -299,7 +328,7 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
                 vis_map = np.ones((vis_h, vis_w), bool)
                 if sr.size:
                     sr_, sc_ = sr * occ_stride, scc * occ_stride
-                    vis_map[sr, scc] = _visibility(dsm, minX, maxY, gsd, C, X0 + (sc_ + 0.5) * gsd,
+                    vis_map[sr, scc] = _visibility(dsm_c, minX, maxY, gsd, C, X0 + (sc_ + 0.5) * gsd,
                                                    Y0 - (sr_ + 0.5) * gsd, dsm[py0 + sr_, px0 + sc_],
                                                    occ_steps, occ_tol, zmax)
                     if occ_stride > 1:   # a coarse cell is visible only if it and its 4-neighbours are

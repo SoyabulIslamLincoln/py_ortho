@@ -90,7 +90,12 @@ def las_to_laz(las_path: str) -> Optional[str]:
         return None
     import os
     laz = os.path.splitext(las_path)[0] + ".laz"
-    laspy.read(las_path).write(laz)
+    # stream in chunks (memory bounded) with the parallel lazrs compressor when available
+    backend = laspy.LazBackend.detect_available()[0]
+    with laspy.open(las_path) as r, laspy.open(laz, mode="w", header=r.header, do_compress=True,
+                                                laz_backend=backend) as w:
+        for chunk in r.chunk_iterator(5_000_000):
+            w.write_points(chunk)
     return laz
 
 
