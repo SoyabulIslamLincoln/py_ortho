@@ -146,6 +146,9 @@ class _Defaults:
     cache_mb = 1024
     workers = 0
     ortho_blend = "seam"
+    ortho_views = 8          # views per tile, chosen from different sides (see process)
+    ortho_scan_views = 80    # nearest cameras examined per tile
+    fill_hidden = True       # colour cells hidden in every chosen view from the best view anyway
     source_weights = (1.0, 0.5, 0.7, 0.3)   # angle, resolution, border, exposure
     seam_smoothness = 0.6
     seam_iters = 4
@@ -234,6 +237,9 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
     occ_steps = int(g("occlusion_steps"))
     occ_stride = max(1, int(g("occlusion_stride")))
     blend = str(g("ortho_blend"))
+    n_views = int(g("ortho_views"))
+    scan_views = int(g("ortho_scan_views"))
+    fill_hidden = bool(g("fill_hidden"))
     w_ang, w_res, w_bord, w_exp = (float(x) for x in g("source_weights"))
     smooth = float(g("seam_smoothness"))
     s_iters = int(g("seam_iters"))
@@ -286,8 +292,8 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
         pts = np.concatenate([np.column_stack([corners, np.full(len(corners), z)]) for z in (zlo, zhi)])
         centre = np.array([[cxw, cyw, 0.5 * (zlo + zhi)]])
         dist = np.hypot(cam_xy[:, 0] - cxw, cam_xy[:, 1] - cyw)
-        cand = []
-        for k in np.argsort(dist):
+        seeing = []
+        for k in np.argsort(dist)[:scan_views]:
             it = rec.intr[rec.cam_group[k]]
             xc = (pts - rec.C[k]) @ rec.R[k].T
             u = it.f * xc[:, 0] / np.maximum(xc[:, 2], 1e-6) + it.cx
@@ -298,11 +304,23 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
             cv = it.f * cc[0, 1] / max(cc[0, 2], 1e-6) + it.cy
             sees_centre = cc[0, 2] > 0 and 0 <= cu <= it.width - 1 and 0 <= cv <= it.height - 1
             if sees_centre or inside.mean() >= 0.5:
-                cand.append(int(k))
-            if len(cand) >= max_views:
-                break
-        if not cand:
+                seeing.append(int(k))
+        if not seeing:
             return None
+        # Views from *different sides*: the most nadir (nearest) first, then repeatedly the camera
+        # farthest from those already chosen. Dense flights take neighbouring photos ~2 m apart, so
+        # the n nearest are one viewpoint: next to a tall wall they can all be occluded while the
+        # ground is seen from the other side of the block.
+        cand = [seeing[0]]
+        if len(seeing) > 1:
+            P = cam_xy[seeing]
+            dmin = np.hypot(*(P - P[0]).T)
+            while len(cand) < min(n_views, len(seeing)):
+                j = int(np.argmax(dmin))
+                if dmin[j] <= 0:
+                    break
+                cand.append(seeing[j])
+                dmin = np.minimum(dmin, np.hypot(*(P - P[j]).T))
         views = [cache.get(k) for k in cand]
 
         rr, cc = np.nonzero(sub)
@@ -314,6 +332,7 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
         L = len(cand)
         cols = np.zeros((L, ph, pw, 3), np.float32)
         score = np.full((L, ph, pw), -1.0, np.float32)            # -1 = not usable
+        score_nv = np.full((L, ph, pw), -1.0, np.float32)         # same, ignoring occlusion (hidden fill)
         inv_depth = np.zeros((L, rr.size), np.float32)
         for j, (k, v) in enumerate(zip(cand, views)):
             rv, vv = backend.sample_view(v.rgb, v.cam(0), X0, Y0, gsd, Ztile)
@@ -348,6 +367,7 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
             s = (w_ang * cos_n ** va_power + w_bord * np.clip(rgbw[rr, cc, 3], 0, 1) + w_exp * expo)
             cols[j, rr, cc] = px
             score[j, rr, cc] = np.where(ok, s, -1.0)
+            score_nv[j, rr, cc] = np.where(valid, s, -1.0)
         # resolution term: projected pixel size relative to the finest view at this cell
         best = inv_depth.max(0)
         res_t = np.where(best > 0, inv_depth / np.maximum(best, 1e-9), 0)
@@ -355,12 +375,20 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
             score[j, rr, cc] = np.where(score[j, rr, cc] >= 0, score[j, rr, cc] + w_res * res_t[j], -1.0)
         wsum_w = max(w_ang + w_res + w_bord + w_exp, 1e-6)
         usable = score >= 0
-        count = usable.sum(0)
+        count = usable.sum(0)                                     # views that *see* the cell
+        if fill_hidden:
+            # cells inside photos but occluded in all of them (e.g. ground at the foot of a wall):
+            # colour them from the best photo anyway instead of leaving a hole (as 0.3.3 did);
+            # coverage_count stays 0 there, so they remain identifiable
+            fb = (count == 0) & (score_nv >= 0).any(0)
+            if fb.any():
+                score = np.where(fb[None], score_nv, score)
+                usable = score >= 0
 
         if blend == "seam":
             cost = np.where(usable, 1.0 - score / wsum_w, 1e3).astype(np.float32)
             lab = _seam_labels(cost, cols, smooth, s_iters)
-            has = count > 0
+            has = usable.any(0)
             # feather only inside a band around the seams; elsewhere one source per cell
             wts = np.zeros((L, ph, pw), np.float32)
             for j in range(L):
@@ -372,10 +400,13 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
             w = np.where(usable, np.maximum(score, 0) ** 2, 0)
             ws = w.sum(0)
             rgb = (w[..., None] * cols).sum(0) / np.maximum(ws, 1e-6)[..., None]
-            src = np.where(count > 0, np.asarray(cand)[np.argmax(score, 0)], -1)
+            src = np.where(usable.any(0), np.asarray(cand)[np.argmax(score, 0)], -1)
         oy, ox = ty - py0, tx - px0
         crop = (slice(oy, oy + th), slice(ox, ox + tw))
-        return tx, ty, th, tw, rgb[crop], (ws[crop] > 1e-6) & (count[crop] > 0), src[crop], count[crop]
+        cov = usable.any(0)
+        if blend == "seam":
+            src = np.where(cov, np.asarray(cand)[lab], -1)
+        return tx, ty, th, tw, rgb[crop], (ws[crop] > 1e-6) & cov[crop], src[crop], count[crop]
 
     def consume(res):
         if res is None:

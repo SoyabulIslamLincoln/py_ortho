@@ -64,6 +64,9 @@ class Options3D(Options):
     occlusion_stride: int = 2               # test occlusion on every n-th cell, then grow the mask
     ortho_tile: int = 256                   # true-orthophoto tile size (cells)
     view_angle_power: float = 1.5           # nadir preference when blending the true orthophoto
+    ortho_views: int = 8                    # orthophoto: views per tile, picked from different sides of the tile
+    ortho_scan_views: int = 80              # orthophoto: nearest cameras examined per tile
+    fill_hidden: bool = True                # orthophoto: colour cells hidden in all chosen views from the best view
     ortho_blend: str = "seam"               # "seam": one source per cell + seam optimisation; "feather": average
     source_weights: tuple = (1.0, 0.5, 0.7, 0.3)   # angle, resolution, border distance, exposure
     seam_smoothness: float = 0.6            # weight of the seam (colour-disagreement) term
