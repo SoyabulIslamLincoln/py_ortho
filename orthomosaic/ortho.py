@@ -221,13 +221,30 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
         if m is not None:
             feather[~m] = 0.0                    # masked pixels: weight 0 = not a valid sample
         rgb = np.dstack([rgb, feather])
+        if u8:
+            # 8-bit cache (colour 0-255, feather 0-255): 4x more photos fit in the same RAM
+            rgb = np.clip(rgb * np.array([1, 1, 1, 255], np.float32) + 0.5, 0, 255).astype(np.uint8)
         it = rec.intr[rec.cam_group[k]]
         sx = rgb.shape[1] / fr.width
-        return _View([], backend.upload(np.ascontiguousarray(rgb)),
+        return _View([], np.ascontiguousarray(rgb) if u8 else backend.upload(np.ascontiguousarray(rgb)),
                      np.ascontiguousarray(rec.R[k]), np.ascontiguousarray(rec.C[k]),
                      it.f * sx, it.k1, it.k2, (it.cx + 0.5) * sx - 0.5, (it.cy + 0.5) * sx - 0.5)
 
+    u8 = backend.name == "cpu" and _dense is not None and hasattr(_dense, "sample_view_u8")
     cache = ImageCache(load, lambda v: v.nbytes, int(g("cache_mb")) * 1024 * 1024)
+
+    def sample(v, X0, Y0, Ztile):
+        if not u8:
+            rv, vv = backend.sample_view(v.rgb, v.cam(0), X0, Y0, gsd, Ztile)
+            return backend.to_numpy(rv), backend.to_numpy(vv)
+        R, C, f, k1, k2, cx, cy = v.cam(0)
+        out = np.empty(Ztile.shape + (4,), np.float32)
+        val = np.empty(Ztile.shape, np.uint8)
+        _dense.sample_view_u8(v.rgb, np.ascontiguousarray(R, np.float64), np.ascontiguousarray(C, np.float64),
+                              float(f), float(k1), float(k2), float(cx), float(cy), float(X0), float(Y0), float(gsd),
+                              np.ascontiguousarray(Ztile, np.float32), out, val)
+        out[..., 3] *= 1.0 / 255.0
+        return out, val
 
     T = int(g("ortho_tile"))
     max_views = int(g("max_views"))
@@ -335,9 +352,8 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
         score_nv = np.full((L, ph, pw), -1.0, np.float32)         # same, ignoring occlusion (hidden fill)
         inv_depth = np.zeros((L, rr.size), np.float32)
         for j, (k, v) in enumerate(zip(cand, views)):
-            rv, vv = backend.sample_view(v.rgb, v.cam(0), X0, Y0, gsd, Ztile)
-            rgbw = backend.to_numpy(rv)
-            valid = (backend.to_numpy(vv)[rr, cc] > 0) & (rgbw[rr, cc, 3] > 0)
+            rgbw, vv = sample(v, X0, Y0, Ztile)
+            valid = (vv[rr, cc] > 0) & (rgbw[rr, cc, 3] > 0)
             C = rec.C[k].astype(np.float64)
             ray = np.column_stack([C[0] - wx, C[1] - wy, C[2] - wz])
             rng_ = np.linalg.norm(ray, axis=1) + 1e-9

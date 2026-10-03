@@ -59,10 +59,17 @@ class DepthOptions:
     window: int = 5                   # NCC window radius (11x11)
     top_k: int = 2                    # score = mean NCC of the best k source views
     min_ncc: float = 0.3              # photometric acceptance (geometric consistency is the main filter)
-    min_texture: float = 3.0          # reference window grey std (0-255 units) below this -> no depth
-    min_views: int = 3                # images that must agree on a point (incl. the reference)
-    consistency_px: float = 1.0       # forward-backward reprojection tolerance (px)
-    consistency_depth: float = 0.01   # relative depth tolerance
+    min_texture: float = 0.5          # reject only flat windows (grey std below this): on real flights
+                                      # low-contrast pixels are mostly correct (55-81 %), so geometric
+                                      # consistency, not a texture threshold, decides
+    min_views: int = 0                # images that must agree on a point; 0 = auto (3, or 2 for low overlap)
+    consistency_px: float = 0.0       # forward-backward tolerance (px); 0 = auto from the SfM residual
+    consistency_depth: float = 0.0    # relative depth tolerance; 0 = auto per image pair (baseline, depth)
+    patchmatch: bool = False          # repair inconsistent pixels with slanted-plane PatchMatch (C, slow on CPU)
+    pm_iters: int = 2
+    pm_window: int = 4                # PatchMatch window radius (px), sampled every `pm_step`
+    pm_step: int = 2
+    pm_geo_weight: float = 0.5        # weight of the multi-view geometric term in the PatchMatch cost
     layer_gap: float = 1.0            # metres: points this far below the cell top are another layer
     keep_depthmaps: bool = False      # keep <out>/depthmaps/*.npy after fusion (deleted even on errors)
     point_stride: int = 2             # fuse every n-th reference pixel per axis (Pix4D "optimal" density)
@@ -166,7 +173,7 @@ def _neighbours(rec, n_nb: int):
     for k in range(N):
         base = np.linalg.norm(rec.C - rec.C[k], axis=1)
         ang = np.degrees(base / max(depth[k], 1e-3))
-        w = np.clip(ang / 5.0, 0, 1) ** 2 * np.where(ang > 45, 0.2, 1.0)
+        w = np.clip(ang / 8.0, 0, 1) ** 2 * np.where(ang > 45, 0.2, 1.0)   # prefer >= 8 deg triangulation angle
         score = shared[k] * w
         cand = [j for j in np.argsort(-score) if score[j] > 0 and shared[k, j] >= 15][:n_nb]
         out.append(cand)
@@ -174,16 +181,38 @@ def _neighbours(rec, n_nb: int):
 
 
 def _depth_range(rec, k):
-    m = rec.obs_cam == k
-    if m.sum() < 10:
-        return None
-    d = (rec.R[k] @ (rec.X[rec.obs_pt[m]] - rec.C[k]).T)[2]
-    d = d[d > 0]
+    """Depth search range of image k from *all* tie points that project into its view (not only
+    those it observed), always reaching the lowest ground of the block.
+
+    Using only an image's own tie points fails on tall buildings flown low: a photo that mostly
+    sees a roof 30 m below the camera then never searches the ground 55 m below it."""
+    it = rec.intr[rec.cam_group[k]]
+    xc = (rec.X - rec.C[k]) @ rec.R[k].T
+    z = xc[:, 2]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        u = it.f * xc[:, 0] / z + it.cx
+        v = it.f * xc[:, 1] / z + it.cy
+    inside = (z > 0) & (u >= 0) & (v >= 0) & (u < it.width) & (v < it.height)
+    d = z[inside]
     if len(d) < 10:
         return None
-    lo, hi = np.percentile(d, [2, 98])
+    lo, hi = np.percentile(d, [1, 99])
+    # the lowest ground anywhere in the block, seen along this camera's optical axis
+    zlow = float(np.percentile(rec.X[:, 2], 0.5))
+    axis_down = max(-float(rec.R[k][2, 2]), 0.2)        # cos of the view axis from nadir
+    hi = max(hi, (float(rec.C[k][2]) - zlow) / axis_down)
     span = hi - lo
-    return max(0.3 * lo, lo - 0.3 * span - 1.0), hi + 0.3 * span + 1.0
+    return max(0.3 * lo, lo - 0.2 * span - 1.0), hi + 0.2 * span + 2.0
+
+
+def _num_depths(rec, k, nbrs_k, rng, f_coarse, base: int) -> int:
+    """Coarse-sweep hypotheses: one per ~1 px of disparity at the coarse level for the median
+    baseline, so a wider depth range keeps the same depth resolution (between base and 3x base)."""
+    if not nbrs_k:
+        return base
+    B = float(np.median([np.linalg.norm(rec.C[k] - rec.C[j]) for j in nbrs_k]))
+    disp = f_coarse * B * (1.0 / rng[0] - 1.0 / rng[1])
+    return int(np.clip(np.ceil(disp), base, 3 * base))
 
 
 # ------------------------------------------------------------------ depth map of one image
@@ -234,6 +263,15 @@ def _sweep(ref, cam_r, srcs, cams_s, inv_list, opt, ray=None):
     return (1.0 / np.maximum(inv, 1e-9)).astype(np.float32), best, sd
 
 
+def noise_sigma(grey255: np.ndarray) -> float:
+    """Image noise (grey levels) from the Laplacian residual (Immerkaer 1996)."""
+    g = grey255.astype(np.float32)
+    lap = (g[:-2, :-2] - 2 * g[:-2, 1:-1] + g[:-2, 2:] - 2 * g[1:-1, :-2] + 4 * g[1:-1, 1:-1]
+           - 2 * g[1:-1, 2:] + g[2:, :-2] - 2 * g[2:, 1:-1] + g[2:, 2:])
+    lap = lap[np.isfinite(lap)]
+    return float(np.sqrt(np.pi / 2) * np.mean(np.abs(lap)) / 6) if lap.size else 1.0
+
+
 def depth_map(k, nbrs, rec, views, opt: DepthOptions):
     """Depth (camera-axis, metres) and NCC score for reference image `k` at matching scale."""
     rng = _depth_range(rec, k)
@@ -267,7 +305,8 @@ def depth_map(k, nbrs, rec, views, opt: DepthOptions):
                                                  + r0[:, 1::2, 1::2]), np.float32))
 
     # full sweep at the coarsest level, uniform in inverse depth
-    inv = np.linspace(1 / rng[1], 1 / rng[0], opt.num_depths).astype(np.float32)
+    nd = _num_depths(rec, k, nbrs, rng, pyr_c[L].f, opt.num_depths)
+    inv = np.linspace(1 / rng[1], 1 / rng[0], nd).astype(np.float32)
     shape = pyr_r[L].shape
     d, _, _ = _sweep(pyr_r[L], pyr_c[L], pyr_s[L], pyr_cs[L], [np.full(shape, i, np.float32) for i in inv], opt,
                      rays[L])
@@ -283,12 +322,63 @@ def depth_map(k, nbrs, rec, views, opt: DepthOptions):
         dstep /= 2
     depth = d
     sd = sd * 64.0                                   # back to 0-255 grey units
-    bad = ref_mask | (score < opt.min_ncc) | (sd < opt.min_texture) | (depth < rng[0]) | (depth > rng[1])
-    depth[bad] = np.nan
-    return depth, score
+    depth[ref_mask | (depth < rng[0]) | (depth > rng[1])] = np.nan
+    # NCC / texture are applied after the (optional) PatchMatch repair; here only the raw map
+    low_texture = sd < opt.min_texture
+    return depth, score, low_texture
 
 
 # ------------------------------------------------------------------ main entry
+def _consistency(k, D, nbrs_k, dm, cams, px_tol, rel_tol):
+    """Number of neighbour depth maps that agree with each pixel of D (forward-backward
+    reprojection within px_tol and relative depth within rel_tol[j])."""
+    cr = cams[k]
+    cnt = np.zeros(D.shape, np.int16)
+    vv, uu = np.nonzero(np.isfinite(D))
+    if len(vv) == 0:
+        return cnt
+    d = D[vv, uu].astype(np.float64)
+    x, y = cr.rays(uu.astype(np.float64), vv.astype(np.float64))
+    X = cr.C + (np.stack([x * d, y * d, d], 1) @ cr.R)
+    c = np.zeros(len(d), np.int16)
+    for j in nbrs_k:
+        if j not in dm:
+            continue
+        cj = cams[j]
+        xc = (X - cj.C) @ cj.R.T
+        u, v = cj.project_cam(xc[:, 0], xc[:, 1], xc[:, 2])
+        ui, vi = np.rint(u).astype(np.int64), np.rint(v).astype(np.int64)
+        ins = (xc[:, 2] > 0) & (ui >= 0) & (vi >= 0) & (ui < cj.w) & (vi < cj.h)
+        dj = np.full(len(d), np.nan)
+        dj[ins] = dm[j][vi[ins], ui[ins]]
+        xj, yj = cj.rays(ui.astype(np.float64), vi.astype(np.float64))
+        Xj = cj.C + (np.stack([xj * dj, yj * dj, dj], 1) @ cj.R)
+        xk = (Xj - cr.C) @ cr.R.T
+        ub, vb = cr.project_cam(xk[:, 0], xk[:, 1], xk[:, 2])
+        ok = np.isfinite(dj) & (np.hypot(ub - uu, vb - vv) <= px_tol) & (np.abs(dj - xc[:, 2]) <= rel_tol[j] * dj)
+        c += ok
+    cnt[vv, uu] = c
+    return cnt
+
+
+def _init_normals(D, ray):
+    """World-frame surface normals of a depth map (local plane from 2-px central differences),
+    oriented towards the camera; vertical where undefined."""
+    P = ray * np.where(np.isfinite(D), D, np.nan)[None]           # point minus camera centre
+    tu = np.full_like(P, np.nan)
+    tv = np.full_like(P, np.nan)
+    tu[:, :, 2:-2] = P[:, :, 4:] - P[:, :, :-4]
+    tv[:, 2:-2, :] = P[:, 4:, :] - P[:, :-4, :]
+    n = np.cross(tu, tv, axis=0)
+    nn = np.linalg.norm(n, axis=0)
+    bad = ~np.isfinite(nn) | (nn < 1e-12)
+    n = n / np.where(bad, 1, nn)[None]
+    n[:, bad] = np.array([0.0, 0.0, 1.0])[:, None]
+    flip = np.sum(n * ray, 0) > 0
+    n[:, flip] *= -1
+    return np.ascontiguousarray(n, np.float32)
+
+
 def densify(ar, rec, gains: dict, biases: Optional[dict], out_dir: str, opt: DepthOptions) -> DenseCloud:
     """Depth maps -> fused dense cloud. The per-image depth maps live in <out_dir>/depthmaps only
     while this runs: the folder is cleared first and removed afterwards, also when the run fails
@@ -312,7 +402,7 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
     scales, cams = {}, {}
     for k, i in enumerate(rec.used):
         fr = frames[i]
-        s = min(1.0, opt.max_image_dim / max(fr.width, fr.height))
+        s = min(1.0, (opt.max_image_dim or max(fr.width, fr.height)) / max(fr.width, fr.height))   # None = full resolution
         w, h = int(round(fr.width * s)), int(round(fr.height * s))
         it = rec.intr[rec.cam_group[k]]
         cams[k] = _Cam(rec.R[k], rec.C[k], it.f, it.k1, it.k2, it.cx, it.cy, fr.width, fr.height).scaled(w / fr.width, w, h)
@@ -362,10 +452,36 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
     done = 0
     step = max(1, N // 20)
 
+    # ---- data-driven settings (no per-flight tuning)
+    scale_med = float(np.median(list(scales.values())))
+    px_tol = opt.consistency_px or float(np.clip(2.0 * rec.rms_px * scale_med, 1.0, 3.0))
+    n_good = np.array([len(x) for x in nbrs])
+    min_views = opt.min_views or (3 if np.median(n_good) >= 3 else 2)
+    dmed = {}
+    for k in range(N):
+        m = rec.obs_cam == k
+        if m.any():
+            dmed[k] = float(np.median((rec.R[k] @ (rec.X[rec.obs_pt[m]] - rec.C[k]).T)[2]))
+
+    def rel_tols(k):
+        """Relative depth tolerance per neighbour: the depth change that moves the point by
+        px_tol pixels between the two views (dz/z = px * z / (f * baseline))."""
+        out = {}
+        for j in nbrs[k]:
+            B = float(np.linalg.norm(rec.C[k] - rec.C[j]))
+            out[j] = (opt.consistency_depth or
+                      float(np.clip(px_tol * dmed.get(k, 1.0) / max(cams[k].f * B, 1e-9), 0.01, 0.05)))
+        return out
+
+    log.info("Densify settings (auto): consistency %.2f px, min views %d, PatchMatch %s",
+             px_tol, min_views, "on" if opt.patchmatch else "off")
+
     def job(k):
         r = depth_map(k, nbrs[k], rec, views, opt)
         if r is not None:
-            np.save(os.path.join(wd, f"{k:05d}.npy"), r[0])
+            np.save(os.path.join(wd, f"p{k:05d}.npy"), r[0])
+            np.save(os.path.join(wd, f"s{k:05d}.npy"), r[1].astype(np.float16))
+            np.save(os.path.join(wd, f"t{k:05d}.npy"), r[2])
         return k, r is not None
 
     have = set()
@@ -376,18 +492,66 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
                 have.add(k)
             if done % step == 0 or done == N:
                 log.info("  dense: %d/%d depth maps", done, N)
-    cache.clear()
     log.info("Depth maps done in %.1fs (%d/%d images)", time.time() - t0, len(have), N)
+
+    # ---- pass 2: geometric check against the neighbours + PatchMatch repair + final filter
+    t2 = time.time()
+    raw = {k: np.load(os.path.join(wd, f"p{k:05d}.npy"), mmap_mode="r") for k in have}
+    stats = {"repaired": 0, "active": 0, "pixels": 0}
+    slock = threading.Lock()
+
+    def repair(k):
+        D = np.array(raw[k], np.float32)
+        S = np.load(os.path.join(wd, f"s{k:05d}.npy")).astype(np.float32)
+        low = np.load(os.path.join(wd, f"t{k:05d}.npy"))
+        tol = rel_tols(k)
+        if opt.patchmatch:
+            cnt = _consistency(k, D, nbrs[k], raw, cams, px_tol, tol)
+            grey, _, cr = views(k)
+            active = (np.isfinite(grey) & ((cnt < min_views - 1) | (S < opt.min_ncc) | ~np.isfinite(D))).astype(np.uint8)
+            src_ids = [j for j in nbrs[k] if j in raw]
+            if active.any() and src_ids:
+                ray = _rays_world(D.shape, cr)
+                normal = _init_normals(D, ray)
+                srcs = [views(j)[0] for j in src_ids]
+                par = np.array([np.r_[cams[j].R.ravel(), cams[j].C, cams[j].f, cams[j].k1, cams[j].k2,
+                                      cams[j].cx, cams[j].cy] for j in src_ids], np.float64)
+                sdeps = [np.ascontiguousarray(raw[j], np.float32) for j in src_ids]
+                rng = _depth_range(rec, k) or (float(np.nanmin(D)), float(np.nanmax(D)))
+                ch = _dense.pm_refine(np.ascontiguousarray(np.where(np.isfinite(grey), grey, np.nan), np.float32),
+                                      ray, np.ascontiguousarray(cr.C, np.float64), srcs, sdeps, par, D, normal, S,
+                                      active, opt.pm_window, opt.pm_step, opt.top_k, opt.pm_geo_weight,
+                                      float(np.median(list(tol.values()))), opt.pm_iters, rng[0], rng[1], k * 2654435761 % 2**32)
+                with slock:
+                    stats["repaired"] += int(ch)
+                    stats["active"] += int(active.sum())
+            with slock:
+                stats["pixels"] += int(np.isfinite(D).sum())
+        D[(S < opt.min_ncc) | low] = np.nan
+        np.save(os.path.join(wd, f"{k:05d}.npy"), D)
+        return k
+
+    done = 0
+    with ThreadPoolExecutor(workers) as ex:
+        for _ in ex.map(repair, sorted(have)):
+            done += 1
+            if done % step == 0 or done == len(have):
+                log.info("  repair: %d/%d depth maps", done, len(have))
+    del raw
+    cache.clear()
+    log.info("Depth-map repair done in %.1fs (%d of %d pixels re-estimated by PatchMatch)",
+             time.time() - t2, stats["active"], stats["pixels"])
 
     # ---- geometric consistency + fusion (sequential: pixels fused once are marked as used)
     t1 = time.time()
-    log.info("Fusing depth maps (>= %d agreeing images per point)", opt.min_views)
+    log.info("Fusing depth maps (>= %d agreeing images per point)", min_views)
     dm = {k: np.load(os.path.join(wd, f"{k:05d}.npy"), mmap_mode="r") for k in have}
     used = {k: np.zeros(dm[k].shape, bool) for k in have}
     pts, cols, nv, owner = [], [], [], []
     for n_done, k in enumerate(sorted(have)):
         D = np.asarray(dm[k])
         cr = cams[k]
+        tol_k = rel_tols(k)
         cand = np.isfinite(D) & ~used[k]
         if opt.point_stride > 1:                         # one point per stride x stride pixels
             sub = np.zeros_like(cand)
@@ -417,17 +581,21 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
             Xj = cj.C + (np.stack([xj * dj, yj * dj, dj], 1) @ cj.R)
             xk = (Xj - cr.C) @ cr.R.T
             ub, vb = cr.project_cam(xk[:, 0], xk[:, 1], xk[:, 2])
-            ok &= np.hypot(ub - uu, vb - vv) <= opt.consistency_px
-            ok &= np.abs(dj - xc[:, 2]) <= opt.consistency_depth * dj
+            ok &= np.hypot(ub - uu, vb - vv) <= px_tol
+            ok &= np.abs(dj - xc[:, 2]) <= tol_k[j] * dj
             acc[ok] += Xj[ok]
             cnt += ok
             marks.append((j, vi[ok], ui[ok], ok))
-        keep = cnt >= opt.min_views
+        keep = cnt >= min_views
         if not keep.any():
             continue
+        st_ = max(1, opt.point_stride)
         for j, vi, ui, ok in marks:
             sel = keep[ok]
-            used[j][vi[sel], ui[sel]] = True
+            # mark the stride-grid pixel that would emit this surface sample when j is the
+            # reference (only those pixels are candidates); otherwise every overlapping photo
+            # re-emits the same point
+            used[j][(vi[sel] // st_) * st_, (ui[sel] // st_) * st_] = True
         _, rgb, _ = views(k)
         pts.append((acc[keep] / cnt[keep, None]))
         cols.append(rgb[vv[keep], uu[keep]])

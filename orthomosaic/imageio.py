@@ -31,6 +31,7 @@ class Frame:
     rel_alt: Optional[float] = None     # DJI XMP: height above take-off (m)
     abs_alt: Optional[float] = None     # DJI XMP: absolute altitude (m)
     gimbal_pitch: Optional[float] = None
+    gimbal_yaw: Optional[float] = None      # DJI XMP GimbalYawDegree (deg from north, clockwise)
     speed_x: Optional[float] = None     # DJI XMP FlightXSpeed (m/s, north)
     speed_y: Optional[float] = None     # DJI XMP FlightYSpeed (m/s, east)
     speed_z: Optional[float] = None     # DJI XMP FlightZSpeed (m/s, down)
@@ -78,7 +79,7 @@ def list_images(folder: str) -> list[str]:
     return files
 
 
-_XMP_KEYS = {"RelativeAltitude": "rel_alt", "AbsoluteAltitude": "abs_alt", "GimbalPitchDegree": "gimbal_pitch",
+_XMP_KEYS = {"RelativeAltitude": "rel_alt", "AbsoluteAltitude": "abs_alt", "GimbalPitchDegree": "gimbal_pitch", "GimbalYawDegree": "gimbal_yaw",
              "FlightXSpeed": "speed_x", "FlightYSpeed": "speed_y", "FlightZSpeed": "speed_z"}
 
 

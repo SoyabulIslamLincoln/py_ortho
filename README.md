@@ -159,19 +159,28 @@ offset to absolute altitude.
 1. **Metadata** — EXIF/XMP: GPS, focal length, DJI gimbal/flight speed/shutter type. Optional
    masks: `<image>_mask.png` next to an image, or AI sky/background masks; masked pixels are
    ignored everywhere.
-2. **Aerial triangulation** — ORB-style features, GPS-neighbour matching, plane + parallax
-   verification, multi-view tracks, Levenberg–Marquardt bundle adjustment (Schur complement,
-   Huber loss) with GPS / altitude / GCP priors and lens self-calibration. Optional rolling-shutter
-   correction (ODM readout database, DJI flight speeds).
+2. **Aerial triangulation** — ORB-style features at full image resolution (12 000 per image),
+   GPS-neighbour matching, plane + parallax verification, multi-view tracks, Levenberg–Marquardt
+   bundle adjustment (Schur complement, Huber loss) with GPS / barometric-altitude / GCP priors,
+   a **gimbal attitude prior** (DJI pitch/roll, σ 2°) that stops a nadir block from drifting into
+   a common tilt, and lens self-calibration. Optional rolling-shutter correction.
 3. **Dense matching** — one depth map per photo: coarse-to-fine multi-view plane sweep (NCC,
-   ¼ → ½ → full of `depth_max_image`), geometric consistency across neighbouring depth maps, fusion
-   into a 3D cloud where each point is confirmed by ≥ `depth_min_views` photos. Depth maps are
+   ¼ → ½ → full of `depth_max_image`, C kernels), geometric consistency across neighbouring depth
+   maps, fusion into a 3D cloud. Settings adapt to each flight instead of being hand-tuned:
+   - depth search range from *all* tie points in a photo's view, always down to the lowest ground
+     (tall buildings flown low no longer lose the ground);
+   - consistency tolerance from the flight's SfM residual and each pair's baseline;
+   - neighbours chosen for a ≥ 8° triangulation angle; 3 agreeing photos, or 2 at low overlap;
+   - only flat, featureless windows are pre-rejected (low contrast is mostly still correct).
+   Optional slanted-plane PatchMatch repair (`depth_patchmatch`, slow on CPU). Depth maps are
    temporary and always deleted, also when a run fails.
-4. **DSM** — per cell the median of the cloud's top layer (roofs never averaged with walls or
+4. **DSM** — on its own grid sized from the point spacing (`dsm_auto_factor` × spacing), so cells
+   are measured rather than interpolated; per cell the median of the cloud's top layer (roofs never averaged with walls or
    ground below); empty cells filled from nearby points in radius steps (spacing × √2ᵏ); holes
    inside the area seen by ≥ 2 photos filled from the *lower* surrounding surface (no fake
    ramps beside buildings); spike removal and edge-preserving smoothing.
-5. **True orthophoto** — each DSM cell is projected into photos chosen from different sides of
+5. **True orthophoto** — on its own, finer grid (native GSD, capped by `ortho_max_cells`), with
+   the DSM resampled edge-aware (smooth on flat areas, nearest at height steps). Each cell is projected into photos chosen from different sides of
    the tile, tested for occlusion against the DSM, and scored (viewing angle, resolution, border
    distance, exposure). An MRF picks one photo per cell with seams where photos agree; colours
    blend only near seams. Cells hidden in every photo take the best photo's colour
@@ -187,11 +196,15 @@ Resolution is never finer than GSD − 10 % (`ignore_gsd=True` to override).
 
 | Option | CLI | Default | Meaning |
 |---|---|---|---|
-| `dsm_resolution` | `--dsm-resolution` | native GSD | Cell size (m) of DSM and orthophoto |
+| `dsm_resolution` | `--dsm-resolution` | auto | DSM cell (m); auto = 0.75 × dense point spacing |
 | `gps_sigma` | `--gps-sigma` | 3.0 | GPS accuracy (m); ~0.05 for RTK-fixed |
 | `dense_method` | `--dense-method` | `depthmap` | `depthmap` (3D cloud) or `sweep` (legacy 2.5D, used for thermal) |
 | `depth_max_image` | `--depth-max-image` | 1600 | Depth-map size (px, long side) |
-| `depth_min_views` | `--depth-min-views` | 3 | Photos that must agree on a point |
+| `depth_min_views` | `--depth-min-views` | 0 (auto) | Photos that must agree on a point (auto: 3, or 2 at low overlap) |
+| `depth_patchmatch` | — | False | Slanted-plane PatchMatch repair (slow on CPU) |
+| `attitude_sigma_deg` | — | 2.0 | Gimbal pitch/roll prior in the bundle adjustment (0 = off) |
+| `ortho_resolution` | — | native GSD | Orthophoto cell (m); its grid is separate from the DSM's |
+| `ortho_max_cells` | — | 60 M | Orthophoto pixel cap (memory) |
 | `dsm_max_fill` | `--dsm-max-fill` | −1 | Hole fill distance (m); −1 = everywhere photographed by ≥ 2 cameras |
 | `dem_gapfill_steps` | `--dem-gapfill-steps` | 3 | Radius steps for filling cells from nearby points |
 | `ortho_blend` | `--ortho-blend` | `seam` | `seam` (no ghosting) or `feather` |

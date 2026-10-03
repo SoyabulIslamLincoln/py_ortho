@@ -28,6 +28,8 @@ NODATA = -9999.0
 
 @dataclass
 class Options3D(Options):
+    feature_max_dim: int = 4096             # detect tie-point features at full resolution (Pix4D "full" keypoint scale):
+                                            # half resolution tilted a low-altitude block by ~2 deg in tests
     n_features: int = 12000                 # features per image for the tie points (2D default 5000):
                                             # ~2.3x more tie points and a stiffer block, for ~15 s more SfM
     neighbors: int = 10
@@ -50,8 +52,13 @@ class Options3D(Options):
     dense_method: str = "depthmap"
     depth_max_image: int = 1600             # matching image long side (~Pix4D "1/2 image scale")
     depth_neighbors: int = 4
-    depth_min_views: int = 3                # images that must agree on a dense point (Pix4D: min. matches 3)
+    depth_min_views: int = 0                # images that must agree on a dense point; 0 = auto (3, or 2 for low overlap)
+    depth_patchmatch: bool = False          # slanted-plane PatchMatch repair of inconsistent pixels (slow on CPU)
+    dsm_auto_factor: float = 0.75           # auto DSM cell = this x dense point spacing (when dsm_resolution is None)
+    ortho_resolution: Optional[float] = None  # orthophoto cell (m); None = native GSD (Pix4D 1 x GSD)
+    ortho_max_cells: float = 60e6           # orthophoto pixel cap (memory: ~13 bytes/pixel during rendering)
     dem_gapfill_steps: int = 3              # ODM radius steps: point spacing * sqrt(2)^k, k < steps
+    attitude_sigma_deg: float = 2.0         # gimbal pitch/roll prior in the BA (0 = off); fixes block tilt
     ignore_gsd: bool = False                # ODM: never allow a DSM/ortho finer than GSD * (1 - 10%)
     mesh_method: str = "auto"               # "auto": Poisson from the dense cloud (needs open3d), else DSM grid
     # digital terrain model (bare ground)
@@ -154,6 +161,35 @@ def las_scale(spacing: Optional[float]) -> float:
     return min(10 ** round(math.log10(spacing)) / 10, 0.001)
 
 
+def _resample_dsm(dsm, gsd, Wo, Ho, o_gsd, step=0.3, rows=512):
+    """DSM -> finer orthophoto grid (same top-left corner). Bilinear on smooth surfaces; at height
+    steps (> `step` m within the 2x2 neighbourhood) or next to NoData the nearest cell, so roof
+    edges stay sharp instead of becoming ramps."""
+    H, W = dsm.shape
+    out = np.empty((Ho, Wo), np.float32)
+    xs = np.clip((np.arange(Wo) + 0.5) * o_gsd / gsd - 0.5, 0, W - 1)
+    x0 = np.minimum(np.floor(xs).astype(np.int64), W - 2) if W > 1 else np.zeros(Wo, np.int64)
+    fx = (xs - x0).astype(np.float32)
+    xn = np.clip(np.floor((np.arange(Wo) + 0.5) * o_gsd / gsd).astype(np.int64), 0, W - 1)
+    for r0 in range(0, Ho, rows):
+        r1 = min(Ho, r0 + rows)
+        ys = np.clip((np.arange(r0, r1) + 0.5) * o_gsd / gsd - 0.5, 0, H - 1)
+        y0 = np.minimum(np.floor(ys).astype(np.int64), H - 2) if H > 1 else np.zeros(r1 - r0, np.int64)
+        fy = (ys - y0).astype(np.float32)[:, None]
+        yn = np.clip(np.floor((np.arange(r0, r1) + 0.5) * o_gsd / gsd).astype(np.int64), 0, H - 1)
+        a = dsm[y0][:, x0]
+        b = dsm[y0][:, np.minimum(x0 + 1, W - 1)]
+        c = dsm[np.minimum(y0 + 1, H - 1)][:, x0]
+        d = dsm[np.minimum(y0 + 1, H - 1)][:, np.minimum(x0 + 1, W - 1)]
+        bil = (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy
+        stack = np.stack([a, b, c, d])
+        with np.errstate(invalid="ignore"):
+            rough = ~np.isfinite(bil) | ((np.nanmax(stack, 0) - np.nanmin(stack, 0)) > step)
+        near = dsm[yn][:, xn]
+        out[r0:r1] = np.where(rough, near, bil)
+    return out
+
+
 def _load_gcps(ar, opt):
     if not opt.gcp:
         return None
@@ -172,6 +208,7 @@ def sparse_block(images: Union[str, Sequence[str]], opt: Options3D):
     gcps = _load_gcps(ar, opt)
     rec = sfm.reconstruct(ar, gps_sigma=opt.gps_sigma, alt_sigma=opt.alt_sigma,
                           rolling_shutter=opt.rolling_shutter, rolling_shutter_readout=opt.rolling_shutter_readout,
+                          attitude_sigma_deg=opt.attitude_sigma_deg,
                           refine_focal=opt.refine_focal, gcps=gcps, gcp_sigma=opt.gcp_sigma)
     return ar, rec
 
@@ -224,8 +261,13 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         from .densify import DepthOptions, densify, rasterize
         cloud = densify(ar, rec, gains, biases, out_dir,
                         DepthOptions(max_image_dim=opt.depth_max_image, neighbors=opt.depth_neighbors,
-                                     min_views=opt.depth_min_views, workers=ar.workers))
+                                     min_views=opt.depth_min_views, patchmatch=opt.depth_patchmatch,
+                                     workers=ar.workers))
         from .densify import camera_coverage, radius_steps
+        if opt.dsm_resolution is None:
+            # one DSM cell per ~dense point: every cell can be measured instead of interpolated
+            res = cap_resolution(max(al.gsd, opt.dsm_auto_factor * cloud.spacing), al.gsd, opt.ignore_gsd)
+            log.info("DSM resolution (auto): %.3f m from point spacing %.3f m (GSD %.3f m)", res, cloud.spacing, al.gsd)
         minX, maxY, W, H, gsd, _ = mvs.grid_extent(rec, res, al.gsd)
         radii = radius_steps(max(cloud.spacing, gsd), opt.dem_gapfill_steps)
         log.info("Dense cloud -> DSM: %d x %d cells at %.3f m (top-layer median per cell, radius steps %s m)",
@@ -252,18 +294,33 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     ortho_frac = None
     src_id = count = None
     ortho_valid = covered              # cells of the orthomosaic that carry colour (alpha)
+    o_gsd, dsm_o, covered_o = gsd, dsm, covered            # orthophoto grid (same as DSM unless finer)
     if getattr(opt, "true_ortho", True) and not thermal and covered.any():
         from .ortho import true_orthophoto
         t1 = time.time()
-        ortho_rgb, ortho_cov, src_id, count = true_orthophoto(ar, rec, dsm, dense.minX, dense.maxY, gsd,
+        o_gsd = cap_resolution(opt.ortho_resolution or al.gsd, al.gsd, opt.ignore_gsd)
+        Wo = int(math.ceil(dsm.shape[1] * gsd / o_gsd))
+        Ho = int(math.ceil(dsm.shape[0] * gsd / o_gsd))
+        if Wo * Ho > opt.ortho_max_cells:
+            o_gsd = math.sqrt(dsm.shape[0] * dsm.shape[1] * gsd * gsd / opt.ortho_max_cells)
+            Wo = int(math.ceil(dsm.shape[1] * gsd / o_gsd))
+            Ho = int(math.ceil(dsm.shape[0] * gsd / o_gsd))
+        if o_gsd < 0.99 * gsd:
+            dsm_o = _resample_dsm(dsm, gsd, Wo, Ho, o_gsd)
+            covered_o = np.isfinite(dsm_o)
+            log.info("Orthophoto grid %d x %d at %.3f m (DSM %d x %d at %.3f m)", Wo, Ho, o_gsd,
+                     dsm.shape[1], dsm.shape[0], gsd)
+        else:
+            o_gsd = gsd
+        ortho_rgb, ortho_cov, src_id, count = true_orthophoto(ar, rec, dsm_o, dense.minX, dense.maxY, o_gsd,
                                                               gains, biases, opt)
         # Only cells a calibrated photo actually sees are coloured. Cells hidden in every photo
         # stay transparent (NoData): they cannot be recovered, and filling them with the dense
         # matching colours would paint walls/roofs onto the hidden ground.
         colors = ortho_rgb
-        ortho_valid = ortho_cov & covered
+        ortho_valid = ortho_cov & covered_o
         if ortho_cov.any():
-            ortho_frac = float(ortho_cov.sum() / max(covered.sum(), 1))
+            ortho_frac = float(ortho_cov.sum() / max(covered_o.sum(), 1))
             log.info("True orthophoto: %.0f%% of DSM cells coloured only from visible views (%.1fs)",
                      100 * ortho_frac, time.time() - t1)
 
@@ -288,15 +345,16 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                   origin_xy, gsd, 0.0)
     if src_id is not None:
         _write_raster(os.path.join(out_dir, "source_image_id.tif"), src_id.astype(np.float32), "float32",
-                      epsg, origin_xy, gsd, -1.0)
+                      epsg, origin_xy, o_gsd, -1.0)
         _write_raster(os.path.join(out_dir, "coverage_count.tif"), count.astype(np.float32), "float32",
-                      epsg, origin_xy, gsd)
+                      epsg, origin_xy, o_gsd)
     rgba = np.dstack([colors, (ortho_valid * 255).astype(np.uint8)])
     rgba[~ortho_valid, :3] = 0
-    _write_raster(os.path.join(out_dir, "orthophoto.tif"), rgba, "rgba", epsg, origin_xy, gsd)
+    _write_raster(os.path.join(out_dir, "orthophoto.tif"), rgba, "rgba", epsg, origin_xy, o_gsd)
     pf = max(1, math.ceil(max(dsm.shape) / 2048))
     Image.fromarray(_colorize(dsm, covered)[::pf, ::pf]).save(os.path.join(out_dir, "dsm_preview.png"))
-    prev = Image.fromarray(rgba[::pf, ::pf], "RGBA")
+    po = max(1, math.ceil(max(rgba.shape[:2]) / 2048))
+    prev = Image.fromarray(rgba[::po, ::po], "RGBA")
     bg = Image.new("RGB", prev.size, (255, 255, 255))
     bg.paste(prev, mask=prev.split()[3])
     bg.save(os.path.join(out_dir, "orthophoto_preview.jpg"), quality=90)
@@ -340,7 +398,7 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         ys, xs = np.nonzero(conf[::s, ::s])
         ys, xs = ys * s, xs * s
         xyz = np.column_stack([dense.minX + (xs + 0.5) * gsd, dense.maxY - (ys + 0.5) * gsd, dense.Z[ys, xs]])
-        col = colors[ys, xs]
+        col = (colors if colors.shape[:2] == dsm.shape else dense.rgb)[ys, xs]
     cls = None                                       #changed here: ASPRS classes (set with the LAS)
     outputs = {"dsm": "dsm.tif", "orthophoto": "orthophoto.tif", "sparse": "sparse.ply",
                "valid_mask": "valid_mask.tif", "dsm_support": "dsm_support.tif"}
@@ -411,7 +469,8 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         V, F, UV = export.grid_mesh(Zm, vm & np.isfinite(Zm), dense.minX, dense.maxY, gsd * f)
         th = max(1, math.ceil(max(rgba.shape[:2]) / opt.texture_max))
         # 3D-model texture only: cells no photo sees take the dense-matching colour instead of black
-        tex_rgb = np.where(ortho_valid[..., None], colors, dense.rgb)
+        tex_rgb = (np.where(ortho_valid[..., None], colors, dense.rgb) if colors.shape[:2] == dsm.shape
+                   else colors)        # orthophoto on its own (finer) grid: use it directly as texture
         tex = Image.fromarray(np.ascontiguousarray(tex_rgb[::th, ::th]))
         if "obj" in opt.formats:
             export.write_obj(os.path.join(out_dir, "mesh.obj"), V, F, UV, tex, offset3)
@@ -449,10 +508,11 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         ortho=dict(true_ortho=bool(getattr(opt, "true_ortho", True)),
                    occlusion=bool(getattr(opt, "occlusion", True)),
                    view_angle_power=float(getattr(opt, "view_angle_power", 1.5)),
-                   visible_fraction=ortho_frac, hidden_cells_transparent=True, blend=opt.ortho_blend,
+                   visible_fraction=ortho_frac, resolution=float(o_gsd),
+                   width=int(colors.shape[1]), height=int(colors.shape[0]), hidden_cells_transparent=True, blend=opt.ortho_blend,
                    source_weights=list(opt.source_weights),
-                   coverage_median=float(np.median(count[covered])) if count is not None and covered.any() else None,
-                   single_view_fraction=float((count[covered] == 1).mean()) if count is not None and covered.any() else None),
+                   coverage_median=float(np.median(count[covered_o])) if count is not None and covered_o.any() else None,
+                   single_view_fraction=float((count[covered_o] == 1).mean()) if count is not None and covered_o.any() else None),
         source_images=[frames[i].name for i in rec.used],
         color=dict(balancing=bool(getattr(opt, "color_balance", True)),
                    gain_median=[float(np.median([g[0] for g in gains.values()])) if gains else 1.0,

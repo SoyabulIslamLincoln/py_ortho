@@ -166,6 +166,8 @@ class Priors:
     intr_target: np.ndarray         # (G, 3)
     intr_sigma: np.ndarray          # (G, 3)
     X_weight: Optional[np.ndarray] = None   # (P, 3) 1/sigma^2 point-position prior (0 = tie point)
+    axis_target: Optional[np.ndarray] = None  # (N, 3) gimbal optical-axis direction (world), NaN = none
+    axis_weight: float = 0.0                # 1 / sigma_tilt^2 (radians)
     X_target: Optional[np.ndarray] = None   # (P, 3) surveyed coordinate for control points
 
     def point_arrays(self, P):
@@ -174,8 +176,27 @@ class Priors:
         return np.ascontiguousarray(self.X_weight), np.ascontiguousarray(self.X_target)
 
 
-def _apply_priors(S, g, C, intr, pri: Priors, N):
+def _tilt_residual(R, pri: Priors):
+    """Camera-frame rotation (wx, wy) that turns each optical axis onto the gimbal's axis
+    (first order). Yaw (rotation about the optical axis) is left free: compass yaw is poor."""
+    d = R[:, 2, :]                                   # optical axis in world
+    dt = pri.axis_target
+    ok = np.isfinite(dt).all(1)
+    diff = np.where(ok[:, None], dt - d, 0.0)
+    v = np.einsum("nij,nj->ni", R, diff)            # in the camera frame
+    return np.stack([v[:, 1], -v[:, 0]], 1) * ok[:, None]
+
+
+def _apply_priors(S, g, C, intr, pri: Priors, N, R=None):
     cost = 0.0
+    if pri.axis_target is not None and pri.axis_weight > 0 and R is not None:
+        # gimbal attitude prior on the rotation increments (left-multiplied, camera frame)
+        wt = _tilt_residual(R, pri)                  # the increment that would satisfy the prior
+        w = pri.axis_weight
+        idx = (6 * np.arange(N)[:, None] + np.arange(2)[None]).ravel()
+        g[idx] += (-w * wt).ravel()
+        S[idx, idx] += w
+        cost += float(w * np.sum(wt * wt))
     wC = np.where(np.isfinite(pri.C_sigma), 1.0 / np.square(pri.C_sigma), 0.0)
     rC = C - pri.C_target
     idx = (6 * np.arange(N)[:, None] + 3 + np.arange(3)[None]).ravel()
@@ -191,10 +212,12 @@ def _apply_priors(S, g, C, intr, pri: Priors, N):
     return cost
 
 
-def _prior_cost(C, intr, pri: Priors, X=None):
+def _prior_cost(C, intr, pri: Priors, X=None, R=None):
     wC = np.where(np.isfinite(pri.C_sigma), 1.0 / np.square(pri.C_sigma), 0.0)
     wI = np.where(np.isfinite(pri.intr_sigma), 1.0 / np.square(pri.intr_sigma), 0.0)
     cost = float(np.sum(wC * (C - pri.C_target) ** 2) + np.sum(wI * (intr - pri.intr_target) ** 2))
+    if pri.axis_target is not None and pri.axis_weight > 0 and R is not None:
+        cost += float(pri.axis_weight * np.sum(_tilt_residual(R, pri) ** 2))
     if pri.X_weight is not None and X is not None:
         cost += float(np.sum(pri.X_weight * (X - pri.X_target) ** 2))
     return cost
@@ -219,10 +242,10 @@ def bundle_adjust(rec: Reconstruction, pri: Priors, huber: float, max_iter: int 
     pw, pt_tgt = pri.point_arrays(len(X))
     lam = 1e-3
     _, cost0 = _ba.residuals(R, C, X, intr, pp, cg, oc, op, uv, huber)
-    cost = cost0 + _prior_cost(C, intr, pri, X)
+    cost = cost0 + _prior_cost(C, intr, pri, X, R)
     for it in range(max_iter):
         S, g, Vinv, gp, _, _ = _ba.reduced_system(R, C, X, intr, pp, cg, oc, uv, ptr, huber, lam, pw, pt_tgt)
-        _apply_priors(S, g, C, intr, pri, N)
+        _apply_priors(S, g, C, intr, pri, N, R)
         improved = False
         for _ in range(8):
             try:
@@ -236,7 +259,7 @@ def bundle_adjust(rec: Reconstruction, pri: Priors, huber: float, max_iter: int 
             I2 = intr + dc[6 * N:].reshape(-1, 3)
             X2 = X + dp
             _, c2 = _ba.residuals(R2, C2, X2, I2, pp, cg, oc, op, uv, huber)
-            c2 += _prior_cost(C2, I2, pri, X2)
+            c2 += _prior_cost(C2, I2, pri, X2, R2)
             if c2 < cost:
                 R, C, intr, X = R2, C2, I2, np.ascontiguousarray(X2)
                 rel = (cost - c2) / max(cost, 1e-12)
@@ -247,7 +270,7 @@ def bundle_adjust(rec: Reconstruction, pri: Priors, huber: float, max_iter: int 
             # reject: increase damping and rebuild the damped system
             lam *= 10
             S, g, Vinv, gp, _, _ = _ba.reduced_system(R, C, X, intr, pp, cg, oc, uv, ptr, huber, lam, pw, pt_tgt)
-            _apply_priors(S, g, C, intr, pri, N)
+            _apply_priors(S, g, C, intr, pri, N, R)
         if not improved or rel < tol:
             break
     rec.R, rec.C, rec.X = R, C, X
@@ -357,6 +380,7 @@ def gcp_report(rec: Reconstruction, origin3) -> dict:
 def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float = 0.85,
                 min_track: int = 2, refine_focal: Optional[bool] = None,
                 rolling_shutter: bool = False, rolling_shutter_readout: float = 0.0,
+                attitude_sigma_deg: float = 2.0,
                 gcps: Optional[dict] = None, gcp_sigma: float = 0.05) -> Reconstruction:
     """Sparse reconstruction from an AlignResult (see pipeline.align_images).
 
@@ -466,6 +490,22 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
         I_s[k, 1] = 0.3
         I_s[k, 2] = 0.3
     pri = Priors(C_t, C_s, I_t, I_s)
+    # gimbal attitude prior: DJI's stabilised gimbal reports pitch to ~1 deg; without it a nadir
+    # block can drift into a common tilt (cameras and scene tilted together), which tilts the DSM
+    if attitude_sigma_deg and attitude_sigma_deg > 0:
+        axes = np.full((N, 3), np.nan)
+        for k, i in enumerate(used):
+            p = frames[i].gimbal_pitch
+            if p is None:
+                continue
+            yaw = frames[i].gimbal_yaw if getattr(frames[i], "gimbal_yaw", None) is not None else 0.0
+            pr, yr = math.radians(p), math.radians(yaw)
+            axes[k] = (math.cos(pr) * math.sin(yr), math.cos(pr) * math.cos(yr), math.sin(pr))
+        if np.isfinite(axes).all(1).sum() >= 0.5 * N:
+            pri.axis_target = axes
+            pri.axis_weight = 1.0 / math.radians(attitude_sigma_deg) ** 2
+            log.info("Gimbal attitude prior on %d cameras (sigma %.1f deg)", int(np.isfinite(axes).all(1).sum()),
+                     attitude_sigma_deg)
 
     # ---- 5. robust BA rounds with outlier rejection
     px = 1.0 / work                           # one feature-detection pixel in full-res pixels

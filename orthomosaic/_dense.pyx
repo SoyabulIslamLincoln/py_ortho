@@ -400,3 +400,312 @@ def near(const unsigned char[:, ::1] mask, int k):
                 if x < W - 1 and d[y, x + 1] + 1 < d[y, x]:
                     d[y, x] = d[y, x + 1] + 1
     return d_a <= k
+
+
+# ---------------------------------------------------------------- PatchMatch repair
+from libc.stdlib cimport malloc as _malloc, free as _free
+
+cdef struct PMCtx:
+    const float* ref
+    int H
+    int W
+    const float* ray
+    double cr0
+    double cr1
+    double cr2
+    int S
+    float** img
+    float** dep
+    int* iw
+    int* ih
+    double* par
+    int r
+    int step
+    int top_k
+    double geo_w
+    double geo_tol
+
+
+cdef inline int _proj(const double* p, double X, double Y, double Z, double* u, double* v, double* z) nogil:
+    """par layout: R(9) C(3) f k1 k2 cx cy."""
+    cdef double dx = X - p[9], dy = Y - p[10], dz = Z - p[11]
+    cdef double xc = p[0] * dx + p[1] * dy + p[2] * dz
+    cdef double yc = p[3] * dx + p[4] * dy + p[5] * dz
+    cdef double zc = p[6] * dx + p[7] * dy + p[8] * dz
+    cdef double nx, ny, r2, dd
+    if zc <= 1e-6:
+        return 0
+    nx = xc / zc
+    ny = yc / zc
+    r2 = nx * nx + ny * ny
+    dd = p[12] * (1 + p[13] * r2 + p[14] * r2 * r2)
+    u[0] = dd * nx + p[15]
+    v[0] = dd * ny + p[16]
+    z[0] = zc
+    return 1
+
+
+cdef inline double _bil(const float* im, int w, int h, double u, double v) nogil:
+    cdef int x0, y0
+    cdef double fx, fy
+    if u < 0 or v < 0 or u > w - 1.001 or v > h - 1.001:
+        return NAN
+    x0 = <int>u
+    y0 = <int>v
+    fx = u - x0
+    fy = v - y0
+    return ((im[y0 * w + x0] * (1 - fx) + im[y0 * w + x0 + 1] * fx) * (1 - fy)
+            + (im[(y0 + 1) * w + x0] * (1 - fx) + im[(y0 + 1) * w + x0 + 1] * fx) * fy)
+
+
+cdef double _pm_cost(PMCtx* c, int y, int x, double d, const double* n, double* ncc_out) nogil:
+    """1 - mean(top_k NCC over a slanted window) + geo_w * geometric disagreement."""
+    cdef int H = c.H, W = c.W, HW = c.H * c.W, idx = y * c.W + x, s, a, b, q, yy, xx, nsamp = 0, kk
+    cdef double rpx = c.ray[idx], rpy = c.ray[HW + idx], rpz = c.ray[2 * HW + idx]
+    cdef double ndr = n[0] * rpx + n[1] * rpy + n[2] * rpz, num, den, t, X, Y, Z, u, v, z, I, J
+    cdef double sI[16]
+    cdef double sJ[16]
+    cdef double sII[16]
+    cdef double sJJ[16]
+    cdef double sIJ[16]
+    cdef int cnt[16]
+    cdef double ncc[16]
+    cdef double tmp, vi, vj, cv, photo, geo, e, dj
+    cdef int ui, vv, ng
+    if ndr >= -1e-6 or d <= 0:
+        return 10.0
+    num = d * ndr
+    for s in range(c.S):
+        sI[s] = 0; sJ[s] = 0; sII[s] = 0; sJJ[s] = 0; sIJ[s] = 0; cnt[s] = 0
+    a = -c.r
+    while a <= c.r:
+        yy = y + a
+        a += c.step
+        if yy < 0 or yy >= H:
+            continue
+        b = -c.r
+        while b <= c.r:
+            xx = x + b
+            b += c.step
+            if xx < 0 or xx >= W:
+                continue
+            q = yy * W + xx
+            I = c.ref[q]
+            if not isfinite(I):
+                continue
+            den = n[0] * c.ray[q] + n[1] * c.ray[HW + q] + n[2] * c.ray[2 * HW + q]
+            if den >= -1e-9:
+                continue
+            t = num / den
+            X = c.cr0 + t * c.ray[q]
+            Y = c.cr1 + t * c.ray[HW + q]
+            Z = c.cr2 + t * c.ray[2 * HW + q]
+            nsamp += 1
+            for s in range(c.S):
+                if _proj(c.par + 17 * s, X, Y, Z, &u, &v, &z):
+                    J = _bil(c.img[s], c.iw[s], c.ih[s], u, v)
+                    if isfinite(J):
+                        sI[s] += I; sJ[s] += J; sII[s] += I * I; sJJ[s] += J * J; sIJ[s] += I * J; cnt[s] += 1
+    for s in range(c.S):
+        if nsamp < 4 or cnt[s] < 0.7 * nsamp:
+            ncc[s] = -1
+            continue
+        vi = sII[s] / cnt[s] - (sI[s] / cnt[s]) ** 2
+        vj = sJJ[s] / cnt[s] - (sJ[s] / cnt[s]) ** 2
+        cv = sIJ[s] / cnt[s] - (sI[s] / cnt[s]) * (sJ[s] / cnt[s])
+        if vi < 1e-8 or vj < 1e-8:
+            ncc[s] = 0
+        else:
+            ncc[s] = cv / sqrt(vi * vj)
+    for a in range(1, c.S):                       # descending sort (S <= 16)
+        tmp = ncc[a]
+        b = a - 1
+        while b >= 0 and ncc[b] < tmp:
+            ncc[b + 1] = ncc[b]
+            b -= 1
+        ncc[b + 1] = tmp
+    kk = c.top_k if c.top_k < c.S else c.S
+    photo = 0
+    for a in range(kk):
+        photo += ncc[a]
+    photo /= kk
+    ncc_out[0] = photo
+    geo = 0
+    if c.geo_w > 0:
+        X = c.cr0 + d * rpx
+        Y = c.cr1 + d * rpy
+        Z = c.cr2 + d * rpz
+        ng = 0
+        for s in range(c.S):
+            if c.dep[s] == NULL:
+                continue
+            ng += 1
+            e = 1.0
+            if _proj(c.par + 17 * s, X, Y, Z, &u, &v, &z):
+                ui = <int>(u + 0.5)
+                vv = <int>(v + 0.5)
+                if ui >= 0 and vv >= 0 and ui < c.iw[s] and vv < c.ih[s]:
+                    dj = c.dep[s][vv * c.iw[s] + ui]
+                    if isfinite(dj) and dj > 0:
+                        e = fabs(z - dj) / dj / c.geo_tol
+                        if e > 1:
+                            e = 1
+            geo += e
+        if ng:
+            geo /= ng
+    return (1 - photo) + c.geo_w * geo
+
+
+cdef inline double _rnd(unsigned int* st) nogil:
+    st[0] ^= st[0] << 13
+    st[0] ^= st[0] >> 17
+    st[0] ^= st[0] << 5
+    return (st[0] & 0xFFFFFF) / 16777216.0
+
+
+def pm_refine(const float[:, ::1] ref, const float[:, :, ::1] ray, const double[::1] Cr, list srcs, list src_depths,
+              const double[:, ::1] par, float[:, ::1] depth, float[:, :, ::1] normal, float[:, ::1] score,
+              const unsigned char[:, ::1] active, int r, int step, int top_k, double geo_w, double geo_tol,
+              int iters, double dmin, double dmax, unsigned int seed):
+    """PatchMatch repair of a depth map (COLMAP/OpenMVS-style, CPU): only `active` pixels are
+    re-estimated; all pixels serve as propagation seeds. depth/normal/score are updated in place
+    (normal: world frame, facing the camera; score: photometric top-k NCC of the kept plane).
+    Returns the number of pixels whose hypothesis changed."""
+    cdef int H = ref.shape[0], W = ref.shape[1], S = len(srcs), s, y, x, it, colour, k, yn, xn, tr
+    cdef PMCtx c
+    cdef const float[:, ::1] mv
+    cdef double n[3]
+    cdef double nb[3]
+    cdef double best, cst, ncc, dn, dp, ndr, sc, nn
+    cdef double dd_scale, nn_scale
+    cdef unsigned int st
+    cdef int changed = 0, HW = H * W, idx, nidx
+    cdef int offy[8]
+    cdef int offx[8]
+    offy[0] = -1; offx[0] = 0; offy[1] = 1; offx[1] = 0; offy[2] = 0; offx[2] = -1; offy[3] = 0; offx[3] = 1
+    offy[4] = -5; offx[4] = 0; offy[5] = 5; offx[5] = 0; offy[6] = 0; offx[6] = -5; offy[7] = 0; offx[7] = 5
+    if S == 0 or S > 16:
+        return 0
+    c.ref = &ref[0, 0]; c.H = H; c.W = W; c.ray = &ray[0, 0, 0]
+    c.cr0 = Cr[0]; c.cr1 = Cr[1]; c.cr2 = Cr[2]; c.S = S
+    c.img = <float **>_malloc(S * sizeof(float *))
+    c.dep = <float **>_malloc(S * sizeof(float *))
+    c.iw = <int *>_malloc(S * sizeof(int))
+    c.ih = <int *>_malloc(S * sizeof(int))
+    for s in range(S):
+        mv = srcs[s]
+        c.img[s] = <float *>&mv[0, 0]
+        c.ih[s] = mv.shape[0]
+        c.iw[s] = mv.shape[1]
+        if src_depths[s] is None:
+            c.dep[s] = NULL
+        else:
+            mv = src_depths[s]
+            c.dep[s] = <float *>&mv[0, 0]
+    c.par = &par[0, 0]; c.r = r; c.step = step; c.top_k = top_k; c.geo_w = geo_w; c.geo_tol = geo_tol
+    st = seed | 1
+    with nogil:
+        for it in range(iters):
+            dd_scale = 0.05 / (it + 1)
+            nn_scale = 0.3 / (it + 1)
+            for colour in range(2):
+                for y in range(H):
+                    for x in range(W):
+                        if not active[y, x] or (x + y) % 2 != colour:
+                            continue
+                        idx = y * W + x
+                        n[0] = normal[0, y, x]; n[1] = normal[1, y, x]; n[2] = normal[2, y, x]
+                        if isfinite(depth[y, x]):
+                            best = _pm_cost(&c, y, x, depth[y, x], n, &ncc)
+                            sc = ncc
+                        else:
+                            best = 1e9
+                            sc = -1
+                        # propagation: neighbours' planes extended to this pixel
+                        for k in range(8):
+                            yn = y + offy[k]
+                            xn = x + offx[k]
+                            if yn < 0 or xn < 0 or yn >= H or xn >= W or not isfinite(depth[yn, xn]):
+                                continue
+                            nidx = yn * W + xn
+                            nb[0] = normal[0, yn, xn]; nb[1] = normal[1, yn, xn]; nb[2] = normal[2, yn, xn]
+                            dn = nb[0] * c.ray[nidx] + nb[1] * c.ray[HW + nidx] + nb[2] * c.ray[2 * HW + nidx]
+                            ndr = nb[0] * c.ray[idx] + nb[1] * c.ray[HW + idx] + nb[2] * c.ray[2 * HW + idx]
+                            if ndr >= -1e-6:
+                                continue
+                            dp = depth[yn, xn] * dn / ndr
+                            if dp < dmin or dp > dmax:
+                                continue
+                            cst = _pm_cost(&c, y, x, dp, nb, &ncc)
+                            if cst < best:
+                                best = cst
+                                sc = ncc
+                                depth[y, x] = <float>dp
+                                normal[0, y, x] = <float>nb[0]; normal[1, y, x] = <float>nb[1]; normal[2, y, x] = <float>nb[2]
+                                changed += 1
+                        # random refinement of depth and tilt
+                        if isfinite(depth[y, x]):
+                            for tr in range(2):
+                                dp = depth[y, x] * (1 + dd_scale * (2 * _rnd(&st) - 1))
+                                nb[0] = normal[0, y, x] + nn_scale * (2 * _rnd(&st) - 1)
+                                nb[1] = normal[1, y, x] + nn_scale * (2 * _rnd(&st) - 1)
+                                nb[2] = normal[2, y, x] + nn_scale * (2 * _rnd(&st) - 1)
+                                nn = sqrt(nb[0] * nb[0] + nb[1] * nb[1] + nb[2] * nb[2])
+                                if nn < 1e-9 or dp < dmin or dp > dmax:
+                                    continue
+                                nb[0] /= nn; nb[1] /= nn; nb[2] /= nn
+                                cst = _pm_cost(&c, y, x, dp, nb, &ncc)
+                                if cst < best:
+                                    best = cst
+                                    sc = ncc
+                                    depth[y, x] = <float>dp
+                                    normal[0, y, x] = <float>nb[0]; normal[1, y, x] = <float>nb[1]; normal[2, y, x] = <float>nb[2]
+                                    changed += 1
+                        score[y, x] = <float>sc
+    _free(c.img); _free(c.dep); _free(c.iw); _free(c.ih)
+    return changed
+
+
+# ---------------------------------------------------------------- orthophoto sampling (8-bit images)
+def sample_view_u8(const unsigned char[:, :, ::1] img, const double[:, ::1] R, const double[::1] C,
+                   double f, double k1, double k2, double cx, double cy,
+                   double X0, double Y0, double gsd, const float[:, ::1] Z,
+                   float[:, :, ::1] out, unsigned char[:, ::1] valid):
+    """_mvs.sample_view for uint8 images (4x less cache memory than float32): grid cell (r, c) is
+    the ground point (X0 + (c+.5) gsd, Y0 - (r+.5) gsd, Z[r, c]); writes the bilinear sample of
+    `img` (h, w, ch) to out[r, c] (0-255 floats) and 1/0 to valid[r, c]."""
+    cdef Py_ssize_t H = Z.shape[0], W = Z.shape[1], h = img.shape[0], w = img.shape[1]
+    cdef Py_ssize_t nch = img.shape[2], r, c, ch, x0, y0, x1, y1
+    cdef double X, Y, dx, dy, dz, xc, yc, zc, nx, ny, r2, d, u, v, fx, fy
+    with nogil:
+        for r in range(H):
+            Y = Y0 - (r + 0.5) * gsd
+            for c in range(W):
+                X = X0 + (c + 0.5) * gsd
+                dx = X - C[0]
+                dy = Y - C[1]
+                dz = Z[r, c] - C[2]
+                zc = R[2, 0] * dx + R[2, 1] * dy + R[2, 2] * dz
+                valid[r, c] = 0
+                if zc <= 1e-6:
+                    continue
+                xc = R[0, 0] * dx + R[0, 1] * dy + R[0, 2] * dz
+                yc = R[1, 0] * dx + R[1, 1] * dy + R[1, 2] * dz
+                nx = xc / zc
+                ny = yc / zc
+                r2 = nx * nx + ny * ny
+                d = 1.0 + k1 * r2 + k2 * r2 * r2
+                u = f * d * nx + cx
+                v = f * d * ny + cy
+                if u < 0 or v < 0 or u > w - 1 or v > h - 1:
+                    continue
+                x0 = <Py_ssize_t>u
+                y0 = <Py_ssize_t>v
+                x1 = x0 + 1 if x0 + 1 < w else x0
+                y1 = y0 + 1 if y0 + 1 < h else y0
+                fx = u - x0
+                fy = v - y0
+                for ch in range(nch):
+                    out[r, c, ch] = <float>((1 - fy) * ((1 - fx) * img[y0, x0, ch] + fx * img[y0, x1, ch])
+                                            + fy * ((1 - fx) * img[y1, x0, ch] + fx * img[y1, x1, ch]))
+                valid[r, c] = 1
