@@ -134,6 +134,83 @@ def _seam_labels(cost, cols, smooth, iters):
     return lab
 
 
+def _global_sources(rec, dsm, minX, maxY, gsd, use_occ, occ_steps, occ_tol, zmax, workers,
+                    cell_m=0.25, K=6, lam=0.25, iters=12):
+    """One source photo per ~`cell_m` region for the whole mosaic (ODM/Pix4D select views
+    globally, not per tile, so neighbouring tiles never disagree).
+
+    Every camera is scored on a coarse grid of DSM points: near-vertical rays first (tall objects
+    lean least, so seams between photos do not cut them), then distance to the image border.
+    Points the camera cannot see (line of sight over the DSM) cost +10, so they are used only when
+    no camera sees them. Each cell keeps its K best cameras; Potts smoothing over the whole grid
+    (energy cost + lam * #differing 4-neighbours, a few sweeps) turns them into large coherent
+    regions. Returns (labels (gh, gw) int32 index into rec.used, -1 = none; step in cells)."""
+    H, W = dsm.shape
+    s = max(1, int(round(cell_m / gsd)))
+    ys = np.minimum(np.arange(-(-H // s)) * s + s // 2, H - 1)
+    xs = np.minimum(np.arange(-(-W // s)) * s + s // 2, W - 1)
+    gh, gw = len(ys), len(xs)
+    Zg = dsm[ys][:, xs]
+    ok = np.isfinite(Zg)
+    gy, gx = np.nonzero(ok)
+    P = np.column_stack([minX + (xs[gx] + 0.5) * gsd, maxY - (ys[gy] + 0.5) * gsd, Zg[gy, gx]]).astype(np.float64)
+    n = len(P)
+    labs = np.full((gh, gw), -1, np.int32)
+    if n == 0:
+        return labs, s
+    dsm_c = np.ascontiguousarray(dsm, np.float32)
+
+    def score_cam(k):
+        it = rec.intr[rec.cam_group[k]]
+        xc = (P - rec.C[k]) @ rec.R[k].T
+        z = xc[:, 2]
+        front = z > 1e-6
+        nrm = xc[:, :2] / np.where(front, z, 1.0)[:, None]
+        r2 = (nrm * nrm).sum(1)
+        uv = (it.f * (1 + it.k1 * r2 + it.k2 * r2 * r2))[:, None] * nrm + (it.cx, it.cy)
+        bu = np.minimum(uv[:, 0], it.width - 1 - uv[:, 0]) / (0.5 * it.width)
+        bv = np.minimum(uv[:, 1], it.height - 1 - uv[:, 1]) / (0.5 * it.height)
+        border = np.minimum(bu, bv)
+        idx = np.flatnonzero(front & (border > 0.01))
+        if idx.size == 0:
+            return k, idx, None
+        ray = rec.C[k] - P[idx]
+        vert = ray[:, 2] / np.linalg.norm(ray, axis=1)          # cos of the ray's angle to vertical
+        cost = (1.0 - vert ** 4) + 0.3 * (1.0 - np.clip(border[idx] / 0.3, 0, 1))
+        if use_occ:
+            vis = _visibility(dsm_c, minX, maxY, gsd, rec.C[k], P[idx, 0], P[idx, 1], P[idx, 2],
+                              occ_steps, occ_tol, zmax)
+            cost = np.where(vis, cost, cost + 10.0)
+        return k, idx, cost.astype(np.float32)
+
+    best_c = np.full((K, n), np.inf, np.float32)
+    best_l = np.full((K, n), -1, np.int32)
+    with ThreadPoolExecutor(max(1, workers)) as ex:
+        for k, idx, cost in ex.map(score_cam, range(len(rec.used))):
+            if cost is None:
+                continue
+            c = np.concatenate([best_c[:, idx], cost[None]])
+            l = np.concatenate([best_l[:, idx], np.full((1, idx.size), k, np.int32)])
+            o = np.argsort(c, 0)[:K]
+            best_c[:, idx] = np.take_along_axis(c, o, 0)
+            best_l[:, idx] = np.take_along_axis(l, o, 0)
+    C = np.full((K, gh, gw), np.inf, np.float32)
+    Lb = np.full((K, gh, gw), -1, np.int32)
+    C[:, gy, gx] = best_c
+    Lb[:, gy, gx] = best_l
+    lab = Lb[0].copy()
+    for _ in range(iters):
+        pad = np.pad(lab, 1, constant_values=-2)
+        nb = np.stack([pad[:-2, 1:-1], pad[2:, 1:-1], pad[1:-1, :-2], pad[1:-1, 2:]])
+        same = (Lb[:, None] == nb[None]).sum(1)
+        E = np.where(Lb >= 0, C + lam * (4 - same), np.inf)
+        new = np.take_along_axis(Lb, np.argmin(E, 0)[None], 0)[0]
+        if (new == lab).all():
+            break
+        lab = new
+    return lab.astype(np.int32), s
+
+
 class _Defaults:
     #changed here: fallback option object so true_orthophoto works without an Options3D.
     ortho_tile = 256
@@ -146,8 +223,7 @@ class _Defaults:
     cache_mb = 1024
     workers = 0
     ortho_blend = "seam"
-    ortho_views = 8          # views per tile, chosen from different sides (see process)
-    ortho_scan_views = 80    # nearest cameras examined per tile
+    ortho_views = 8          # max photos per tile (taken from the global source map)
     fill_hidden = True       # colour cells hidden in every chosen view from the best view anyway
     source_weights = (1.0, 0.5, 0.7, 0.3)   # angle, resolution, border, exposure
     seam_smoothness = 0.6
@@ -255,7 +331,6 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
     occ_stride = max(1, int(g("occlusion_stride")))
     blend = str(g("ortho_blend"))
     n_views = int(g("ortho_views"))
-    scan_views = int(g("ortho_scan_views"))
     fill_hidden = bool(g("fill_hidden"))
     w_ang, w_res, w_bord, w_exp = (float(x) for x in g("source_weights"))
     smooth = float(g("seam_smoothness"))
@@ -280,7 +355,13 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
         n[n[..., 2] < np.cos(np.radians(30))] = (0.0, 0.0, 1.0)
         return n[y0 - a0:y0 - a0 + (y1 - y0), x0 - b0:x0 - b0 + (x1 - x0)]
 
-    cam_xy = rec.C[:, :2]
+    # global source map: which photo colours which region of the whole mosaic
+    t_g = time.time()
+    workers = int(g("workers")) or getattr(ar, "workers", 1)
+    glab, gstep = _global_sources(rec, dsm_c, minX, maxY, gsd, use_occ, occ_steps, occ_tol, zmax, workers)
+    gl = glab[glab >= 0]
+    log.info("True orthophoto: global source selection, %d photos over %d grid cells of %.2f m (%.1fs)",
+             len(np.unique(gl)), gl.size, gstep * gsd, time.time() - t_g)
     SRC = np.full((H, W), -1, np.int32)                       # index into rec.used, -1 = none
     CNT = np.zeros((H, W), np.uint8)                          # number of visible, valid views
 
@@ -297,47 +378,15 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
         Y0 = maxY - py0 * gsd
         Ztile = np.where(sub, dsm[py0:py1, px0:px1], zfill).astype(np.float32)
 
-        # candidate views: those that see the tile (at least its centre over the height range),
-        # nearest first (spatial restriction: never every image for every cell). Per-cell `valid`
-        # from the sampler masks the parts a view misses.
-        zz = Ztile[sub]
-        zlo, zhi = float(zz.min()), float(zz.max())
-        cxw = X0 + pw * gsd / 2.0
-        cyw = Y0 - ph * gsd / 2.0
-        corners = np.array([[X0, Y0], [X0 + pw * gsd, Y0], [X0, Y0 - ph * gsd], [X0 + pw * gsd, Y0 - ph * gsd],
-                            [cxw, cyw]])
-        pts = np.concatenate([np.column_stack([corners, np.full(len(corners), z)]) for z in (zlo, zhi)])
-        centre = np.array([[cxw, cyw, 0.5 * (zlo + zhi)]])
-        dist = np.hypot(cam_xy[:, 0] - cxw, cam_xy[:, 1] - cyw)
-        seeing = []
-        for k in np.argsort(dist)[:scan_views]:
-            it = rec.intr[rec.cam_group[k]]
-            xc = (pts - rec.C[k]) @ rec.R[k].T
-            u = it.f * xc[:, 0] / np.maximum(xc[:, 2], 1e-6) + it.cx
-            v = it.f * xc[:, 1] / np.maximum(xc[:, 2], 1e-6) + it.cy
-            inside = (xc[:, 2] > 0) & (u >= 0) & (u <= it.width - 1) & (v >= 0) & (v <= it.height - 1)
-            cc = (centre - rec.C[k]) @ rec.R[k].T
-            cu = it.f * cc[0, 0] / max(cc[0, 2], 1e-6) + it.cx
-            cv = it.f * cc[0, 1] / max(cc[0, 2], 1e-6) + it.cy
-            sees_centre = cc[0, 2] > 0 and 0 <= cu <= it.width - 1 and 0 <= cv <= it.height - 1
-            if sees_centre or inside.mean() >= 0.5:
-                seeing.append(int(k))
-        if not seeing:
+        # candidate views: the photos the global source map assigns to this tile (and its context
+        # margin), most frequent first; tiles therefore agree with their neighbours
+        ys_g = np.arange(py0, py1) // gstep
+        xs_g = np.arange(px0, px1) // gstep
+        g_tile = glab[ys_g][:, xs_g]
+        lv, lc = np.unique(g_tile[(g_tile >= 0) & sub], return_counts=True)
+        if lv.size == 0:
             return None
-        # Views from *different sides*: the most nadir (nearest) first, then repeatedly the camera
-        # farthest from those already chosen. Dense flights take neighbouring photos ~2 m apart, so
-        # the n nearest are one viewpoint: next to a tall wall they can all be occluded while the
-        # ground is seen from the other side of the block.
-        cand = [seeing[0]]
-        if len(seeing) > 1:
-            P = cam_xy[seeing]
-            dmin = np.hypot(*(P - P[0]).T)
-            while len(cand) < min(n_views, len(seeing)):
-                j = int(np.argmax(dmin))
-                if dmin[j] <= 0:
-                    break
-                cand.append(seeing[j])
-                dmin = np.minimum(dmin, np.hypot(*(P - P[j]).T))
+        cand = [int(k) for k in lv[np.argsort(-lc)][:max(n_views, 1)]]
         views = [cache.get(k) for k in cand]
 
         rr, cc = np.nonzero(sub)
@@ -403,7 +452,11 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
                 usable = score >= 0
 
         if blend == "seam":
-            cost = np.where(usable, 1.0 - score / wsum_w, 1e3).astype(np.float32)
+            # follow the global map: a source is preferred where the map assigns it, blurred over
+            # one region so that, near a region border, the colour-aware seam step decides where
+            # exactly to cut (around cars and roof units, through flat areas)
+            pref = np.stack([_box(g_tile == k, gstep) for k in cand])
+            cost = np.where(usable, 1.0 - score / wsum_w + 0.6 * (1.0 - pref), 1e3).astype(np.float32)
             lab = _seam_labels(cost, cols, smooth, s_iters)
             has = usable.any(0)
             # feather only inside a band around the seams; elsewhere one source per cell
@@ -443,7 +496,6 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
         row = tiles[r:r + tw_n]
         ordered.extend(row if (r // tw_n) % 2 == 0 else row[::-1])
 
-    workers = int(g("workers")) or getattr(ar, "workers", 1)
     log.info("True orthophoto: rendering %d tiles", len(ordered))
     t0 = time.time()
     done = 0

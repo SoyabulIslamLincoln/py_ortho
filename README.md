@@ -214,7 +214,7 @@ Resolution is never finer than GSD − 10 % (`ignore_gsd=True` to override).
 | `dsm_max_fill` | `--dsm-max-fill` | −1 | Hole fill distance (m); −1 = everywhere photographed by ≥ 2 cameras |
 | `dem_gapfill_steps` | `--dem-gapfill-steps` | 3 | Radius steps for filling cells from nearby points |
 | `ortho_blend` | `--ortho-blend` | `seam` | `seam` (no ghosting) or `feather` |
-| `ortho_views` | — | 8 | Photos per tile, chosen from different sides |
+| `ortho_views` | — | 8 | Max photos per tile, taken from a global nadir-first source map (no tile seams) |
 | `fill_hidden` | — | True | Colour fully occluded cells from the best photo |
 | `occlusion` | `--no-occlusion` | True | Occlusion test in the orthophoto |
 | `color_balance` | `--no-color-balance` | True | Per-image gain + offset |
