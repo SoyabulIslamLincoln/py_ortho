@@ -274,6 +274,10 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         # holes may only be filled where >= 2 calibrated photos actually see the ground
         dense = rasterize(cloud, minX, maxY, W, H, gsd, radii=radii,
                           covered=camera_coverage(rec, minX, maxY, W, H, gsd, min_views=2))
+        # products cover the reconstructed area only (ODM crops to the point cloud's hull)
+        from .densify import cloud_footprint
+        dense.covered &= cloud_footprint(dense.score >= 1, gsd)
+        log.info("Reconstructed footprint: %.0f%% of the photographed grid", 100 * dense.covered.mean())
     else:
         dopt = mvs.DenseOptions(gsd=res, max_views=opt.max_views, min_score=opt.min_score,
                                 window=opt.ncc_window, tile=opt.tile, cache_mb=opt.cache_mb, workers=ar.workers,

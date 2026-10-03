@@ -645,6 +645,44 @@ def camera_coverage(rec, minX: float, maxY: float, W: int, H: int, gsd: float, m
     return camera_count(rec, minX, maxY, W, H, gsd, step) >= min_views
 
 
+def cloud_footprint(measured: np.ndarray, gsd: float, block_m: float = 0.5) -> np.ndarray:
+    """(H, W) bool: area actually reconstructed (ODM crops its DEM and orthophoto to the point
+    cloud's convex hull). Blocks of ~`block_m` holding measured cells are kept when most of their
+    3x3 neighbourhood is reconstructed too (stray points at the edge do not inflate the hull);
+    the result is their convex hull, rasterised (numpy only)."""
+    H, W = measured.shape
+    b = max(1, int(round(block_m / gsd)))
+    h, w = -(-H // b), -(-W // b)
+    P = np.zeros((h * b, w * b), np.float32)
+    P[:H, :W] = measured
+    occ = P.reshape(h, b, w, b).mean((1, 3)) > 0.05
+    pad = np.pad(occ, 1)
+    nb = sum(pad[1 + dy:h + 1 + dy, 1 + dx:w + 1 + dx] for dy in (-1, 0, 1) for dx in (-1, 0, 1))
+    occ &= nb >= 5
+    ys, xs = np.nonzero(occ)
+    if len(xs) < 3:
+        return np.ones((H, W), bool)
+    # convex hull of the block corners (Andrew's monotone chain)
+    pts = np.unique(np.concatenate([np.stack([xs + dx, ys + dy], 1) for dx in (0, 1) for dy in (0, 1)]), axis=0)
+
+    def half(points):
+        out = []
+        for p in points:
+            while len(out) >= 2 and ((out[-1][0] - out[-2][0]) * (p[1] - out[-2][1])
+                                     - (out[-1][1] - out[-2][1]) * (p[0] - out[-2][0])) <= 0:
+                out.pop()
+            out.append(p)
+        return out
+    pl = [tuple(p) for p in pts.tolist()]
+    hull = np.array(half(pl)[:-1] + half(pl[::-1])[:-1], np.float64)
+    # inside test on the coarse grid: left of every counter-clockwise hull edge
+    gy, gx = np.mgrid[0:h, 0:w] + 0.5
+    inside = np.ones((h, w), bool)
+    for (x0, y0), (x1, y1) in zip(hull, np.roll(hull, -1, 0)):
+        inside &= (x1 - x0) * (gy - y0) - (y1 - y0) * (gx - x0) >= -1e-9
+    return np.repeat(np.repeat(inside, b, 0), b, 1)[:H, :W]
+
+
 def radius_steps(spacing: float, steps: int = 3, multiplier: float = 1.0) -> list:
     """ODM's DEM search radii: point spacing * multiplier, growing by sqrt(2) per step."""
     r = [spacing * multiplier]

@@ -511,31 +511,6 @@ def _near(mask: np.ndarray, cells: int) -> np.ndarray:
     return out
 
 
-def fill_holes_lower(Z: np.ndarray, f: int = 4) -> np.ndarray:
-    """Fill NaN holes by growing the *lower* median of measured neighbours inwards (never an
-    average across a height step, so a hole between a roof and the ground takes the ground
-    height instead of an invented ramp). Grown at 1/f resolution (block medians), then the
-    coarse values fill the full-resolution holes."""
-    import warnings
-    from . import _dense
-    H, W = Z.shape
-    h, w = -(-H // f), -(-W // f)
-    P = np.full((h * f, w * f), np.nan, np.float32)
-    P[:H, :W] = Z
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        C = np.nanmedian(P.reshape(h, f, w, f).transpose(0, 2, 1, 3).reshape(h, w, f * f), axis=2).astype(np.float32)
-    if not np.isfinite(C).any():
-        return Z.copy()
-    rgb = np.zeros((h, w, 3), np.uint8)
-    sc = np.zeros((h, w), np.float32)
-    while True:
-        if _dense.fill_lower_median(C.copy(), rgb.copy(), C, rgb, sc, 1.0, 1) == 0:
-            break
-    up = np.repeat(np.repeat(C, f, 0), f, 1)[:H, :W]
-    return np.where(np.isfinite(Z), Z, up).astype(np.float32)
-
-
 def _bilateral_parallel(z, vmask, radius, sigma_z, sigma_s, rows=256):
     """_mvs.bilateral on overlapping row bands in parallel (the kernel releases the GIL); each band
     carries `radius` extra rows on both sides, so the result equals the single-call result."""
@@ -576,9 +551,9 @@ def postprocess(d: DenseResult, min_score: float, max_dev: float = 1.0,
         spikes = np.isfinite(Zc) & (np.abs(Zc - med) > thr)
         conf &= ~spikes
         Zc[spikes] = np.nan
-    # depth-map DSMs: holes are mostly ground hidden/shadowed beside objects -> fill from the lower
-    # surface; the sweep DSM keeps its smooth push-pull fill
-    filled = fill_holes_lower(Zc) if d.stepped is not None else fill_holes(Zc)
+    # holes left after the radius steps: smooth interpolation, as ODM's gdal_fillnodata pass
+    # (the lower-median grower turned large gaps into flat polygon patches and streaks)
+    filled = fill_holes(Zc)
     # heights already filled from nearby points (densify radius steps, 0 < score < min_score)
     # are better than the push-pull estimate: keep them where they are not spikes
     stepped = (np.zeros(d.Z.shape, bool) if d.stepped is None else d.stepped & np.isfinite(d.Z))
