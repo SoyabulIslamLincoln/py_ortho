@@ -647,23 +647,25 @@ def camera_coverage(rec, minX: float, maxY: float, W: int, H: int, gsd: float, m
 
 def cloud_footprint(measured: np.ndarray, gsd: float, block_m: float = 0.5) -> np.ndarray:
     """(H, W) bool: area actually reconstructed (ODM crops its DEM and orthophoto to the point
-    cloud's convex hull). Blocks of ~`block_m` holding measured cells are kept when most of their
-    3x3 neighbourhood is reconstructed too (stray points at the edge do not inflate the hull);
-    the result is their convex hull, rasterised (numpy only)."""
+    cloud's convex hull). Blocks of ~`block_m` count when at least half of their cells are measured
+    and most of their 3x3 neighbourhood is too, so the thin, poorly seen fringe at the flight edge
+    (single oblique views, smeared colours) is left out. The convex hull of those blocks is
+    rasterised at full resolution, so the border is a straight line, not a staircase (numpy only)."""
     H, W = measured.shape
     b = max(1, int(round(block_m / gsd)))
     h, w = -(-H // b), -(-W // b)
     P = np.zeros((h * b, w * b), np.float32)
     P[:H, :W] = measured
-    occ = P.reshape(h, b, w, b).mean((1, 3)) > 0.05
+    occ = P.reshape(h, b, w, b).mean((1, 3)) >= 0.5
     pad = np.pad(occ, 1)
     nb = sum(pad[1 + dy:h + 1 + dy, 1 + dx:w + 1 + dx] for dy in (-1, 0, 1) for dx in (-1, 0, 1))
-    occ &= nb >= 5
+    occ &= nb >= 6
     ys, xs = np.nonzero(occ)
     if len(xs) < 3:
         return np.ones((H, W), bool)
-    # convex hull of the block corners (Andrew's monotone chain)
-    pts = np.unique(np.concatenate([np.stack([xs + dx, ys + dy], 1) for dx in (0, 1) for dy in (0, 1)]), axis=0)
+    # convex hull of the block corners, in full-resolution cell units (Andrew's monotone chain)
+    pts = np.unique(np.concatenate([np.stack([(xs + dx) * b, (ys + dy) * b], 1)
+                                    for dx in (0, 1) for dy in (0, 1)]), axis=0)
 
     def half(points):
         out = []
@@ -675,12 +677,20 @@ def cloud_footprint(measured: np.ndarray, gsd: float, block_m: float = 0.5) -> n
         return out
     pl = [tuple(p) for p in pts.tolist()]
     hull = np.array(half(pl)[:-1] + half(pl[::-1])[:-1], np.float64)
-    # inside test on the coarse grid: left of every counter-clockwise hull edge
-    gy, gx = np.mgrid[0:h, 0:w] + 0.5
-    inside = np.ones((h, w), bool)
+    # scanline fill: for a convex polygon every row is one span [left, right]
+    yc = np.arange(H) + 0.5
+    left = np.full(H, np.inf)
+    right = np.full(H, -np.inf)
     for (x0, y0), (x1, y1) in zip(hull, np.roll(hull, -1, 0)):
-        inside &= (x1 - x0) * (gy - y0) - (y1 - y0) * (gx - x0) >= -1e-9
-    return np.repeat(np.repeat(inside, b, 0), b, 1)[:H, :W]
+        if y0 == y1:
+            continue
+        lo, hi = min(y0, y1), max(y0, y1)
+        r = (yc >= lo) & (yc <= hi)
+        x = x0 + (yc[r] - y0) * (x1 - x0) / (y1 - y0)
+        left[r] = np.minimum(left[r], x)
+        right[r] = np.maximum(right[r], x)
+    xc = np.arange(W) + 0.5
+    return (xc[None, :] >= left[:, None]) & (xc[None, :] <= right[:, None])
 
 
 def radius_steps(spacing: float, steps: int = 3, multiplier: float = 1.0) -> list:

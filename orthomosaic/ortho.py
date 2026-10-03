@@ -238,8 +238,8 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
             rv, vv = backend.sample_view(v.rgb, v.cam(0), X0, Y0, gsd, Ztile)
             return backend.to_numpy(rv), backend.to_numpy(vv)
         R, C, f, k1, k2, cx, cy = v.cam(0)
-        out = np.empty(Ztile.shape + (4,), np.float32)
-        val = np.empty(Ztile.shape, np.uint8)
+        out = np.zeros(Ztile.shape + (4,), np.float32)     # cells a photo misses stay 0, never garbage
+        val = np.zeros(Ztile.shape, np.uint8)
         _dense.sample_view_u8(v.rgb, np.ascontiguousarray(R, np.float64), np.ascontiguousarray(C, np.float64),
                               float(f), float(k1), float(k2), float(cx), float(cy), float(X0), float(Y0), float(gsd),
                               np.ascontiguousarray(Ztile, np.float32), out, val)
@@ -353,6 +353,7 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
         inv_depth = np.zeros((L, rr.size), np.float32)
         for j, (k, v) in enumerate(zip(cand, views)):
             rgbw, vv = sample(v, X0, Y0, Ztile)
+            rgbw = np.nan_to_num(rgbw, nan=0.0, posinf=0.0, neginf=0.0)
             valid = (vv[rr, cc] > 0) & (rgbw[rr, cc, 3] > 0)
             C = rec.C[k].astype(np.float64)
             ray = np.column_stack([C[0] - wx, C[1] - wy, C[2] - wz])

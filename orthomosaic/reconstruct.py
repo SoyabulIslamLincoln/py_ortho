@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import time
+import warnings
 from dataclasses import asdict, dataclass, field
 from typing import Optional, Sequence, Union
 
@@ -182,7 +183,8 @@ def _resample_dsm(dsm, gsd, Wo, Ho, o_gsd, step=0.3, rows=512):
         d = dsm[np.minimum(y0 + 1, H - 1)][:, np.minimum(x0 + 1, W - 1)]
         bil = (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy
         stack = np.stack([a, b, c, d])
-        with np.errstate(invalid="ignore"):
+        with np.errstate(invalid="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)          # all-NaN corners at the edge
             rough = ~np.isfinite(bil) | ((np.nanmax(stack, 0) - np.nanmin(stack, 0)) > step)
         near = dsm[yn][:, xn]
         out[r0:r1] = np.where(rough, near, bil)
@@ -274,9 +276,10 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         # holes may only be filled where >= 2 calibrated photos actually see the ground
         dense = rasterize(cloud, minX, maxY, W, H, gsd, radii=radii,
                           covered=camera_coverage(rec, minX, maxY, W, H, gsd, min_views=2))
-        # products cover the reconstructed area only (ODM crops to the point cloud's hull)
+        # products cover the reconstructed area only (ODM crops to the point cloud's hull); the
+        # hull has straight edges, so the DSM and ortho borders are clean lines
         from .densify import cloud_footprint
-        dense.covered &= cloud_footprint(dense.score >= 1, gsd)
+        dense.covered = cloud_footprint(dense.score >= 1, gsd)
         log.info("Reconstructed footprint: %.0f%% of the photographed grid", 100 * dense.covered.mean())
     else:
         dopt = mvs.DenseOptions(gsd=res, max_views=opt.max_views, min_score=opt.min_score,
@@ -287,6 +290,14 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     max_fill = -1 if opt.dsm_max_fill < 0 else int(math.ceil(opt.dsm_max_fill / gsd))
     dsm, conf, support = mvs.postprocess(dense, opt.min_score, smooth_range=opt.dsm_smooth,
                                          smooth_iters=opt.dsm_smooth_iters, max_fill_cells=max_fill)
+    if cloud is not None:
+        # ODM median-smooths its DEM (radius 4 cells at 5 cm, i.e. ~0.2 m wide): removes the
+        # isolated 10-30 cm spikes that otherwise print as dots in the orthophoto, while a median
+        # keeps building edges sharp. Radius from the cell size, not a fixed number of cells.
+        r = max(1, int(round(0.1 / gsd)))
+        valid = np.isfinite(dsm)
+        dsm = np.where(valid, mvs._nanmedian_filter(dsm, r), np.nan).astype(np.float32)
+        log.info("DSM median smoothing: %d-cell radius (%.2f m)", r, r * gsd)
     covered = np.isfinite(dsm)
     origin_xy = (dense.minX + ox, dense.maxY + oy)
 
