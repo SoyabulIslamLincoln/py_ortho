@@ -30,9 +30,8 @@ NODATA = -9999.0
 class Options3D(Options):
     feature_max_dim: int = 4096             # detect tie-point features at full resolution (Pix4D "full" keypoint scale):
                                             # half resolution tilted a low-altitude block by ~2 deg in tests
-    n_features: int = 12000                 # features per image for the tie points (2D default 5000):
-                                            # ~2.3x more tie points and a stiffer block, for ~15 s more SfM
-    neighbors: int = 10
+    n_features: int = 0                     # 0 = auto, ~1250 per megapixel (15k on 12 MP; 2D default 5000)
+    neighbors: int = 0                      # 0 = auto: images overlapping >= ~50%, 6..12 per image
     alt_sigma: float = 0.5                  # DJI relative-altitude accuracy (m)
     refine_focal: Optional[bool] = None     # None: refine when an altitude reference exists
     dsm_resolution: Optional[float] = None  # metres per DSM cell; default = native GSD  #changed here
@@ -341,6 +340,17 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     # chosen source image (index into report["source_images"]) and number of seeing views
     _write_raster(os.path.join(out_dir, "valid_mask.tif"), covered.astype(np.float32), "float32", epsg,
                   origin_xy, gsd)
+    # Pix4D overlap map: number of calibrated images that photograph each DSM point
+    from .densify import camera_count
+    overlap = camera_count(rec, dense.minX, dense.maxY, dsm.shape[1], dsm.shape[0], gsd,
+                           step=max(1, int(round(0.5 / gsd))), Z=dsm)
+    _write_raster(os.path.join(out_dir, "overlap.tif"), np.where(covered, overlap, 0).astype(np.float32),
+                  "float32", epsg, origin_xy, gsd)
+    ov_stats = (dict(median=float(np.median(overlap[covered])), fraction_5plus=float((overlap[covered] >= 5).mean()),
+                     fraction_3plus=float((overlap[covered] >= 3).mean())) if covered.any() else None)
+    if ov_stats:
+        log.info("Overlap: median %.0f images per point, %.0f%% of the area seen by 5+ images",
+                 ov_stats["median"], 100 * ov_stats["fraction_5plus"])
     _write_raster(os.path.join(out_dir, "dsm_support.tif"), support.astype(np.float32), "float32", epsg,
                   origin_xy, gsd, 0.0)
     if src_id is not None:
@@ -401,7 +411,7 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         col = (colors if colors.shape[:2] == dsm.shape else dense.rgb)[ys, xs]
     cls = None                                       #changed here: ASPRS classes (set with the LAS)
     outputs = {"dsm": "dsm.tif", "orthophoto": "orthophoto.tif", "sparse": "sparse.ply",
-               "valid_mask": "valid_mask.tif", "dsm_support": "dsm_support.tif"}
+               "valid_mask": "valid_mask.tif", "dsm_support": "dsm_support.tif", "overlap": "overlap.tif"}
     if src_id is not None:
         outputs.update(source_image_id="source_image_id.tif", coverage_count="coverage_count.tif")
     if dtm is not None:
@@ -486,6 +496,7 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         backend=ar.backend.name, georeferenced=georef, epsg=epsg, origin=[ox, oy],
         z_datum=rec.stats.get("z_datum"), z_to_absolute_offset=z_abs_offset,
         sfm=rec.stats,
+        overlap=ov_stats,
         dense=dict(method="depth maps -> fused 3D cloud -> DSM" if cloud is not None else "ground-grid height sweep",
                    points=int(len(cloud.xyz)) if cloud is not None else None,
                    median_views=int(np.median(cloud.views)) if cloud is not None else None,

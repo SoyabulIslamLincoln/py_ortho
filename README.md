@@ -143,6 +143,7 @@ All rasters share one north-up grid (same origin, cell size and CRS = UTM of the
 | `valid_mask.tif` | DSM validity |
 | `source_image_id.tif` | Photo used per cell (index into `report["source_images"]`) |
 | `coverage_count.tif` | Photos that *see* each cell (0 = hidden in all, coloured by fallback) |
+| `overlap.tif` | Pix4D overlap: calibrated photos whose frame contains each DSM point |
 | `dense.laz` / `dense.ply` | Dense 3D point cloud (ASPRS classes ground / building / vegetation) |
 | `mesh.obj`, `mesh.glb` | Poisson mesh from the dense cloud (vertex colours) |
 | `contours.geojson` | Terrain contours (`--contours`) |
@@ -159,8 +160,11 @@ offset to absolute altitude.
 1. **Metadata** — EXIF/XMP: GPS, focal length, DJI gimbal/flight speed/shutter type. Optional
    masks: `<image>_mask.png` next to an image, or AI sky/background masks; masked pixels are
    ignored everywhere.
-2. **Aerial triangulation** — ORB-style features at full image resolution (12 000 per image),
-   GPS-neighbour matching, plane + parallax verification, multi-view tracks, Levenberg–Marquardt
+2. **Aerial triangulation** — ORB-style features at full image resolution (automatic count,
+   ~1 250 per megapixel), matching against the images that overlap ≥ ~50% (automatic, 6–12 per
+   image), plane + parallax verification, multi-view tracks (a match that would put two features
+   of one photo in one track is refused instead of discarding the track), guided track extension
+   (each tie point is looked up in every other photo that sees it), Levenberg–Marquardt
    bundle adjustment (Schur complement, Huber loss) with GPS / barometric-altitude / GCP priors,
    a **gimbal attitude prior** (DJI pitch/roll, σ 2°) that stops a nadir block from drifting into
    a common tilt, and lens self-calibration. Optional rolling-shutter correction.
@@ -203,6 +207,8 @@ Resolution is never finer than GSD − 10 % (`ignore_gsd=True` to override).
 | `depth_min_views` | `--depth-min-views` | 0 (auto) | Photos that must agree on a point (auto: 3, or 2 at low overlap) |
 | `depth_patchmatch` | — | False | Slanted-plane PatchMatch repair (slow on CPU) |
 | `attitude_sigma_deg` | — | 2.0 | Gimbal pitch/roll prior in the bundle adjustment (0 = off) |
+| `n_features` | `--features` | 0 (auto) | Keypoints per image; auto ≈ 1 250 per megapixel (15 000 on 12 MP) |
+| `neighbors` | `--neighbors` | 0 (auto) | Matching partners per image; auto = photos overlapping ≥ ~50%, 6–12 |
 | `ortho_resolution` | — | native GSD | Orthophoto cell (m); its grid is separate from the DSM's |
 | `ortho_max_cells` | — | 60 M | Orthophoto pixel cap (memory) |
 | `dsm_max_fill` | `--dsm-max-fill` | −1 | Hole fill distance (m); −1 = everywhere photographed by ≥ 2 cameras |

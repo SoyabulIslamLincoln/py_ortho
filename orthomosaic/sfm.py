@@ -45,6 +45,7 @@ class Reconstruction:
     pt_prior_w: Optional[np.ndarray] = None   # (P, 3) point-position prior weight (GCPs > 0)
     pt_prior_t: Optional[np.ndarray] = None   # (P, 3) surveyed target for control points
     gcp_names: Optional[list] = None          # name per GCP point (in point order), else None
+    obs_feat: Optional[np.ndarray] = None     # (M,) feature index per observation (-1 = GCP mark)
 
     def intr_array(self):
         return np.array([[it.f, it.k1, it.k2] for it in self.intr], np.float64)
@@ -98,13 +99,27 @@ def _build_tracks(n_feats, pair_results, min_len=2):
             parent[x], x = root, parent[x]
         return root
 
-    for (i, j), (a, b) in pair_results:
+    # consistency-aware union (as COLMAP): a merge that would put two features of one image into
+    # one track is refused instead of letting it poison (and later discard) the whole track; the
+    # plain union lost ~40% of all verified matches on a dense 216-image block
+    members = {}                                      # root -> set of images in its track
+    for (i, j), (a, b) in sorted(pair_results, key=lambda r: -len(r[1][0])):   # strongest pairs first
         na = offs[i] + a
         nb = offs[j] + b
         for u, v in zip(na.tolist(), nb.tolist()):
             ru, rv = find(u), find(v)
-            if ru != rv:
-                parent[ru] = rv
+            if ru == rv:
+                continue
+            su = members.get(ru) or {i}
+            sv = members.get(rv) or {j}
+            if not su.isdisjoint(sv):
+                continue
+            if len(su) < len(sv):
+                ru, rv, su, sv = rv, ru, sv, su
+            parent[rv] = ru
+            su |= sv
+            members[ru] = su
+            members.pop(rv, None)
     nodes = np.unique(np.concatenate([np.concatenate([offs[i] + a, offs[j] + b])
                                       for (i, j), (a, b) in pair_results]))
     roots = np.array([find(int(u)) for u in nodes], np.int64)
@@ -288,6 +303,7 @@ def _keep_observations(rec: Reconstruction, keep_obs: np.ndarray, min_views: int
     if rec.pt_prior_w is not None:
         keep_obs |= is_gcp[rec.obs_pt]                       # never drop a control-point mark
     oc, op, uv = rec.obs_cam[keep_obs], rec.obs_pt[keep_obs], rec.obs_uv[keep_obs]
+    of = rec.obs_feat[keep_obs] if rec.obs_feat is not None else None
     counts = np.bincount(op, minlength=len(rec.X))
     good_pt = counts >= min_views
     if rec.pt_prior_w is not None:
@@ -298,11 +314,91 @@ def _keep_observations(rec: Reconstruction, keep_obs: np.ndarray, min_views: int
     op = remap[op].astype(np.int32)
     order = np.argsort(op, kind="stable")
     rec.obs_cam, rec.obs_pt, rec.obs_uv = oc[order].astype(np.int32), op[order], uv[order]
+    if of is not None:
+        rec.obs_feat = of[m][order]
     rec.X = rec.X[good_pt]
     rec.color = rec.color[good_pt]
     if rec.pt_prior_w is not None:
         rec.pt_prior_w = rec.pt_prior_w[good_pt]
         rec.pt_prior_t = rec.pt_prior_t[good_pt]
+
+
+_POPCOUNT = np.array([bin(v).count("1") for v in range(256)], np.uint8)
+
+
+def _extend_tracks(rec: Reconstruction, feats, radius: float, max_track: int = 8, max_ham: int = 24):
+    """Guided track extension (as Pix4D/OpenSfM do when they grow tracks): project every point
+    into each image that sees it but has no observation of it, and adopt the nearest unused
+    keypoint within `radius` px with the best descriptor (Lowe ratio against the runner-up). The
+    radius is generous on purpose: a tight gate only admits observations that already agree with
+    the current lens model and biases the distortion estimate (doming). Pairwise matching only links each image
+    to its ~12 nearest neighbours, so a point seen by 40 images otherwise gets a 2-3 view track.
+    Tracks are capped at `max_track` views (bundle-adjustment cost grows with track length^2)."""
+    from scipy.spatial import cKDTree
+    P, N = len(rec.X), len(rec.used)
+    if P == 0 or rec.obs_feat is None:
+        return 0
+    first = np.searchsorted(rec.obs_pt, np.arange(P))
+    f0 = rec.obs_feat[first]
+    cam0 = rec.obs_cam[first]
+    pdesc = np.zeros((P, feats[rec.used[0]].desc.shape[1]), np.uint8)
+    for k, i in enumerate(rec.used):
+        sel = (cam0 == k) & (f0 >= 0)
+        pdesc[sel] = feats[i].desc[f0[sel]]
+    room = max_track - np.bincount(rec.obs_pt, minlength=P)
+    room[f0 < 0] = 0                                       # never extend control points
+    observed = np.zeros(N * P, bool)
+    observed[rec.obs_cam.astype(np.int64) * P + rec.obs_pt] = True
+    cand_pt, cand_cam, cand_feat, cand_ham = [], [], [], []
+    for k, i in enumerate(rec.used):
+        it = rec.intr[rec.cam_group[k]]
+        idx = np.flatnonzero((room > 0) & ~observed[k * P:(k + 1) * P])
+        if len(idx) == 0 or len(feats[i]) == 0:
+            continue
+        Xc = (rec.X[idx] - rec.C[k]) @ rec.R[k].T
+        front = Xc[:, 2] > 0
+        idx = idx[front]
+        n = Xc[front, :2] / Xc[front, 2:3]
+        r2 = np.sum(n * n, 1)
+        uv = (it.f * (1 + it.k1 * r2 + it.k2 * r2 * r2))[:, None] * n + (it.cx, it.cy)
+        inb = (uv[:, 0] >= 0) & (uv[:, 0] < it.width) & (uv[:, 1] >= 0) & (uv[:, 1] < it.height)
+        idx, uv = idx[inb], uv[inb]
+        if len(idx) == 0:
+            continue
+        nkp = len(feats[i])
+        d, nn = cKDTree(feats[i].xy).query(uv, k=4, distance_upper_bound=radius)
+        taken = np.zeros(nkp + 1, bool)                    # index nkp = "no neighbour"
+        taken[rec.obs_feat[(rec.obs_cam == k) & (rec.obs_feat >= 0)]] = True
+        valid = np.isfinite(d) & ~taken[nn]
+        ham = np.full(nn.shape, 999, np.int32)
+        ham[valid] = _POPCOUNT[feats[i].desc[nn[valid]] ^ pdesc[np.broadcast_to(idx[:, None], nn.shape)[valid]]
+                               ].sum(1, dtype=np.int32)
+        o = np.argsort(ham, 1)
+        best = np.take_along_axis(ham, o[:, :1], 1)[:, 0]
+        second = np.take_along_axis(ham, o[:, 1:2], 1)[:, 0]
+        good = (best <= max_ham) & (best < 0.8 * second)
+        idx, nn, ham = idx[good], np.take_along_axis(nn, o[:, :1], 1)[good, 0], best[good]
+        o = np.lexsort((ham, nn))                          # one point per keypoint: best descriptor
+        first_kp = np.r_[True, np.diff(nn[o]) != 0]
+        o = o[first_kp]
+        cand_pt.append(idx[o]); cand_cam.append(np.full(len(o), k, np.int32))
+        cand_feat.append(nn[o]); cand_ham.append(ham[o])
+    if not cand_pt:
+        return 0
+    pt, cam, ft, ham = (np.concatenate(a) for a in (cand_pt, cand_cam, cand_feat, cand_ham))
+    o = np.lexsort((ham, pt))                              # per point keep the best `room` views
+    pt, cam, ft = pt[o], cam[o], ft[o]
+    start = np.searchsorted(pt, pt)
+    keep = (np.arange(len(pt)) - start) < room[pt]
+    pt, cam, ft = pt[keep], cam[keep], ft[keep]
+    uv = np.concatenate([feats[rec.used[k]].xy[f][None] for k, f in zip(cam.tolist(), ft.tolist())]) \
+        if len(pt) else np.zeros((0, 2))
+    rec.obs_cam = np.concatenate([rec.obs_cam, cam]).astype(np.int32)
+    rec.obs_pt = np.concatenate([rec.obs_pt, pt.astype(np.int32)])
+    rec.obs_uv = np.concatenate([rec.obs_uv, uv])
+    rec.obs_feat = np.concatenate([rec.obs_feat, ft.astype(rec.obs_feat.dtype)])
+    _keep_observations(rec, np.ones(len(rec.obs_pt), bool))     # re-sort by point
+    return int(len(pt))
 
 
 # --------------------------------------------------------------------------
@@ -341,6 +437,8 @@ def _add_gcps(rec: Reconstruction, frames, used, gcps: dict, gcp_sigma: float):
     rec.obs_uv = np.vstack([rec.obs_uv, np.array(add_uv, np.float64)])
     order = np.argsort(rec.obs_pt, kind="stable")     # keep observations sorted by point
     rec.obs_cam, rec.obs_pt, rec.obs_uv = rec.obs_cam[order], rec.obs_pt[order], rec.obs_uv[order]
+    if rec.obs_feat is not None:
+        rec.obs_feat = np.concatenate([rec.obs_feat, np.full(len(add_cam), -1, rec.obs_feat.dtype)])[order]
     rec.pt_prior_w = np.vstack([np.zeros((P, 3)), np.array(pw_extra)])
     rec.pt_prior_t = np.vstack([np.zeros((P, 3)), np.array(pt_extra)])
     rec.gcp_names = names
@@ -380,7 +478,7 @@ def gcp_report(rec: Reconstruction, origin3) -> dict:
 def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float = 0.85,
                 min_track: int = 2, refine_focal: Optional[bool] = None,
                 rolling_shutter: bool = False, rolling_shutter_readout: float = 0.0,
-                attitude_sigma_deg: float = 2.0,
+                attitude_sigma_deg: float = 2.0, max_track: int = 8,
                 gcps: Optional[dict] = None, gcp_sigma: float = 0.05) -> Reconstruction:
     """Sparse reconstruction from an AlignResult (see pipeline.align_images).
 
@@ -432,6 +530,7 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
     obs_cam = np.concatenate([np.array([local[i] for i in ti], np.int32) for ti, _ in tracks])
     obs_pt = np.concatenate([np.full(len(ti), k, np.int32) for k, (ti, _) in enumerate(tracks)])
     obs_uv = np.concatenate([np.stack([feats[i].xy[f] for i, f in zip(ti, tf)]) for ti, tf in tracks])
+    obs_feat = np.concatenate([np.asarray(tf, np.int64) for _, tf in tracks])
     obs_col = np.concatenate([np.stack([feats[i].color[f] for i, f in zip(ti, tf)]) for ti, tf in tracks])
     P = len(tracks)
     color = np.zeros((P, 3))
@@ -441,7 +540,7 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
              P, len(obs_pt), len(obs_pt) / max(P, 1), time.time() - t)
 
     rec = Reconstruction(used, R, C, intr, cam_group, np.zeros((P, 3)), color,
-                         obs_cam, obs_pt, obs_uv)
+                         obs_cam, obs_pt, obs_uv, obs_feat=obs_feat)
 
     # ---- 3. triangulate + coarse filtering (initial poses ignore tilt, so be generous)
     X, ang = triangulate(R, C, rec.intr_array(), rec.pp_array(), cam_group, obs_cam, obs_pt, obs_uv, P)
@@ -521,6 +620,15 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
             # position (OpenSfM/ODM rolling-shutter correction), later rounds refine on them
             from .rollingshutter import correct_observations
             rs_stats = correct_observations(rec, ar.frames, rolling_shutter_readout)
+        if rnd == 0 and max_track > 2:
+            # poses are now good to ~1 px: grow tracks into every image that sees each point;
+            # the search radius follows the achieved reprojection error (no manual tuning)
+            t = time.time()
+            rad = float(np.clip(6.0 * 1.4826 * np.median(err[keep]), 4.0 * px, 12.0 * px))
+            n_obs = len(rec.obs_pt)
+            added = _extend_tracks(rec, feats, rad, max_track)
+            log.info("  track extension: +%d observations (radius %.1f px), mean track %.2f -> %.2f (%.1fs)",
+                     added, rad, n_obs / len(rec.X), len(rec.obs_pt) / len(rec.X), time.time() - t)
 
     err = bundle_adjust(rec, pri, 2 * px)
     rec.rms_px = float(np.sqrt(np.mean(np.square(err))))
@@ -528,7 +636,12 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
                      rms_px=rec.rms_px, focal_px=[it.f for it in rec.intr],
                      k1=[it.k1 for it in rec.intr], k2=[it.k2 for it in rec.intr],
                      z_datum="take-off (DJI relative altitude)" if has_rel_alt else "mean ground",
-                     mean_track_length=float(len(rec.obs_pt) / max(len(rec.X), 1)))
+                     mean_track_length=float(len(rec.obs_pt) / max(len(rec.X), 1)),
+                     # Pix4D quality-report quantities
+                     reproj_mean_px=float(np.mean(err)) if len(err) else 0.0,
+                     images=len(frames), calibrated=N,
+                     keypoints_median=int(np.median([len(feats[i]) for i in used])),
+                     tie_points_per_image_median=int(np.median(np.bincount(rec.obs_cam, minlength=N))))
     if rolling_shutter:
         rec.stats["rolling_shutter"] = rs_stats
     if gcps:

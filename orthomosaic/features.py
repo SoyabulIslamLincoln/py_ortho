@@ -95,7 +95,10 @@ def extract(frame: Frame, max_dim: int = 2000, n_features: int = 5000, levels: i
         smooth = _core.gaussian_blur(img, 2.0)
         desc_all.append(_core.brief_describe(smooth, xs, ys, ang, PATTERN))
         sx, sy = w0 / lw, h0 / lh
-        xy_all.append(np.stack([(xs + 0.5) * sx - 0.5, (ys + 0.5) * sy - 0.5], 1))
+        # sub-pixel keypoint positions (descriptors stay on the integer grid): lowers the
+        # reprojection error of the tie points and sharpens the bundle adjustment
+        rx, ry = _core.harris_subpix(img, xs, ys)
+        xy_all.append(np.stack([(rx + 0.5) * sx - 0.5, (ry + 0.5) * sy - 0.5], 1))
 
     if not xy_all:
         return Features(np.zeros((0, 2)), np.zeros((0, 32), np.uint8), np.zeros((0, 3), np.float32)), s

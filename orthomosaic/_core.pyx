@@ -226,6 +226,45 @@ def detect_corners(const float[:, ::1] img, float threshold, int border):
     return xs_np, ys_np, sc_np
 
 
+def harris_subpix(const float[:, ::1] img, const float[::1] xs, const float[::1] ys):
+    """Sub-pixel keypoints from the detector response itself (as SIFT does for its DoG peak):
+    a parabola through the Harris score at the 3x3 neighbourhood, per axis, shift limited to
+    half a pixel. Consistent across views because every view refines the same response peak."""
+    cdef Py_ssize_t n = xs.shape[0], k, h = img.shape[0], w = img.shape[1], x, y
+    cdef double hl, hc, hr, hu, hd, den, dx, dy
+    ox_np = np.empty(n, np.float32)
+    oy_np = np.empty(n, np.float32)
+    cdef float[::1] ox = ox_np, oy = oy_np
+    with nogil:
+        for k in range(n):
+            x = <Py_ssize_t>(xs[k] + 0.5)
+            y = <Py_ssize_t>(ys[k] + 0.5)
+            ox[k] = xs[k]
+            oy[k] = ys[k]
+            if x < 5 or y < 5 or x >= w - 5 or y >= h - 5:
+                continue
+            hc = _harris(img, y, x)
+            hl = _harris(img, y, x - 1)
+            hr = _harris(img, y, x + 1)
+            hu = _harris(img, y - 1, x)
+            hd = _harris(img, y + 1, x)
+            den = hl - 2 * hc + hr
+            dx = 0.5 * (hl - hr) / den if den < 0 else 0
+            den = hu - 2 * hc + hd
+            dy = 0.5 * (hu - hd) / den if den < 0 else 0
+            if dx > 0.5:
+                dx = 0.5
+            elif dx < -0.5:
+                dx = -0.5
+            if dy > 0.5:
+                dy = 0.5
+            elif dy < -0.5:
+                dy = -0.5
+            ox[k] = <float>(x + dx)
+            oy[k] = <float>(y + dy)
+    return ox_np, oy_np
+
+
 # --------------------------------------------------------------------------
 # ORB: orientation by intensity centroid + steered BRIEF
 # --------------------------------------------------------------------------

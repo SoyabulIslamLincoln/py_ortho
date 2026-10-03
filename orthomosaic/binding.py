@@ -136,6 +136,7 @@ def bind_thermal(rec_rgb, frames_rgb, rec_thermal, frames_thermal, refine: bool 
     rec.obs_uv = np.ascontiguousarray(rec_thermal.obs_uv[obs_keep])
     order = np.argsort(rec.obs_pt, kind="stable")
     rec.obs_cam, rec.obs_pt, rec.obs_uv = rec.obs_cam[order], rec.obs_pt[order], rec.obs_uv[order]
+    rec.obs_feat = None
     # re-triangulate points with the bound poses so the sparse cloud matches the new geometry
     from .sfm import triangulate
     if len(rec.obs_pt):

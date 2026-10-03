@@ -616,15 +616,19 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
 
 
 # ------------------------------------------------------------------ DSM from the cloud
-def camera_coverage(rec, minX: float, maxY: float, W: int, H: int, gsd: float, min_views: int = 2,
-                    step: int = 16) -> np.ndarray:
-    """(H, W) bool: cells photographed by at least `min_views` calibrated cameras (cell centres at
-    the typical ground height projected inside the image), on a coarse grid of `step` cells."""
+def camera_count(rec, minX: float, maxY: float, W: int, H: int, gsd: float, step: int = 16,
+                 Z: Optional[np.ndarray] = None) -> np.ndarray:
+    """(H, W) int: number of calibrated cameras whose frame contains each cell (Pix4D's overlap
+    definition, not occlusion-aware), evaluated on a coarse grid of `step` cells. Cells sit at the
+    height `Z` (H, W) where given and finite, else at the typical ground height."""
     zg = float(np.percentile(rec.X[:, 2], 20)) if len(rec.X) else 0.0
     hs, ws = (H + step - 1) // step, (W + step - 1) // step
     yy, xx = np.mgrid[0:hs, 0:ws]
-    P = np.stack([minX + (xx.ravel() * step + step / 2) * gsd, maxY - (yy.ravel() * step + step / 2) * gsd,
-                  np.full(xx.size, zg)], 1)
+    z = np.full(xx.size, zg)
+    if Z is not None:
+        zc = Z[np.minimum(yy.ravel() * step + step // 2, H - 1), np.minimum(xx.ravel() * step + step // 2, W - 1)]
+        z = np.where(np.isfinite(zc), zc, zg)
+    P = np.stack([minX + (xx.ravel() * step + step / 2) * gsd, maxY - (yy.ravel() * step + step / 2) * gsd, z], 1)
     count = np.zeros(xx.size, np.int32)
     for k in range(len(rec.used)):
         it = rec.intr[rec.cam_group[k]]
@@ -632,8 +636,13 @@ def camera_coverage(rec, minX: float, maxY: float, W: int, H: int, gsd: float, m
         xc = (P - cam.C) @ cam.R.T
         u, v = cam.project_cam(xc[:, 0], xc[:, 1], xc[:, 2])
         count += (xc[:, 2] > 0) & (u >= 0) & (v >= 0) & (u <= it.width - 1) & (v <= it.height - 1)
-    m = (count >= min_views).reshape(hs, ws)
-    return np.repeat(np.repeat(m, step, 0), step, 1)[:H, :W]
+    return np.repeat(np.repeat(count.reshape(hs, ws), step, 0), step, 1)[:H, :W]
+
+
+def camera_coverage(rec, minX: float, maxY: float, W: int, H: int, gsd: float, min_views: int = 2,
+                    step: int = 16) -> np.ndarray:
+    """(H, W) bool: cells photographed by at least `min_views` calibrated cameras."""
+    return camera_count(rec, minX, maxY, W, H, gsd, step) >= min_views
 
 
 def radius_steps(spacing: float, steps: int = 3, multiplier: float = 1.0) -> list:

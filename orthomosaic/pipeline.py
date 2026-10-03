@@ -27,13 +27,13 @@ class Options:
     workers: int = 0                   # 0 -> os.cpu_count()
     # features / matching
     feature_max_dim: int = 2000        # detect features on images downscaled to this
-    n_features: int = 5000
+    n_features: int = 5000             # 0 = auto from the image size (Pix4D "automatic" keypoints)
     # ODM-style masks and rolling shutter (see masks.py / rollingshutter.py)
     sky_removal: bool = False          # AI sky masks for non-nadir images (needs onnxruntime)
     bg_removal: bool = False           # AI background masks (U^2-Net, needs onnxruntime)
     rolling_shutter: bool = False      # correct electronic-shutter distortion in the bundle adjustment
     rolling_shutter_readout: float = 0.0   # ms; 0 = ODM readout database / 30 ms default
-    neighbors: int = 8                 # candidate pairs per image (GPS kNN)
+    neighbors: int = 8                 # candidate pairs per image (GPS kNN); 0 = auto from the overlap
     ratio: float = 0.8
     min_inliers: int = 25
     # alignment
@@ -86,6 +86,32 @@ class AlignResult:
     workers: int
     dropped: list
     thermal_range: Optional[tuple] = None   # raw-value range when mosaicking radiometric thermal
+
+
+def _auto_features(frames, max_dim: int) -> int:
+    """~1250 keypoints per megapixel actually searched (15k on a 12 MP frame), 4k..20k."""
+    w, h = np.median([f.width for f in frames]), np.median([f.height for f in frames])
+    s = min(1.0, max_dim / max(w, h))
+    return int(np.clip(round(w * h * s * s / 1e6 * 1.25) * 1000, 4000, 20000))
+
+
+def _auto_neighbors(frames, positions, lo: int = 6, hi: int = 12) -> int:
+    """Pair each image with the images whose ground footprint overlaps it by >= ~50% (camera
+    centres closer than half the footprint's short side, from height and focal length), bounded
+    to [lo, hi]. More than ~12 pairs per image adds conflicting matches that break tracks
+    (fewer tie points on a 216-image test block at 16 than at 12) and costs matching time."""
+    from .camera import focal_from_exif
+    if positions is None:
+        return 10
+    ok = [k for k, f in enumerate(frames)
+          if f.rel_alt is not None and f.rel_alt > 2 and np.all(np.isfinite(positions[k]))]
+    if len(ok) < 3:
+        return 10
+    short = np.array([frames[k].rel_alt * min(frames[k].width, frames[k].height) / focal_from_exif(frames[k])[0]
+                      for k in ok])
+    P = positions[ok]
+    cnt = [int((np.linalg.norm(P - P[a], axis=1) < 0.5 * short[a]).sum()) - 1 for a in range(len(ok))]
+    return int(np.clip(np.median(cnt), lo, hi))
 
 
 def align_images(images: Union[str, Sequence[str]], opt: Options) -> AlignResult:
@@ -141,15 +167,18 @@ def align_images(images: Union[str, Sequence[str]], opt: Options) -> AlignResult
     log.info("Extracting features (%d workers)", workers)
     t = time.time()
     with ThreadPoolExecutor(workers) as ex:
-        res = list(ex.map(lambda f: extract(f, opt.feature_max_dim, opt.n_features), frames))
+        n_feat = opt.n_features or _auto_features(frames, opt.feature_max_dim)
+        res = list(ex.map(lambda f: extract(f, opt.feature_max_dim, n_feat), frames))
     feats = [r[0] for r in res]
     work_scale = float(np.median([r[1] for r in res]))
     log.info("  %d features/image avg in %.1fs", int(np.mean([len(f) for f in feats])), time.time() - t)
 
     # ---- matching
     pos_for_pairs = positions if positions is not None and np.isfinite(positions).all() else None
-    cand = candidate_pairs(pos_for_pairs, len(frames), opt.neighbors)
-    log.info("Matching %d candidate pairs on %s", len(cand), backend.name)
+    k_nb = opt.neighbors or _auto_neighbors(frames, positions)
+    cand = candidate_pairs(pos_for_pairs, len(frames), k_nb)
+    log.info("Matching %d candidate pairs (%d neighbours per image%s) on %s", len(cand), k_nb,
+             "" if opt.neighbors else ", auto", backend.name)
     t = time.time()
     thresh = 3.0 / work_scale
 
