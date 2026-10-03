@@ -378,6 +378,8 @@ def _extend_tracks(rec: Reconstruction, feats, radius: float, max_track: int = 8
         second = np.take_along_axis(ham, o[:, 1:2], 1)[:, 0]
         good = (best <= max_ham) & (best < 0.8 * second)
         idx, nn, ham = idx[good], np.take_along_axis(nn, o[:, :1], 1)[good, 0], best[good]
+        if len(idx) == 0:
+            continue
         o = np.lexsort((ham, nn))                          # one point per keypoint: best descriptor
         first_kp = np.r_[True, np.diff(nn[o]) != 0]
         o = o[first_kp]
@@ -542,19 +544,7 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
     rec = Reconstruction(used, R, C, intr, cam_group, np.zeros((P, 3)), color,
                          obs_cam, obs_pt, obs_uv, obs_feat=obs_feat)
 
-    # ---- 3. triangulate + coarse filtering (initial poses ignore tilt, so be generous)
-    X, ang = triangulate(R, C, rec.intr_array(), rec.pp_array(), cam_group, obs_cam, obs_pt, obs_uv, P)
-    rec.X = X
-    err, _ = _ba.residuals(R, C, X, rec.intr_array(), rec.pp_array(), cam_group, obs_cam, obs_pt,
-                           obs_uv, 1e9)
-    keep = (err < 0.02 * diag) & (ang[obs_pt] > 1.0)
-    _keep_observations(rec, keep)
-
-    # ---- 3b. ground control points (surveyed anchors), if any
-    if gcps:
-        _add_gcps(rec, frames, used, gcps, gcp_sigma)
-
-    # ---- 4. priors
+    # ---- 3. priors
     pos = ar.positions
     C_t = rec.C.copy()
     C_s = np.full((N, 3), np.inf)
@@ -606,8 +596,35 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
             log.info("Gimbal attitude prior on %d cameras (sigma %.1f deg)", int(np.isfinite(axes).all(1).sum()),
                      attitude_sigma_deg)
 
-    # ---- 5. robust BA rounds with outlier rejection
+    # ---- 4. triangulate + coarse filtering. The first poses come from the 2D alignment and ignore
+    # tilt and relief: on a low flight over tall objects they can be hundreds of pixels off, and a
+    # fixed gate then discards most good tracks for good. So when too few observations pass, the
+    # poses are adjusted on those that did, every track is re-triangulated and filtered again.
     px = 1.0 / work                           # one feature-detection pixel in full-res pixels
+    full = (rec.obs_cam, rec.obs_pt, rec.obs_uv, rec.obs_feat, rec.color)
+    prev = 0.0
+    for attempt in range(6):
+        rec.obs_cam, rec.obs_pt, rec.obs_uv, rec.obs_feat, rec.color = full
+        rec.X, ang = triangulate(rec.R, rec.C, rec.intr_array(), rec.pp_array(), rec.cam_group,
+                                 rec.obs_cam, rec.obs_pt, rec.obs_uv, P)
+        err, _ = _ba.residuals(rec.R, rec.C, rec.X, rec.intr_array(), rec.pp_array(), rec.cam_group,
+                               rec.obs_cam, rec.obs_pt, rec.obs_uv, 1e9)
+        keep = (err < (0.02 * diag if attempt == 0 else 30 * px)) & (ang[rec.obs_pt] > 1.0)
+        _keep_observations(rec, keep)
+        if keep.mean() >= 0.6 or keep.mean() < prev + 0.05 or attempt == 5:
+            break
+        prev = float(keep.mean())
+        log.info("  initial poses: only %.0f%% of observations triangulate consistently "
+                 "(median error %.0f px); refining poses and re-triangulating", 100 * keep.mean(), np.median(err))
+        bundle_adjust(rec, pri, 8 * px)
+    log.info("  %d points, %d observations pass the initial triangulation (%.0f%%)",
+             len(rec.X), len(rec.obs_pt), 100 * keep.mean())
+
+    # ground control points (surveyed anchors), if any
+    if gcps:
+        _add_gcps(rec, frames, used, gcps, gcp_sigma)
+
+    # ---- 5. robust BA rounds with outlier rejection
     for rnd, (huber, thr) in enumerate([(8 * px, 30 * px), (3 * px, 8 * px), (2 * px, 4 * px)]):
         t = time.time()
         err = bundle_adjust(rec, pri, huber)
