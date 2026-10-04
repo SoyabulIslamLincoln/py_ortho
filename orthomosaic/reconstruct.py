@@ -12,6 +12,8 @@ import math
 import os
 import time
 import warnings
+import dataclasses
+import shutil
 from dataclasses import asdict, dataclass, field
 from typing import Optional, Sequence, Union
 
@@ -56,7 +58,8 @@ class Options3D(Options):
     depth_patchmatch: bool = False          # slanted-plane PatchMatch repair of inconsistent pixels (slow on CPU)
     dsm_auto_factor: float = 0.75           # auto DSM cell = this x dense point spacing (when dsm_resolution is None)
     ortho_resolution: Optional[float] = None  # orthophoto cell (m); None = native GSD (Pix4D 1 x GSD)
-    ortho_max_cells: float = 60e6           # orthophoto pixel cap (memory: ~13 bytes/pixel during rendering)
+    ortho_max_cells: float = 0              # orthophoto pixel cap; 0 = auto from the machine's RAM (outputs are
+                                            # disk-backed, ~6 bytes/pixel stay in memory)
     dem_gapfill_steps: int = 3              # ODM radius steps: point spacing * sqrt(2)^k, k < steps
     attitude_sigma_deg: float = 2.0         # gimbal pitch/roll prior in the BA (0 = off); fixes block tilt
     ignore_gsd: bool = False                # ODM: never allow a DSM/ortho finer than GSD * (1 - 10%)
@@ -71,7 +74,7 @@ class Options3D(Options):
     occlusion_tol: float = 0.20             # metres a ray may pass under the surface before it blocks
     occlusion_steps: int = 96               # max line-of-sight samples per ray (1 DSM cell apart when possible)
     occlusion_stride: int = 2               # test occlusion on every n-th cell, then grow the mask
-    ortho_tile: int = 256                   # true-orthophoto tile size (cells)
+    ortho_tile: int = 512                   # true-orthophoto tile size (cells)
     view_angle_power: float = 1.5           # nadir preference when blending the true orthophoto
     ortho_views: int = 8                    # orthophoto: max photos per tile, from the global (nadir-first) source map
     fill_hidden: bool = True                # orthophoto: colour cells hidden in all chosen views from the best view
@@ -118,6 +121,8 @@ def _write_raster(path, arr, kind, epsg, origin_xy, gsd, nodata=None, tile=512):
     def job(t):
         tx, ty = t
         blk = arr[ty:ty + tile, tx:tx + tile]
+        if kind == "float32":
+            blk = blk.astype(np.float32, copy=False)          # int rasters convert per tile, not whole
         if kind == "rgba" and not blk[..., 3].any():
             return None
         if kind == "float32" and nodata is not None and np.all(blk == nodata):
@@ -139,6 +144,16 @@ def _block_reduce(a, f, valid):
     v = valid[:h * f, :w * f].reshape(h, f, w, f)
     cnt = v.sum((1, 3))
     return np.where(cnt > 0, a.sum((1, 3)) / np.maximum(cnt, 1), np.nan), cnt >= (f * f) / 2
+
+
+def _ortho_cell_budget(fraction: float = 0.15, bytes_per_cell: float = 6.0) -> float:
+    """Orthophoto cells that fit in `fraction` of physical RAM (the RGBA/source rasters are disk
+    backed; the DSM resample, masks and per-tile buffers stay in memory)."""
+    try:
+        ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, OSError, AttributeError):
+        ram = 8e9
+    return max(60e6, fraction * ram / bytes_per_cell)
 
 
 def cap_resolution(requested, gsd: float, ignore_gsd: bool = False, error: float = 0.1) -> float:
@@ -298,6 +313,19 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         dsm = np.where(valid, mvs._nanmedian_filter(dsm, r), np.nan).astype(np.float32)
         log.info("DSM median smoothing: %d-cell radius (%.2f m)", r, r * gsd)
     covered = np.isfinite(dsm)
+    if covered.any():
+        # every raster covers the reconstructed footprint's bounding box, not the whole camera
+        # extent: smaller files, less memory, and the orthophoto can afford the native GSD
+        rows, cols_ = np.flatnonzero(covered.any(1)), np.flatnonzero(covered.any(0))
+        r0, r1 = max(0, rows[0] - 2), min(dsm.shape[0], rows[-1] + 3)
+        c0, c1 = max(0, cols_[0] - 2), min(dsm.shape[1], cols_[-1] + 3)
+        if (r1 - r0) * (c1 - c0) < dsm.size:
+            cut = (slice(r0, r1), slice(c0, c1))
+            dsm, conf, support, covered = dsm[cut], conf[cut], support[cut], covered[cut]
+            dense = dataclasses.replace(
+                dense, Z=dense.Z[cut], score=dense.score[cut], rgb=dense.rgb[cut], covered=dense.covered[cut],
+                stepped=None if dense.stepped is None else dense.stepped[cut],
+                minX=dense.minX + c0 * gsd, maxY=dense.maxY - r0 * gsd)
     origin_xy = (dense.minX + ox, dense.maxY + oy)
 
     #changed here: Pix4D "Orthomosaic" stage -- re-render the colours on the FINAL DSM with
@@ -305,7 +333,7 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     #seam feathering.  This is what turns the dense colours into a true orthophoto.
     colors = dense.rgb
     ortho_frac = None
-    src_id = count = None
+    src_id = count = rgba_o = ortho_tmp = None
     ortho_valid = covered              # cells of the orthomosaic that carry colour (alpha)
     o_gsd, dsm_o, covered_o = gsd, dsm, covered            # orthophoto grid (same as DSM unless finer)
     if getattr(opt, "true_ortho", True) and not thermal and covered.any():
@@ -314,8 +342,9 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         o_gsd = cap_resolution(opt.ortho_resolution or al.gsd, al.gsd, opt.ignore_gsd)
         Wo = int(math.ceil(dsm.shape[1] * gsd / o_gsd))
         Ho = int(math.ceil(dsm.shape[0] * gsd / o_gsd))
-        if Wo * Ho > opt.ortho_max_cells:
-            o_gsd = math.sqrt(dsm.shape[0] * dsm.shape[1] * gsd * gsd / opt.ortho_max_cells)
+        cap = opt.ortho_max_cells or _ortho_cell_budget()
+        if Wo * Ho > cap:
+            o_gsd = math.sqrt(dsm.shape[0] * dsm.shape[1] * gsd * gsd / cap)
             Wo = int(math.ceil(dsm.shape[1] * gsd / o_gsd))
             Ho = int(math.ceil(dsm.shape[0] * gsd / o_gsd))
         if o_gsd < 0.99 * gsd:
@@ -325,15 +354,15 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                      dsm.shape[1], dsm.shape[0], gsd)
         else:
             o_gsd = gsd
-        ortho_rgb, ortho_cov, src_id, count = true_orthophoto(ar, rec, dsm_o, dense.minX, dense.maxY, o_gsd,
-                                                              gains, biases, opt)
+        rgba_o, src_id, count, ortho_tmp = true_orthophoto(ar, rec, dsm_o, dense.minX, dense.maxY, o_gsd,
+                                                           gains, biases, opt)
         # Only cells a calibrated photo actually sees are coloured. Cells hidden in every photo
         # stay transparent (NoData): they cannot be recovered, and filling them with the dense
         # matching colours would paint walls/roofs onto the hidden ground.
-        colors = ortho_rgb
-        ortho_valid = ortho_cov & covered_o
-        if ortho_cov.any():
-            ortho_frac = float(ortho_cov.sum() / max(covered_o.sum(), 1))
+        colors = rgba_o[..., :3]
+        ortho_valid = rgba_o[..., 3] > 0
+        if ortho_valid.any():
+            ortho_frac = float(ortho_valid.sum() / max(covered_o.sum(), 1))
             log.info("True orthophoto: %.0f%% of DSM cells coloured only from visible views (%.1fs)",
                      100 * ortho_frac, time.time() - t1)
 
@@ -368,12 +397,15 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     _write_raster(os.path.join(out_dir, "dsm_support.tif"), support.astype(np.float32), "float32", epsg,
                   origin_xy, gsd, 0.0)
     if src_id is not None:
-        _write_raster(os.path.join(out_dir, "source_image_id.tif"), src_id.astype(np.float32), "float32",
+        _write_raster(os.path.join(out_dir, "source_image_id.tif"), src_id, "float32",
                       epsg, origin_xy, o_gsd, -1.0)
-        _write_raster(os.path.join(out_dir, "coverage_count.tif"), count.astype(np.float32), "float32",
+        _write_raster(os.path.join(out_dir, "coverage_count.tif"), count, "float32",
                       epsg, origin_xy, o_gsd)
-    rgba = np.dstack([colors, (ortho_valid * 255).astype(np.uint8)])
-    rgba[~ortho_valid, :3] = 0
+    if rgba_o is not None:
+        rgba = rgba_o                                    # already RGBA, alpha = coloured by a photo
+    else:
+        rgba = np.dstack([colors, (ortho_valid * 255).astype(np.uint8)])
+        rgba[~ortho_valid, :3] = 0
     _write_raster(os.path.join(out_dir, "orthophoto.tif"), rgba, "rgba", epsg, origin_xy, o_gsd)
     pf = max(1, math.ceil(max(dsm.shape) / 2048))
     Image.fromarray(_colorize(dsm, covered)[::pf, ::pf]).save(os.path.join(out_dir, "dsm_preview.png"))
@@ -557,6 +589,8 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     )
     with open(os.path.join(out_dir, "report.json"), "w") as fh:
         json.dump(report, fh, indent=1)
+    if ortho_tmp:
+        shutil.rmtree(ortho_tmp, ignore_errors=True)     # disk-backed orthophoto buffers
     log.info("3D done in %.1fs -> %s", time.time() - t0, out_dir)
     return report
 

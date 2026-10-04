@@ -491,6 +491,37 @@ def fill_holes(Z: np.ndarray) -> np.ndarray:
     return filled.astype(np.float32)
 
 
+def _box_mean(a: np.ndarray, r: int) -> np.ndarray:
+    """Mean over a (2r+1)^2 window (edge-clamped), via cumulative sums."""
+    p = np.pad(a.astype(np.float64), r + 1, mode="edge")
+    c = p.cumsum(0).cumsum(1)
+    k = 2 * r + 1
+    s = c[k:, k:] - c[:-k, k:] - c[k:, :-k] + c[:-k, :-k]
+    return (s[:a.shape[0], :a.shape[1]] / (k * k)).astype(np.float32)
+
+
+def _lower_envelope(Z: np.ndarray, f: int) -> np.ndarray:
+    """Smooth lower surface: minimum of each f x f block (NaN-aware), holes filled by push-pull,
+    bilinearly upsampled to the full grid."""
+    import warnings
+    H, W = Z.shape
+    h, w = -(-H // f), -(-W // f)
+    P = np.full((h * f, w * f), np.nan, np.float32)
+    P[:H, :W] = Z
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        B = np.nanmin(P.reshape(h, f, w, f), axis=(1, 3)).astype(np.float32)
+    B = fill_holes(B)
+    ys = np.clip((np.arange(H) + 0.5) / f - 0.5, 0, h - 1)
+    xs = np.clip((np.arange(W) + 0.5) / f - 0.5, 0, w - 1)
+    y0 = np.minimum(np.floor(ys).astype(int), max(h - 2, 0)); x0 = np.minimum(np.floor(xs).astype(int), max(w - 2, 0))
+    y1, x1 = np.minimum(y0 + 1, h - 1), np.minimum(x0 + 1, w - 1)
+    fy = (ys - y0).astype(np.float32)[:, None]; fx = (xs - x0).astype(np.float32)[None, :]
+    top = B[y0][:, x0] * (1 - fx) + B[y0][:, x1] * fx
+    bot = B[y1][:, x0] * (1 - fx) + B[y1][:, x1] * fx
+    return (top * (1 - fy) + bot * fy).astype(np.float32)
+
+
 def _near(mask: np.ndarray, cells: int) -> np.ndarray:
     """Cells within `cells` (city-block distance) of a True cell (= repeated 4-neighbour dilation)."""
     try:
@@ -554,6 +585,20 @@ def postprocess(d: DenseResult, min_score: float, max_dev: float = 1.0,
     # holes left after the radius steps: smooth interpolation, as ODM's gdal_fillnodata pass
     # (the lower-median grower turned large gaps into flat polygon patches and streaks)
     filled = fill_holes(Zc)
+    if d.stepped is not None:
+        # a gap next to a height step (ground at the foot of a wall, hidden from most photos) takes
+        # the local ground height, not a ramp from the roof: a ramp stretches the photo texture
+        # into the melted, wavy edges seen beside buildings
+        f = max(1, int(round(0.5 / d.gsd)))
+        low = _lower_envelope(Zc, f)
+        hole = ~np.isfinite(Zc)
+        # min() of two continuous surfaces is continuous: no per-cell switching, so no terraces
+        filled = np.where(hole, np.minimum(filled, low), filled).astype(np.float32)
+        # unmeasured areas carry no detail anyway: make them smooth (~0.5 m), so the orthophoto
+        # drapes the photos over a calm surface instead of warping them over interpolation noise
+        # (ODM gets the same effect by texturing a simplified 2.5D mesh)
+        sm = _box_mean(np.nan_to_num(filled), f) / np.maximum(_box_mean(np.isfinite(filled).astype(np.float32), f), 1e-6)
+        filled = np.where(hole & np.isfinite(filled), sm, filled).astype(np.float32)
     # heights already filled from nearby points (densify radius steps, 0 < score < min_score)
     # are better than the push-pull estimate: keep them where they are not spikes
     stepped = (np.zeros(d.Z.shape, bool) if d.stepped is None else d.stepped & np.isfinite(d.Z))

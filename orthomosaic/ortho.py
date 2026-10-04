@@ -19,6 +19,8 @@ the current matching tile.
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -213,7 +215,7 @@ def _global_sources(rec, dsm, minX, maxY, gsd, use_occ, occ_steps, occ_tol, zmax
 
 class _Defaults:
     #changed here: fallback option object so true_orthophoto works without an Options3D.
-    ortho_tile = 256
+    ortho_tile = 512
     max_views = 6
     view_angle_power = 1.5
     occlusion = True
@@ -247,9 +249,10 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
     only within ``seam_band`` cells of a seam. ``ortho_blend="feather"`` keeps the old weighted
     average of all visible views (more ghosting on tall objects).
 
-    Returns ``(rgb (H, W, 3) uint8, covered (H, W) bool, source (H, W) int32, count (H, W) uint8)``:
-    `source` is the index into ``rec.used`` of the view chosen per cell (-1 = unobserved) and
-    `count` the number of views that see the cell. Unobserved cells stay uncovered (NoData).
+    Returns ``(rgba (H, W, 4) uint8, source (H, W) int32, count (H, W) uint8, tmp_dir)``, all
+    memory-mapped from files in `tmp_dir` (the caller removes it): alpha is 255 where a photo
+    coloured the cell, `source` the index into ``rec.used`` of the view chosen per cell (-1 =
+    unobserved) and `count` the number of views that see the cell.
     """
     opt = opt if opt is not None else _Defaults()
     g = lambda name: getattr(opt, name, getattr(_Defaults, name))
@@ -263,9 +266,15 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
     dsm = np.ascontiguousarray(dsm, np.float32)
     H, W = dsm.shape
     covered = np.isfinite(dsm)
-    rgb_out = np.zeros((H, W, 3), np.uint8)
+    # outputs live on disk (memory-mapped) so the orthophoto can be rendered at the native GSD on
+    # an 8 GB machine; the caller writes them out and removes the folder (returned last)
+    tmp = tempfile.mkdtemp(prefix="ortho_", dir=getattr(opt, "work_dir", None))
+    rgba_out = np.lib.format.open_memmap(os.path.join(tmp, "rgba.npy"), "w+", np.uint8, (H, W, 4))
+    SRC = np.lib.format.open_memmap(os.path.join(tmp, "src.npy"), "w+", np.int32, (H, W))
+    SRC[:] = -1                                               # index into rec.used, -1 = none
+    CNT = np.lib.format.open_memmap(os.path.join(tmp, "cnt.npy"), "w+", np.uint8, (H, W))
     if not covered.any() or len(rec.used) == 0:
-        return rgb_out, np.zeros((H, W), bool)
+        return rgba_out, SRC, CNT, tmp
 
     gains = gains or {}
     biases = biases or {}
@@ -336,7 +345,11 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
     smooth = float(g("seam_smoothness"))
     s_iters = int(g("seam_iters"))
     band = max(0, int(g("seam_band")))
-    pad = band + 8 if blend == "seam" else 0     # context so seams/feathering continue across tiles
+    # two-band blending (Burt & Adelson): colour/exposure (low band) is blended over ~0.25 m across
+    # a seam, detail (high band) over `band` cells, so lighting steps between photos vanish while
+    # edges stay sharp. The tile margin covers the wide band, so tiles blend identically.
+    lo_r = max(band, int(round(0.25 / gsd)))
+    pad = 2 * lo_r + 8 if blend == "seam" else 0
     zmax = float(np.nanmax(dsm))
 
     dsm_c = np.ascontiguousarray(dsm, np.float32)       # one contiguous copy for the C visibility kernel
@@ -362,8 +375,6 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
     gl = glab[glab >= 0]
     log.info("True orthophoto: global source selection, %d photos over %d grid cells of %.2f m (%.1fs)",
              len(np.unique(gl)), gl.size, gstep * gsd, time.time() - t_g)
-    SRC = np.full((H, W), -1, np.int32)                       # index into rec.used, -1 = none
-    CNT = np.zeros((H, W), np.uint8)                          # number of visible, valid views
 
     def process(tile):
         tx, ty = tile
@@ -460,11 +471,25 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
             lab = _seam_labels(cost, cols, smooth, s_iters)
             has = usable.any(0)
             # feather only inside a band around the seams; elsewhere one source per cell
-            wts = np.zeros((L, ph, pw), np.float32)
+            rgb = np.zeros((ph, pw, 3), np.float32)
+            ws = np.zeros((ph, pw), np.float32)
+            wl_sum = np.zeros((ph, pw), np.float32)
+            lo_acc = np.zeros((ph, pw, 3), np.float32)
             for j in range(L):
-                wts[j] = _box((lab == j) & has, band) * usable[j]
-            ws = wts.sum(0)
-            rgb = (wts[..., None] * cols).sum(0) / np.maximum(ws, 1e-6)[..., None]
+                if not usable[j].any():
+                    continue
+                u = usable[j].astype(np.float32)
+                own = ((lab == j) & has).astype(np.float32)
+                # low band of photo j: normalised blur over the cells it covers
+                den = _box(u, lo_r)
+                low = np.stack([_box(cols[j, ..., c] * u, lo_r) for c in range(3)], -1) / np.maximum(den, 1e-6)[..., None]
+                w_hi = _box(own, band) * u
+                w_lo = _box(own, lo_r) * u
+                rgb += w_hi[..., None] * (cols[j] - low)
+                ws += w_hi
+                lo_acc += w_lo[..., None] * low
+                wl_sum += w_lo
+            rgb = rgb / np.maximum(ws, 1e-6)[..., None] + lo_acc / np.maximum(wl_sum, 1e-6)[..., None]
             src = np.where(has, np.asarray(cand)[lab], -1)
         else:   # legacy weighted average of all visible views
             w = np.where(usable, np.maximum(score, 0) ** 2, 0)
@@ -484,8 +509,9 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
         tx, ty, th, tw, rgb, m, src, count = res
         if not m.any():
             return
-        block = rgb_out[ty:ty + th, tx:tx + tw]
-        block[m] = np.clip(rgb[m] + 0.5, 0, 255).astype(np.uint8)
+        block = rgba_out[ty:ty + th, tx:tx + tw]
+        block[m, :3] = np.clip(rgb[m] + 0.5, 0, 255).astype(np.uint8)
+        block[m, 3] = 255
         SRC[ty:ty + th, tx:tx + tw][m] = src[m]
         CNT[ty:ty + th, tx:tx + tw] = np.minimum(count, 255)
 
@@ -515,4 +541,4 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
                 log.info("  ortho: %d/%d tiles", done, len(ordered))
     log.info("True orthophoto: %d/%d tiles in %.1fs (%d image loads)",
              len(ordered), len(ordered), time.time() - t0, cache.loads)
-    return rgb_out, SRC >= 0, SRC, CNT
+    return rgba_out, SRC, CNT, tmp
