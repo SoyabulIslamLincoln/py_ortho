@@ -3,9 +3,11 @@
 """
 Bundle adjustment kernels (Levenberg-Marquardt with Schur complement).
 
-Parameter layout of the reduced ("camera side") system, size nc = 6*N + 3*G:
+Parameter layout of the reduced ("camera side") system, size nc = 6*N + 6*G:
     camera i : [w0 w1 w2 | c0 c1 c2]  at 6*i      (left-multiplied rotation update, centre)
-    group  g : [f k1 k2]               at 6*N + 3*g
+    group  g : [f k1 k2 k3 cx cy]      at 6*N + 6*g  (Pix4D/ODM-style self-calibration: focal,
+                                                    three radial terms, principal point)
+intr is (G, 6) in that order; the `pp` arguments are kept for API compatibility and ignored.
 Points (3 each) are eliminated per track. Observations must be sorted by point,
 with pt_ptr giving the CSR row pointers.
 """
@@ -23,9 +25,9 @@ cdef inline bint _linearize_obs(const double[:, :, ::1] R, const double[:, ::1] 
                                 const double[:, ::1] pp, const int32_t[::1] cam_group,
                                 int cam, Py_ssize_t pt, double uo, double vo, double huber,
                                 double* Jc, double* Jp, double* e, double* cost) noexcept nogil:
-    """Jc: 2x9 (w, C, f k1 k2), Jp: 2x3, e: 2 residual, all pre-scaled by sqrt(Huber weight)."""
+    """Jc: 2x12 (w, C, f k1 k2 k3 cx cy), Jp: 2x3, e: 2 residual, pre-scaled by sqrt(Huber weight)."""
     cdef int g = cam_group[cam]
-    cdef double f = intr[g, 0], k1 = intr[g, 1], k2 = intr[g, 2]
+    cdef double f = intr[g, 0], k1 = intr[g, 1], k2 = intr[g, 2], k3 = intr[g, 3]
     cdef double dX0 = X[pt, 0] - C[cam, 0], dX1 = X[pt, 1] - C[cam, 1], dX2 = X[pt, 2] - C[cam, 2]
     cdef double x = R[cam, 0, 0] * dX0 + R[cam, 0, 1] * dX1 + R[cam, 0, 2] * dX2
     cdef double y = R[cam, 1, 0] * dX0 + R[cam, 1, 1] * dX1 + R[cam, 1, 2] * dX2
@@ -34,10 +36,10 @@ cdef inline bint _linearize_obs(const double[:, :, ::1] R, const double[:, ::1] 
         return False
     cdef double iz = 1.0 / z, nx = x * iz, ny = y * iz
     cdef double r2 = nx * nx + ny * ny
-    cdef double d = 1.0 + k1 * r2 + k2 * r2 * r2
-    cdef double dd = k1 + 2.0 * k2 * r2
-    cdef double ex = f * d * nx + pp[g, 0] - uo
-    cdef double ey = f * d * ny + pp[g, 1] - vo
+    cdef double d = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))
+    cdef double dd = k1 + r2 * (2.0 * k2 + 3.0 * k3 * r2)
+    cdef double ex = f * d * nx + intr[g, 4] - uo
+    cdef double ey = f * d * ny + intr[g, 5] - vo
     cdef double s = sqrt(ex * ex + ey * ey), w = 1.0
     if s <= huber:
         cost[0] += s * s
@@ -61,19 +63,25 @@ cdef inline bint _linearize_obs(const double[:, :, ::1] R, const double[:, ::1] 
     cdef int r, k
     for r in range(2):
         # rotation: J @ (-[xc]_x) with -[xc]_x = [[0, z, -y], [-z, 0, x], [y, -x, 0]]
-        Jc[r * 9 + 0] = sw * (-J[r][1] * z + J[r][2] * y)
-        Jc[r * 9 + 1] = sw * (J[r][0] * z - J[r][2] * x)
-        Jc[r * 9 + 2] = sw * (-J[r][0] * y + J[r][1] * x)
+        Jc[r * 12 + 0] = sw * (-J[r][1] * z + J[r][2] * y)
+        Jc[r * 12 + 1] = sw * (J[r][0] * z - J[r][2] * x)
+        Jc[r * 12 + 2] = sw * (-J[r][0] * y + J[r][1] * x)
         for k in range(3):
             # centre: J @ (-R) ; point: J @ R
             Jp[r * 3 + k] = sw * (J[r][0] * R[cam, 0, k] + J[r][1] * R[cam, 1, k] + J[r][2] * R[cam, 2, k])
-            Jc[r * 9 + 3 + k] = -Jp[r * 3 + k]
-    Jc[0 * 9 + 6] = sw * d * nx
-    Jc[1 * 9 + 6] = sw * d * ny
-    Jc[0 * 9 + 7] = sw * f * r2 * nx
-    Jc[1 * 9 + 7] = sw * f * r2 * ny
-    Jc[0 * 9 + 8] = sw * f * r2 * r2 * nx
-    Jc[1 * 9 + 8] = sw * f * r2 * r2 * ny
+            Jc[r * 12 + 3 + k] = -Jp[r * 3 + k]
+    Jc[6] = sw * d * nx
+    Jc[18] = sw * d * ny
+    Jc[7] = sw * f * r2 * nx
+    Jc[19] = sw * f * r2 * ny
+    Jc[8] = sw * f * r2 * r2 * nx
+    Jc[20] = sw * f * r2 * r2 * ny
+    Jc[9] = sw * f * r2 * r2 * r2 * nx
+    Jc[21] = sw * f * r2 * r2 * r2 * ny
+    Jc[10] = sw
+    Jc[22] = 0.0
+    Jc[11] = 0.0
+    Jc[23] = sw
     return True
 
 
@@ -110,7 +118,7 @@ def reduced_system(const double[:, :, ::1] R, const double[:, ::1] C, const doub
     Solve S dc = -g, then dp = back_substitute(...).
     """
     cdef Py_ssize_t N = R.shape[0], G = intr.shape[0], P = X.shape[0]
-    cdef Py_ssize_t nc = 6 * N + 3 * G
+    cdef Py_ssize_t nc = 6 * N + 6 * G
     S_np = np.zeros((nc, nc), np.float64)
     g_np = np.zeros(nc, np.float64)
     diagU_np = np.zeros(nc, np.float64)
@@ -125,17 +133,17 @@ def reduced_system(const double[:, :, ::1] R, const double[:, ::1] C, const doub
     for p in range(P):
         if pt_ptr[p + 1] - pt_ptr[p] > maxlen:
             maxlen = pt_ptr[p + 1] - pt_ptr[p]
-    cdef double* Wbuf = <double*>malloc(max(maxlen, 1) * 27 * sizeof(double))   # W_k = Jc^T Jp (9x3)
-    cdef int* Ibuf = <int*>malloc(max(maxlen, 1) * 9 * sizeof(int))             # global indices
+    cdef double* Wbuf = <double*>malloc(max(maxlen, 1) * 36 * sizeof(double))   # W_k = Jc^T Jp (12x3)
+    cdef int* Ibuf = <int*>malloc(max(maxlen, 1) * 12 * sizeof(int))            # global indices
     cdef char* ok = <char*>malloc(max(maxlen, 1) * sizeof(char))
-    cdef double Jc[18]
+    cdef double Jc[24]
     cdef double Jp[6]
     cdef double e[2]
     cdef double V[9]
     cdef double Vd[9]
     cdef double Vi[9]
     cdef double gpt[3]
-    cdef double WV[27]
+    cdef double WV[36]
     cdef double t
     cdef int cam, grp
     if Wbuf == NULL or Ibuf == NULL or ok == NULL:
@@ -159,19 +167,19 @@ def reduced_system(const double[:, :, ::1] R, const double[:, ::1] C, const doub
                     if not ok[k]:
                         continue
                     for a in range(6):
-                        Ibuf[k * 9 + a] = 6 * cam + a
-                    for a in range(3):
-                        Ibuf[k * 9 + 6 + a] = 6 * N + 3 * grp + a
+                        Ibuf[k * 12 + a] = 6 * cam + a
+                    for a in range(6):
+                        Ibuf[k * 12 + 6 + a] = 6 * N + 6 * grp + a
                     # U block, gradient
-                    for a in range(9):
-                        ka = Ibuf[k * 9 + a]
-                        g[ka] += Jc[a] * e[0] + Jc[9 + a] * e[1]
-                        diagU[ka] += Jc[a] * Jc[a] + Jc[9 + a] * Jc[9 + a]
-                        for b in range(9):
-                            S[ka, Ibuf[k * 9 + b]] += Jc[a] * Jc[b] + Jc[9 + a] * Jc[9 + b]
+                    for a in range(12):
+                        ka = Ibuf[k * 12 + a]
+                        g[ka] += Jc[a] * e[0] + Jc[12 + a] * e[1]
+                        diagU[ka] += Jc[a] * Jc[a] + Jc[12 + a] * Jc[12 + a]
+                        for b in range(12):
+                            S[ka, Ibuf[k * 12 + b]] += Jc[a] * Jc[b] + Jc[12 + a] * Jc[12 + b]
                         # W = Jc^T Jp
                         for b in range(3):
-                            Wbuf[k * 27 + a * 3 + b] = Jc[a] * Jp[b] + Jc[9 + a] * Jp[3 + b]
+                            Wbuf[k * 36 + a * 3 + b] = Jc[a] * Jp[b] + Jc[12 + a] * Jp[3 + b]
                     for a in range(3):
                         gpt[a] += Jp[a] * e[0] + Jp[3 + a] * e[1]
                         for b in range(3):
@@ -195,24 +203,24 @@ def reduced_system(const double[:, :, ::1] R, const double[:, ::1] C, const doub
                 for k in range(m):
                     if not ok[k]:
                         continue
-                    for a in range(9):
+                    for a in range(12):
                         for b in range(3):
-                            WV[a * 3 + b] = (Wbuf[k * 27 + a * 3 + 0] * Vi[0 * 3 + b]
-                                             + Wbuf[k * 27 + a * 3 + 1] * Vi[1 * 3 + b]
-                                             + Wbuf[k * 27 + a * 3 + 2] * Vi[2 * 3 + b])
-                    for a in range(9):
-                        ka = Ibuf[k * 9 + a]
+                            WV[a * 3 + b] = (Wbuf[k * 36 + a * 3 + 0] * Vi[0 * 3 + b]
+                                             + Wbuf[k * 36 + a * 3 + 1] * Vi[1 * 3 + b]
+                                             + Wbuf[k * 36 + a * 3 + 2] * Vi[2 * 3 + b])
+                    for a in range(12):
+                        ka = Ibuf[k * 12 + a]
                         g[ka] -= WV[a * 3 + 0] * gpt[0] + WV[a * 3 + 1] * gpt[1] + WV[a * 3 + 2] * gpt[2]
                     for q in range(m):
                         if not ok[q]:
                             continue
-                        for a in range(9):
-                            ka = Ibuf[k * 9 + a]
-                            for b in range(9):
-                                kb = Ibuf[q * 9 + b]
-                                t = (WV[a * 3 + 0] * Wbuf[q * 27 + b * 3 + 0]
-                                     + WV[a * 3 + 1] * Wbuf[q * 27 + b * 3 + 1]
-                                     + WV[a * 3 + 2] * Wbuf[q * 27 + b * 3 + 2])
+                        for a in range(12):
+                            ka = Ibuf[k * 12 + a]
+                            for b in range(12):
+                                kb = Ibuf[q * 12 + b]
+                                t = (WV[a * 3 + 0] * Wbuf[q * 36 + b * 3 + 0]
+                                     + WV[a * 3 + 1] * Wbuf[q * 36 + b * 3 + 1]
+                                     + WV[a * 3 + 2] * Wbuf[q * 36 + b * 3 + 2])
                                 S[ka, kb] -= t
     finally:
         free(Wbuf)
@@ -234,7 +242,7 @@ def back_substitute(const double[:, :, ::1] R, const double[:, ::1] C, const dou
     cdef Py_ssize_t N = R.shape[0], P = X.shape[0], p, q
     dp_np = np.zeros((P, 3), np.float64)
     cdef double[:, ::1] dp = dp_np
-    cdef double Jc[18]
+    cdef double Jc[24]
     cdef double Jp[6]
     cdef double e[2]
     cdef double rhs[3]
@@ -256,10 +264,10 @@ def back_substitute(const double[:, :, ::1] R, const double[:, ::1] C, const dou
                 jd1 = 0.0
                 for a in range(6):
                     jd0 += Jc[a] * dc[6 * cam + a]
-                    jd1 += Jc[9 + a] * dc[6 * cam + a]
-                for a in range(3):
-                    jd0 += Jc[6 + a] * dc[6 * N + 3 * grp + a]
-                    jd1 += Jc[15 + a] * dc[6 * N + 3 * grp + a]
+                    jd1 += Jc[12 + a] * dc[6 * cam + a]
+                for a in range(6):
+                    jd0 += Jc[6 + a] * dc[6 * N + 6 * grp + a]
+                    jd1 += Jc[18 + a] * dc[6 * N + 6 * grp + a]
                 for b in range(3):
                     rhs[b] -= Jp[b] * jd0 + Jp[3 + b] * jd1
             for a in range(3):
@@ -275,7 +283,7 @@ def residuals(const double[:, :, ::1] R, const double[:, ::1] C, const double[:,
     cdef Py_ssize_t M = obs_cam.shape[0], q
     out_np = np.empty(M, np.float64)
     cdef double[::1] out = out_np
-    cdef double cost = 0.0, x, y, z, nx, ny, r2, dd, ex, ey, s, f, k1, k2, d0, d1, d2
+    cdef double cost = 0.0, x, y, z, nx, ny, r2, dd, ex, ey, s, f, k1, k2, k3, d0, d1, d2
     cdef int cam, g, pt
     with nogil:
         for q in range(M):
@@ -285,6 +293,7 @@ def residuals(const double[:, :, ::1] R, const double[:, ::1] C, const double[:,
             f = intr[g, 0]
             k1 = intr[g, 1]
             k2 = intr[g, 2]
+            k3 = intr[g, 3]
             d0 = X[pt, 0] - C[cam, 0]
             d1 = X[pt, 1] - C[cam, 1]
             d2 = X[pt, 2] - C[cam, 2]
@@ -298,9 +307,9 @@ def residuals(const double[:, :, ::1] R, const double[:, ::1] C, const double[:,
             nx = x / z
             ny = y / z
             r2 = nx * nx + ny * ny
-            dd = 1.0 + k1 * r2 + k2 * r2 * r2
-            ex = f * dd * nx + pp[g, 0] - obs_uv[q, 0]
-            ey = f * dd * ny + pp[g, 1] - obs_uv[q, 1]
+            dd = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))
+            ex = f * dd * nx + intr[g, 4] - obs_uv[q, 0]
+            ey = f * dd * ny + intr[g, 5] - obs_uv[q, 1]
             s = sqrt(ex * ex + ey * ey)
             out[q] = s
             if s <= huber:

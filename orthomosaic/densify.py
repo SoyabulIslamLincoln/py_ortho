@@ -125,15 +125,15 @@ def _half(g: np.ndarray) -> np.ndarray:
 
 
 class _Cam:
-    """Pinhole + 2-term radial model (pyOrthomosaic convention: pixel centres at integers)."""
+    """Pinhole + 3-term radial model (pyOrthomosaic convention: pixel centres at integers)."""
 
-    def __init__(self, R, C, f, k1, k2, cx, cy, w, h):
+    def __init__(self, R, C, f, k1, k2, cx, cy, w, h, k3=0.0):
         self.R, self.C = np.asarray(R, np.float64), np.asarray(C, np.float64)
-        self.f, self.k1, self.k2, self.cx, self.cy, self.w, self.h = f, k1, k2, cx, cy, w, h
+        self.f, self.k1, self.k2, self.k3, self.cx, self.cy, self.w, self.h = f, k1, k2, k3, cx, cy, w, h
 
     def scaled(self, s: float, w: int, h: int) -> "_Cam":
         return _Cam(self.R, self.C, self.f * s, self.k1, self.k2,
-                    (self.cx + 0.5) * s - 0.5, (self.cy + 0.5) * s - 0.5, w, h)
+                    (self.cx + 0.5) * s - 0.5, (self.cy + 0.5) * s - 0.5, w, h, self.k3)
 
     def rays(self, u, v):
         """Undistorted normalised camera rays (x, y, 1) for pixels (u, v)."""
@@ -141,7 +141,7 @@ class _Cam:
         x, y = nx.copy(), ny.copy()
         for _ in range(8):
             r2 = x * x + y * y
-            d = 1 + self.k1 * r2 + self.k2 * r2 * r2
+            d = 1 + r2 * (self.k1 + r2 * (self.k2 + r2 * self.k3))
             x, y = nx / d, ny / d
         return x, y
 
@@ -150,7 +150,7 @@ class _Cam:
         z = np.maximum(xc2, 1e-6)
         x, y = xc0 / z, xc1 / z
         r2 = x * x + y * y
-        d = self.f * (1 + self.k1 * r2 + self.k2 * r2 * r2)
+        d = self.f * (1 + r2 * (self.k1 + r2 * (self.k2 + r2 * self.k3)))
         return d * x + self.cx, d * y + self.cy
 
 
@@ -205,6 +205,50 @@ def _depth_range(rec, k):
     return max(0.3 * lo, lo - 0.2 * span - 1.0), hi + 0.2 * span + 2.0
 
 
+def _depth_band(rec, k, cam, shape, rng, block: int = 32, margin: float = 1.0):
+    """Per-pixel inverse-depth search band (lo, hi maps at `shape`) from the tie points image k
+    itself observes (OpenMVS/Pix4D seed depth maps from the sparse points the same way).
+
+    A uniform patterned roof otherwise matches a false repeat of its pattern a few metres above
+    or below (neighbouring photos agree on the same false depth, so the consistency check passes
+    it). Per block of `block` px: depth range of the tie points there, widened to the 3x3 block
+    neighbourhood (objects straddling blocks) and by `margin` m; blocks without tie points keep the
+    image-wide range `rng`."""
+    H, W = shape
+    m = rec.obs_cam == k
+    lo_g, hi_g = rng
+    inv_lo = np.full((H, W), 1.0 / hi_g, np.float32)
+    inv_hi = np.full((H, W), 1.0 / lo_g, np.float32)
+    if m.sum() < 50:
+        return inv_lo, inv_hi
+    xc = (rec.X[rec.obs_pt[m]] - cam.C) @ cam.R.T
+    ok = xc[:, 2] > 0
+    u, v = cam.project_cam(xc[ok, 0], xc[ok, 1], xc[ok, 2])
+    z = xc[ok, 2]
+    gh, gw = -(-H // block), -(-W // block)
+    bi = (np.clip(v, 0, H - 1) // block).astype(int) * gw + (np.clip(u, 0, W - 1) // block).astype(int)
+    inb = (u >= 0) & (v >= 0) & (u < W) & (v < H)
+    bi, z = bi[inb], z[inb]
+    zlo = np.full(gh * gw, np.inf)
+    zhi = np.full(gh * gw, -np.inf)
+    cnt = np.bincount(bi, minlength=gh * gw)
+    np.minimum.at(zlo, bi, z)
+    np.maximum.at(zhi, bi, z)
+    ok_b = (cnt >= 5).reshape(gh, gw)
+    zlo, zhi = zlo.reshape(gh, gw), zhi.reshape(gh, gw)
+    pl = np.pad(np.where(ok_b, zlo, np.inf), 1, constant_values=np.inf)
+    ph = np.pad(np.where(ok_b, zhi, -np.inf), 1, constant_values=-np.inf)
+    lo3 = np.min([pl[1 + dy:gh + 1 + dy, 1 + dx:gw + 1 + dx] for dy in (-1, 0, 1) for dx in (-1, 0, 1)], 0)
+    hi3 = np.max([ph[1 + dy:gh + 1 + dy, 1 + dx:gw + 1 + dx] for dy in (-1, 0, 1) for dx in (-1, 0, 1)], 0)
+    has = ok_b & np.isfinite(lo3) & np.isfinite(hi3)
+    pad = margin + 0.05 * (hi3 - lo3)
+    lo_b = np.where(has, np.clip(lo3 - pad, lo_g, hi_g), lo_g)
+    hi_b = np.where(has, np.clip(hi3 + pad, lo_g, hi_g), hi_g)
+    lo_px = np.repeat(np.repeat(lo_b, block, 0), block, 1)[:H, :W]
+    hi_px = np.repeat(np.repeat(hi_b, block, 0), block, 1)[:H, :W]
+    return (1.0 / hi_px).astype(np.float32), (1.0 / np.maximum(lo_px, 1e-6)).astype(np.float32)
+
+
 def _num_depths(rec, k, nbrs_k, rng, f_coarse, base: int) -> int:
     """Coarse-sweep hypotheses: one per ~1 px of disparity at the coarse level for the median
     baseline, so a wider depth range keeps the same depth resolution (between base and 3x base)."""
@@ -251,7 +295,7 @@ def _sweep(ref, cam_r, srcs, cams_s, inv_list, opt, ray=None):
     for i, inv in enumerate(inv_list):
         inv = np.ascontiguousarray(inv, np.float32)
         for j, (src, cs, (Rs, b)) in enumerate(zip(srcs, cams_s, geo)):
-            _dense.ncc_warp(ref, mu, sd, src, ray, Rs, b, cs.f, cs.k1, cs.k2, cs.cx, cs.cy, inv, r, S[j], J, V, hs)
+            _dense.ncc_warp(ref, mu, sd, src, ray, Rs, b, cs.f, cs.k1, cs.k2, cs.k3, cs.cx, cs.cy, inv, r, S[j], J, V, hs)
         _dense.combine(S, opt.top_k, i, best, prev, s_prev_best, s_next_best, idx)
     n = len(inv_list)
     inv0 = inv_list[0]
@@ -306,16 +350,21 @@ def depth_map(k, nbrs, rec, views, opt: DepthOptions):
 
     # full sweep at the coarsest level, uniform in inverse depth
     nd = _num_depths(rec, k, nbrs, rng, pyr_c[L].f, opt.num_depths)
-    inv = np.linspace(1 / rng[1], 1 / rng[0], nd).astype(np.float32)
     shape = pyr_r[L].shape
-    d, _, _ = _sweep(pyr_r[L], pyr_c[L], pyr_s[L], pyr_cs[L], [np.full(shape, i, np.float32) for i in inv], opt,
-                     rays[L])
-    dstep = (inv[1] - inv[0]) / 2
+    # per-pixel band seeded from this image's tie points: the same number of hypotheses spread
+    # over a much narrower range where the surface is known (finer steps, no pattern aliasing)
+    inv_lo, inv_hi = _depth_band(rec, k, pyr_c[L], shape, rng, block=max(8, shape[1] // 16))
+    step = (inv_hi - inv_lo) / max(nd - 1, 1)
+    d, _, _ = _sweep(pyr_r[L], pyr_c[L], pyr_s[L], pyr_cs[L],
+                     [(inv_lo + i * step).astype(np.float32) for i in range(nd)], opt, rays[L])
+    dstep = step / 2
     # refine: at each finer level search +-refine_steps around the upsampled depth, half the spacing
     for lvl in range(L - 1, -1, -1):
         H, W = pyr_r[lvl].shape
         up = np.repeat(np.repeat(d, 2, 0), 2, 1)[:H, :W]
         up = np.pad(up, ((0, H - up.shape[0]), (0, W - up.shape[1])), mode="edge")
+        dstep = np.repeat(np.repeat(dstep, 2, 0), 2, 1)[:H, :W]
+        dstep = np.pad(dstep, ((0, H - dstep.shape[0]), (0, W - dstep.shape[1])), mode="edge")
         hyp = [np.maximum(1.0 / up + t * dstep, 1e-6).astype(np.float32)
                for t in range(-opt.refine_steps, opt.refine_steps + 1)]
         d, score, sd = _sweep(pyr_r[lvl], pyr_c[lvl], pyr_s[lvl], pyr_cs[lvl], hyp, opt, rays[lvl])
@@ -405,7 +454,7 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
         s = min(1.0, (opt.max_image_dim or max(fr.width, fr.height)) / max(fr.width, fr.height))   # None = full resolution
         w, h = int(round(fr.width * s)), int(round(fr.height * s))
         it = rec.intr[rec.cam_group[k]]
-        cams[k] = _Cam(rec.R[k], rec.C[k], it.f, it.k1, it.k2, it.cx, it.cy, fr.width, fr.height).scaled(w / fr.width, w, h)
+        cams[k] = _Cam(rec.R[k], rec.C[k], it.f, it.k1, it.k2, it.cx, it.cy, fr.width, fr.height, it.k3).scaled(w / fr.width, w, h)
         scales[k] = s
 
     cache, lock = OrderedDict(), threading.Lock()
@@ -514,7 +563,7 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
                 ray = _rays_world(D.shape, cr)
                 normal = _init_normals(D, ray)
                 srcs = [views(j)[0] for j in src_ids]
-                par = np.array([np.r_[cams[j].R.ravel(), cams[j].C, cams[j].f, cams[j].k1, cams[j].k2,
+                par = np.array([np.r_[cams[j].R.ravel(), cams[j].C, cams[j].f, cams[j].k1, cams[j].k2, cams[j].k3,
                                       cams[j].cx, cams[j].cy] for j in src_ids], np.float64)
                 sdeps = [np.ascontiguousarray(raw[j], np.float32) for j in src_ids]
                 rng = _depth_range(rec, k) or (float(np.nanmin(D)), float(np.nanmax(D)))
@@ -632,7 +681,7 @@ def camera_count(rec, minX: float, maxY: float, W: int, H: int, gsd: float, step
     count = np.zeros(xx.size, np.int32)
     for k in range(len(rec.used)):
         it = rec.intr[rec.cam_group[k]]
-        cam = _Cam(rec.R[k], rec.C[k], it.f, it.k1, it.k2, it.cx, it.cy, it.width, it.height)
+        cam = _Cam(rec.R[k], rec.C[k], it.f, it.k1, it.k2, it.cx, it.cy, it.width, it.height, it.k3)
         xc = (P - cam.C) @ cam.R.T
         u, v = cam.project_cam(xc[:, 0], xc[:, 1], xc[:, 2])
         count += (xc[:, 2] > 0) & (u >= 0) & (v >= 0) & (u <= it.width - 1) & (v <= it.height - 1)

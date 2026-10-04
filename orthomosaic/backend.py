@@ -61,13 +61,13 @@ class CPUBackend:
 
     def sample_view(self, img, cam, X0, Y0, gsd, Z):
         """Z: (H, W) heights, or a (D, H, W) stack of height hypotheses."""
-        R, C, f, k1, k2, cx, cy = cam
+        R, C, f, k1, k2, k3, cx, cy = cam
         Z = np.ascontiguousarray(Z, np.float32)
         out = np.zeros(Z.shape + (img.shape[2],), np.float32)
         valid = np.zeros(Z.shape, np.uint8)
         Zs, os_, vs = Z.reshape((-1,) + Z.shape[-2:]), out.reshape((-1,) + out.shape[-3:]), valid.reshape((-1,) + Z.shape[-2:])
         for d in range(Zs.shape[0]):
-            _mvs.sample_view(img, R, C, float(f), float(k1), float(k2), float(cx), float(cy),
+            _mvs.sample_view(img, R, C, float(f), float(k1), float(k2), float(k3), float(cx), float(cy),
                              float(X0), float(Y0), float(gsd), Zs[d], os_[d], vs[d])
         return out, valid
 

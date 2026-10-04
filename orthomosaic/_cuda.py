@@ -91,7 +91,7 @@ void sample_view(const float* __restrict__ img, const int h, const int w, const 
                  const double r10, const double r11, const double r12,
                  const double r20, const double r21, const double r22,
                  const double c0, const double c1, const double c2,
-                 const double f, const double k1, const double k2, const double cx, const double cy,
+                 const double f, const double k1, const double k2, const double k3, const double cx, const double cy,
                  const double X0, const double Y0, const double gsd,
                  const float* __restrict__ Z, const int H, const int W, const int Hs,
                  float* __restrict__ out, unsigned char* __restrict__ valid)
@@ -109,7 +109,7 @@ void sample_view(const float* __restrict__ img, const int h, const int w, const 
     const double nx = (r00 * dx + r01 * dy + r02 * dz) / zc;
     const double ny = (r10 * dx + r11 * dy + r12 * dz) / zc;
     const double r2 = nx * nx + ny * ny;
-    const double d = 1.0 + k1 * r2 + k2 * r2 * r2;
+    const double d = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3));
     const double u = f * d * nx + cx, v = f * d * ny + cy;
     if (u < 0.0 || v < 0.0 || u > w - 1 || v > h - 1) return;
     const int x0 = (int)u, y0 = (int)v;
@@ -159,7 +159,7 @@ class CUDABackend:
             raise RuntimeError("CUDA self-test failed (warp)")
         z = cp.zeros((4, 4), cp.float32)
         s, v = self.sample_view(cp.ones((8, 8, 1), cp.float32), (np.diag([1.0, -1.0, -1.0]), np.array([0, 0, 10.0]),
-                                                                  10.0, 0.0, 0.0, 3.5, 3.5), -1.0, 1.0, 0.5, z)
+                                                                  10.0, 0.0, 0.0, 0.0, 3.5, 3.5), -1.0, 1.0, 0.5, z)
         a = cp.cumsum(cp.sort(s[..., 0], axis=0), axis=1)
         if float(cp.asnumpy(v).sum()) <= 0 or not np.isfinite(float(a.sum())):
             raise RuntimeError("CUDA self-test failed (sampler)")
@@ -217,7 +217,7 @@ class CUDABackend:
         return cp.asnumpy(out)
 
     def sample_view(self, img, cam, X0, Y0, gsd, Z):
-        R, C, f, k1, k2, cx, cy = cam
+        R, C, f, k1, k2, k3, cx, cy = cam
         Z = cp.ascontiguousarray(cp.asarray(Z, cp.float32))
         lead = Z.shape[:-2]
         Hs, W = Z.shape[-2:]
@@ -230,7 +230,7 @@ class CUDABackend:
         bs = (32, 8)
         grid = ((W + bs[0] - 1) // bs[0], (H + bs[1] - 1) // bs[1])
         _k_sample(grid, bs, (img, np.int32(h), np.int32(w), np.int32(nch), *Rf, *Cf,
-                             np.float64(f), np.float64(k1), np.float64(k2), np.float64(cx), np.float64(cy),
+                             np.float64(f), np.float64(k1), np.float64(k2), np.float64(k3), np.float64(cx), np.float64(cy),
                              np.float64(X0), np.float64(Y0), np.float64(gsd), Z, np.int32(H), np.int32(W),
                              np.int32(Hs), out, valid))
         return out.reshape(*lead, Hs, W, nch), valid.reshape(*lead, Hs, W)

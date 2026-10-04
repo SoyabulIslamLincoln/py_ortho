@@ -95,20 +95,28 @@ class Options3D(Options):
     gcp_sigma: float = 0.05                 # surveyed GCP accuracy in metres
 
 
-def _colorize(Z, valid):
-    """Hillshaded colour relief for a quick-look PNG."""
+def _colorize(Z, valid, gsd=1.0):
+    """Pix4D-style quick look: green -> yellow -> orange -> brown elevation ramp, multiplied by a
+    hillshade (sun from the north-west, 45 deg, slopes in metres) so edges, cars and roof units
+    read as relief."""
     z = np.where(valid, Z, np.nan)
     lo, hi = np.nanpercentile(z, [1, 99]) if np.isfinite(z).any() else (0, 1)
-    t = np.clip((np.nan_to_num(z, nan=lo) - lo) / max(hi - lo, 1e-6), 0, 1)
-    stops = np.array([[0.19, 0.30, 0.58], [0.20, 0.60, 0.55], [0.55, 0.75, 0.30], [0.93, 0.80, 0.35],
-                      [0.80, 0.40, 0.25], [0.95, 0.95, 0.95]])
+    zf = np.nan_to_num(z, nan=lo)
+    t = np.clip((zf - lo) / max(hi - lo, 1e-6), 0, 1)
+    stops = np.array([[0.00, 0.47, 0.00], [0.31, 0.75, 0.00], [0.90, 0.86, 0.00], [0.86, 0.51, 0.12],
+                      [0.67, 0.24, 0.08]])
     pos = t * (len(stops) - 1)
     i = np.clip(pos.astype(int), 0, len(stops) - 2)
     f = (pos - i)[..., None]
     rgb = stops[i] * (1 - f) + stops[i + 1] * f
-    gy, gx = np.gradient(np.nan_to_num(z, nan=lo))
-    shade = np.clip(0.75 + 0.9 * (-gx - gy) / (np.hypot(gx, gy) + 1.0) * 0.5, 0.35, 1.2)
+    gy, gx = np.gradient(zf, gsd)
+    slope = np.arctan(np.hypot(gx, gy))
+    aspect = np.arctan2(-gx, gy)
+    az, alt = np.radians(315.0), np.radians(45.0)
+    hs = np.sin(alt) * np.cos(slope) + np.cos(alt) * np.sin(slope) * np.cos(az - aspect)
+    shade = 0.35 + 0.75 * np.clip(hs, 0, 1)
     out = np.clip(rgb * shade[..., None] * 255, 0, 255).astype(np.uint8)
+    out[~valid] = 255                       # white outside the footprint (even where alpha is ignored)
     alpha = (valid * 255).astype(np.uint8)
     return np.dstack([out, alpha])
 
@@ -255,7 +263,7 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     for k, i in enumerate(rec.used):
         it = rec.intr[rec.cam_group[k]]
         cams[frames[i].name] = dict(R=rec.R[k].tolist(), C=(rec.C[k] + np.array(offset3)).tolist(),
-                                    f=it.f, k1=it.k1, k2=it.k2, cx=it.cx, cy=it.cy,
+                                    f=it.f, k1=it.k1, k2=it.k2, k3=it.k3, cx=it.cx, cy=it.cy,
                                     width=it.width, height=it.height)
 
     # ---- dense
@@ -408,7 +416,7 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         rgba[~ortho_valid, :3] = 0
     _write_raster(os.path.join(out_dir, "orthophoto.tif"), rgba, "rgba", epsg, origin_xy, o_gsd)
     pf = max(1, math.ceil(max(dsm.shape) / 2048))
-    Image.fromarray(_colorize(dsm, covered)[::pf, ::pf]).save(os.path.join(out_dir, "dsm_preview.png"))
+    Image.fromarray(_colorize(dsm, covered, gsd)[::pf, ::pf]).save(os.path.join(out_dir, "dsm_preview.png"))
     po = max(1, math.ceil(max(rgba.shape[:2]) / 2048))
     prev = Image.fromarray(rgba[::po, ::po], "RGBA")
     bg = Image.new("RGB", prev.size, (255, 255, 255))
@@ -427,7 +435,7 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         ndsm_raw = np.where(covered, np.maximum(dsm - dtm, 0.0), np.nan)
         _write_raster(os.path.join(out_dir, "ndsm.tif"), np.where(covered, ndsm_raw, NODATA).astype(np.float32),
                       "float32", epsg, origin_xy, gsd, NODATA)
-        Image.fromarray(_colorize(dtm, covered)[::pf, ::pf]).save(os.path.join(out_dir, "dtm_preview.png"))
+        Image.fromarray(_colorize(dtm, covered, gsd)[::pf, ::pf]).save(os.path.join(out_dir, "dtm_preview.png"))
         log.info("DTM: %.0f%% of the surface classified as ground (%.1fs)",
                  100 * ground.sum() / max(covered.sum(), 1), time.time() - t)
         #changed here: Pix4D elevation mapping -- contour lines from the bare-earth DTM

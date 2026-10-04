@@ -12,6 +12,7 @@ Pipeline (initialised from the robust 2D alignment, so no fragile incremental Sf
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 import time
@@ -48,7 +49,8 @@ class Reconstruction:
     obs_feat: Optional[np.ndarray] = None     # (M,) feature index per observation (-1 = GCP mark)
 
     def intr_array(self):
-        return np.array([[it.f, it.k1, it.k2] for it in self.intr], np.float64)
+        """(G, 6): f, k1, k2, k3, cx, cy -- the self-calibrated camera parameters."""
+        return np.array([[it.f, it.k1, it.k2, it.k3, it.cx, it.cy] for it in self.intr], np.float64)
 
     def pp_array(self):
         return np.array([[it.cx, it.cy] for it in self.intr], np.float64)
@@ -146,7 +148,8 @@ def triangulate(R, C, intr_arr, pp_arr, cam_group, obs_cam, obs_pt, obs_uv, n_po
     """Least-squares ray intersection (midpoint method), vectorised.
     Returns X (P,3) and the max ray-angle per point (degrees)."""
     g = cam_group[obs_cam]
-    n = undistort_normalized(obs_uv, intr_arr[g, 0], intr_arr[g, 1], intr_arr[g, 2], pp_arr[g, 0], pp_arr[g, 1])
+    n = undistort_normalized(obs_uv, intr_arr[g, 0], intr_arr[g, 1], intr_arr[g, 2], intr_arr[g, 4], intr_arr[g, 5],
+                             k3=intr_arr[g, 3])
     d_cam = np.column_stack([n, np.ones(len(n))])
     d = np.einsum("nji,nj->ni", R[obs_cam], d_cam)       # R^T d
     d /= np.linalg.norm(d, axis=1, keepdims=True)
@@ -178,8 +181,8 @@ def triangulate(R, C, intr_arr, pp_arr, cam_group, obs_cam, obs_pt, obs_uv, n_po
 class Priors:
     C_target: np.ndarray            # (N, 3)
     C_sigma: np.ndarray             # (N, 3)  inf = no prior
-    intr_target: np.ndarray         # (G, 3)
-    intr_sigma: np.ndarray          # (G, 3)
+    intr_target: np.ndarray         # (G, 6) f k1 k2 k3 cx cy
+    intr_sigma: np.ndarray          # (G, 6)
     X_weight: Optional[np.ndarray] = None   # (P, 3) 1/sigma^2 point-position prior (0 = tie point)
     axis_target: Optional[np.ndarray] = None  # (N, 3) gimbal optical-axis direction (world), NaN = none
     axis_weight: float = 0.0                # 1 / sigma_tilt^2 (radians)
@@ -220,7 +223,7 @@ def _apply_priors(S, g, C, intr, pri: Priors, N, R=None):
     cost += float(np.sum(wC * rC * rC))
     wI = np.where(np.isfinite(pri.intr_sigma), 1.0 / np.square(pri.intr_sigma), 0.0)
     rI = intr - pri.intr_target
-    idx = (6 * N + 3 * np.arange(len(intr))[:, None] + np.arange(3)[None]).ravel()
+    idx = (6 * N + 6 * np.arange(len(intr))[:, None] + np.arange(6)[None]).ravel()
     g[idx] += (wI * rI).ravel()
     S[idx, idx] += wI.ravel()
     cost += float(np.sum(wI * rI * rI))
@@ -251,7 +254,7 @@ def bundle_adjust(rec: Reconstruction, pri: Priors, huber: float, max_iter: int 
     uv = np.ascontiguousarray(rec.obs_uv, np.float64)
     ptr = np.searchsorted(op, np.arange(len(X) + 1)).astype(np.int64)
     N = len(R)
-    nc = 6 * N + 3 * len(intr)
+    nc = 6 * N + 6 * len(intr)
     if rec.pt_prior_w is not None:                     # control-point position priors live on rec
         pri.X_weight, pri.X_target = rec.pt_prior_w, rec.pt_prior_t
     pw, pt_tgt = pri.point_arrays(len(X))
@@ -271,7 +274,7 @@ def bundle_adjust(rec: Reconstruction, pri: Priors, huber: float, max_iter: int 
             dcam = dc[:6 * N].reshape(N, 6)
             R2 = np.ascontiguousarray(rodrigues(dcam[:, :3]) @ R)
             C2 = C + dcam[:, 3:]
-            I2 = intr + dc[6 * N:].reshape(-1, 3)
+            I2 = intr + dc[6 * N:].reshape(-1, 6)
             X2 = X + dp
             _, c2 = _ba.residuals(R2, C2, X2, I2, pp, cg, oc, op, uv, huber)
             c2 += _prior_cost(C2, I2, pri, X2, R2)
@@ -290,7 +293,7 @@ def bundle_adjust(rec: Reconstruction, pri: Priors, huber: float, max_iter: int 
             break
     rec.R, rec.C, rec.X = R, C, X
     for k, it in enumerate(rec.intr):
-        it.f, it.k1, it.k2 = (float(v) for v in intr[k])
+        it.f, it.k1, it.k2, it.k3, it.ppx, it.ppy = (float(v) for v in intr[k])
     err, _ = _ba.residuals(R, C, X, intr, pp, cg, oc, op, uv, huber)
     return err
 
@@ -360,7 +363,7 @@ def _extend_tracks(rec: Reconstruction, feats, radius: float, max_track: int = 8
         idx = idx[front]
         n = Xc[front, :2] / Xc[front, 2:3]
         r2 = np.sum(n * n, 1)
-        uv = (it.f * (1 + it.k1 * r2 + it.k2 * r2 * r2))[:, None] * n + (it.cx, it.cy)
+        uv = (it.f * (1 + r2 * (it.k1 + r2 * (it.k2 + r2 * it.k3))))[:, None] * n + (it.cx, it.cy)
         inb = (uv[:, 0] >= 0) & (uv[:, 0] < it.width) & (uv[:, 1] >= 0) & (uv[:, 1] < it.height)
         idx, uv = idx[inb], uv[inb]
         if len(idx) == 0:
@@ -496,6 +499,17 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
     N = len(used)
     R = np.stack([poses[i][0] for i in used])
     C = np.stack([poses[i][1] for i in used])
+    # camera positions start at GPS (as OpenSfM/Pix4D do), not at the 2D mosaic's image centres:
+    # a planar affine mosaic of a low flight over tall objects is distorted (on a 36 m flight its
+    # layout sat ~12 m from GPS and the block came out ~30% too small); the mosaic still gives yaw
+    if ar.positions is not None and al.georeferenced:
+        gps = np.array([ar.positions[i] for i in used], np.float64)
+        ok = np.isfinite(gps).all(1)
+        if ok.sum() >= 3:
+            C[ok, :2] = gps[ok]
+            # images without GPS keep their mosaic position, shifted to the GPS frame
+            if (~ok).any():
+                C[~ok, :2] += np.median(gps[ok] - np.stack([poses[i][1][:2] for i in np.asarray(used)[ok]]), 0)
     cam_group = np.array([cam_group_map[i] for i in used], np.int32)
 
     # ---- 1. plane + parallax matching on the verified pairs
@@ -576,8 +590,8 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
             log.warning("No focal length in EXIF: heights will be scaled by the focal-length error")
         else:
             I_s[k, 0] = 0.02 * it.f if refine_focal else 1e-4 * it.f
-        I_s[k, 1] = 0.3
-        I_s[k, 2] = 0.3
+        I_s[k, 1:4] = 0.3                     # radial k1..k3: free, softly regularised
+        I_s[k, 4:6] = 0.01 * it.width         # principal point: within ~1% of the width (Pix4D: ~2 px)
     pri = Priors(C_t, C_s, I_t, I_s)
     # gimbal attitude prior: DJI's stabilised gimbal reports pitch to ~1 deg; without it a nadir
     # block can drift into a common tilt (cameras and scene tilted together), which tilts the DSM
@@ -616,7 +630,9 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
         prev = float(keep.mean())
         log.info("  initial poses: only %.0f%% of observations triangulate consistently "
                  "(median error %.0f px); refining poses and re-triangulating", 100 * keep.mean(), np.median(err))
-        bundle_adjust(rec, pri, 8 * px)
+        # poses only: on this small, still-contaminated subset a free lens (k1-k3, principal
+        # point) would absorb pose errors and corrupt every later triangulation
+        bundle_adjust(rec, dataclasses.replace(pri, intr_sigma=np.full_like(pri.intr_sigma, 1e-9)), 8 * px)
     log.info("  %d points, %d observations pass the initial triangulation (%.0f%%)",
              len(rec.X), len(rec.obs_pt), 100 * keep.mean())
 
@@ -652,6 +668,7 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
     rec.stats = dict(points=int(len(rec.X)), observations=int(len(err)), pairs=len(results),
                      rms_px=rec.rms_px, focal_px=[it.f for it in rec.intr],
                      k1=[it.k1 for it in rec.intr], k2=[it.k2 for it in rec.intr],
+                     k3=[it.k3 for it in rec.intr], principal_point=[[it.cx, it.cy] for it in rec.intr],
                      z_datum="take-off (DJI relative altitude)" if has_rel_alt else "mean ground",
                      mean_track_length=float(len(rec.obs_pt) / max(len(rec.X), 1)),
                      # Pix4D quality-report quantities

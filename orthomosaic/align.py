@@ -305,6 +305,21 @@ def _solve_once(frames, pairs: list[PairMatch], positions: Optional[np.ndarray],
                 X, Y = ne.solve(scale_lock=L)
                 L = np.stack([np.stack([X[:, 0], X[:, 1]], 1), np.stack([Y[:, 0], Y[:, 1]], 1)], 1)
                 T = np.stack([X[:, 2], Y[:, 2]], 1)
+                # The joint solve measures match residuals in metres, so the image positions can
+                # still contract (smaller block = smaller residuals) against the weak GPS prior:
+                # on a 36 m flight it shrank the block to ~0.6-0.7 of its true size and every 3D
+                # product with it. Re-anchor the result to GPS with a similarity (as in stage 2):
+                # the matches keep the relative layout, GPS fixes scale, rotation and position.
+                z = T[gl[keep]][:, 0] + 1j * T[gl[keep]][:, 1]
+                wv_k = wv[keep]
+                zm, wm = z.mean(), wv_k.mean()
+                den = np.sum(np.abs(z - zm) ** 2)
+                if den > 1e-12:
+                    a2 = np.sum(np.conj(z - zm) * (wv_k - wm)) / den
+                    b2 = wm - a2 * zm
+                    S2 = np.array([[a2.real, -a2.imag], [a2.imag, a2.real]])
+                    L = np.einsum("ab,nbc->nac", S2, L)
+                    T = T @ S2.T + np.array([b2.real, b2.imag])
     if not georef:
         # world units = pixels of the reference image
         L = L * scl[ref]

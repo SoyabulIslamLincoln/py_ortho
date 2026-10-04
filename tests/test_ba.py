@@ -18,8 +18,9 @@ def _problem(seed=0):
     R = rodrigues(rng.normal(0, 0.05, (N, 3)) + np.array([np.pi, 0, 0]))   # looking down
     C = np.column_stack([rng.uniform(-5, 5, (N, 2)), np.full(N, 50.0)])
     X = np.column_stack([rng.uniform(-15, 15, (P, 2)), rng.uniform(0, 10, P)])
-    intr = np.array([[1000.0, -0.05, 0.01], [900.0, 0.02, 0.0]])
-    pp = np.array([[600.0, 450.0], [640.0, 512.0]])
+    # f, k1, k2, k3, cx, cy (pp is ignored by the kernels; principal point lives in intr)
+    intr = np.array([[1000.0, -0.05, 0.01, 0.02, 600.0, 450.0], [900.0, 0.02, 0.0, -0.01, 640.0, 512.0]])
+    pp = intr[:, 4:6].copy()
     cam_group = np.array([0, 0, 1, 1], np.int32)
     obs_cam, obs_pt = [], []
     for p in range(P):
@@ -35,7 +36,7 @@ def _problem(seed=0):
         n = xc[:2] / xc[2]
         r2 = n @ n
         g = cam_group[c]
-        uv[q] = intr[g, 0] * (1 + intr[g, 1] * r2 + intr[g, 2] * r2 * r2) * n + pp[g]
+        uv[q] = intr[g, 0] * (1 + intr[g, 1] * r2 + intr[g, 2] * r2 * r2 + intr[g, 3] * r2 ** 3) * n + intr[g, 4:6]
     uv += rng.normal(0, 2.0, uv.shape)
     pt_ptr = np.searchsorted(obs_pt, np.arange(P + 1)).astype(np.int64)
     return R, C, X, intr, pp, cam_group, obs_cam, obs_pt, uv, pt_ptr
@@ -48,14 +49,14 @@ def _residual_vec(R, C, X, intr, pp, cam_group, obs_cam, obs_pt, uv):
         n = xc[:2] / xc[2]
         r2 = n @ n
         g = cam_group[c]
-        out.append(intr[g, 0] * (1 + intr[g, 1] * r2 + intr[g, 2] * r2 * r2) * n + pp[g] - o)
+        out.append(intr[g, 0] * (1 + intr[g, 1] * r2 + intr[g, 2] * r2 * r2 + intr[g, 3] * r2 ** 3) * n + intr[g, 4:6] - o)
     return np.concatenate(out)
 
 
 def test_schur_matches_dense():
     R, C, X, intr, pp, cg, oc, op, uv, ptr = _problem()
     N, P, G = len(R), len(X), len(intr)
-    nc = 6 * N + 3 * G
+    nc = 6 * N + 6 * G
     huber = 1e9  # pure least squares for the comparison
     lam = 0.0
     zpw = np.zeros((P, 3))
@@ -64,7 +65,7 @@ def test_schur_matches_dense():
     def unpack(x):
         R2 = np.stack([rodrigues(x[6 * i:6 * i + 3]) @ R[i] for i in range(N)])
         C2 = C + x[:6 * N].reshape(N, 6)[:, 3:]
-        I2 = intr + x[6 * N:nc].reshape(G, 3)
+        I2 = intr + x[6 * N:nc].reshape(G, 6)
         X2 = X + x[nc:].reshape(P, 3)
         return R2, C2, X2, I2
 
@@ -72,7 +73,7 @@ def test_schur_matches_dense():
     r0 = _residual_vec(R, C, X, intr, pp, cg, oc, op, uv)
     J = np.zeros((len(r0), len(x0)))
     for k in range(len(x0)):
-        h = 1e-6 * (1e3 if 6 * N <= k < nc and (k - 6 * N) % 3 == 0 else 1.0)
+        h = 1e-6 * (1e3 if 6 * N <= k < nc and (k - 6 * N) % 6 == 0 else 1.0)
         xp = x0.copy()
         xp[k] += h
         xm = x0.copy()

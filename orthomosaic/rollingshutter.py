@@ -84,6 +84,7 @@ def correct_observations(rec, frames, readout_override: float = 0.0, only_electr
     f = np.array([t.f for t in it])[cam]
     k1 = np.array([t.k1 for t in it])[cam]
     k2 = np.array([t.k2 for t in it])[cam]
+    k3 = np.array([t.k3 for t in it])[cam]
     cx = np.array([t.cx for t in it])[cam]
     cy = np.array([t.cy for t in it])[cam]
     dt = ((rec.obs_uv[:, 1] + 0.5) / H - 0.5) * ro[cam]
@@ -94,7 +95,7 @@ def correct_observations(rec, frames, readout_override: float = 0.0, only_electr
         xc = np.einsum("nij,nj->ni", R, X - Cc)
         n = xc[:, :2] / xc[:, 2:3]
         r2 = np.sum(n * n, 1)
-        d = f * (1 + k1 * r2 + k2 * r2 * r2)
+        d = f * (1 + r2 * (k1 + r2 * (k2 + r2 * k3)))
         return np.stack([d * n[:, 0] + cx, d * n[:, 1] + cy], 1)
 
     C = rec.C[cam]

@@ -10,7 +10,7 @@ cnp.import_array()
 
 
 def sample_view(const float[:, :, ::1] img, const double[:, ::1] R, const double[::1] C,
-                double f, double k1, double k2, double cx, double cy,
+                double f, double k1, double k2, double k3, double cx, double cy,
                 double X0, double Y0, double gsd, const float[:, ::1] Z,
                 float[:, :, ::1] out, uint8_t[:, ::1] valid):
     """Grid cell (r, c) is the ground point (X0 + (c+.5) gsd, Y0 - (r+.5) gsd, Z[r, c]).
@@ -36,7 +36,7 @@ def sample_view(const float[:, :, ::1] img, const double[:, ::1] R, const double
                 nx = xc / zc
                 ny = yc / zc
                 r2 = nx * nx + ny * ny
-                d = 1.0 + k1 * r2 + k2 * r2 * r2
+                d = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))
                 u = f * d * nx + cx
                 v = f * d * ny + cy
                 if u < 0 or v < 0 or u > w - 1 or v > h - 1:

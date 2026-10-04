@@ -45,7 +45,7 @@ def test_gpu_backends_match_cpu():
         im = rng.uniform(0, 255, (200, 240, 3)).astype(np.float32)
         th = 0.05
         R = np.array([[1, 0, 0], [0, np.cos(np.pi + th), -np.sin(np.pi + th)], [0, np.sin(np.pi + th), np.cos(np.pi + th)]])
-        cam = (R, np.array([3.0, -2.0, 40.0]), 300.0, -0.05, 0.01, 119.5, 99.5)
+        cam = (R, np.array([3.0, -2.0, 40.0]), 300.0, -0.05, 0.01, 0.02, 119.5, 99.5)   # f k1 k2 k3 cx cy
         Z = rng.uniform(0, 8, (60, 70)).astype(np.float32)
         oc, vc = cpu.sample_view(im, cam, -10.0, 8.0, 0.25, Z)
         og, vg = gpu.sample_view(gpu.upload(im), cam, -10.0, 8.0, 0.25, gpu.asarray(Z, gpu.xp.float32))

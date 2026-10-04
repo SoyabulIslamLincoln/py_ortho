@@ -73,15 +73,15 @@ def _median3(xp, a):
 class _View:
     """A camera with an image pyramid, cached on the compute device."""
 
-    def __init__(self, gray_pyr, rgb, R, C, f, k1, k2, cx, cy):
+    def __init__(self, gray_pyr, rgb, R, C, f, k1, k2, cx, cy, k3=0.0):
         self.gray_pyr, self.rgb = gray_pyr, rgb
         self.R, self.C = R, C
-        self.f, self.k1, self.k2, self.cx, self.cy = f, k1, k2, cx, cy
+        self.f, self.k1, self.k2, self.k3, self.cx, self.cy = f, k1, k2, k3, cx, cy
 
     def cam(self, level):
         """Camera parameters in the pixel units of pyramid level `level`."""
         s = 0.5 ** level
-        return (self.R, self.C, self.f * s, self.k1, self.k2,
+        return (self.R, self.C, self.f * s, self.k1, self.k2, self.k3,
                 (self.cx + 0.5) * s - 0.5, (self.cy + 0.5) * s - 0.5)
 
     @property
@@ -180,7 +180,7 @@ def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions
         sx = rgb.shape[1] / fr.width
         return _View([backend.upload(p) for p in pyr], backend.upload(np.ascontiguousarray(rgb)),
                      np.ascontiguousarray(rec.R[k]), np.ascontiguousarray(rec.C[k]),
-                     it.f * sx, it.k1, it.k2, (it.cx + 0.5) * sx - 0.5, (it.cy + 0.5) * sx - 0.5)
+                     it.f * sx, it.k1, it.k2, (it.cx + 0.5) * sx - 0.5, (it.cy + 0.5) * sx - 0.5, it.k3)
 
     cache = ImageCache(load, lambda v: v.nbytes, opt.cache_mb * 1024 * 1024)
 

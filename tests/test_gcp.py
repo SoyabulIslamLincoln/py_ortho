@@ -42,7 +42,7 @@ def test_point_prior_pulls_point():
     R = rodrigues(rng.normal(0, 0.03, (N, 3)) + [np.pi, 0, 0])
     C = np.c_[rng.uniform(-3, 3, (N, 2)), np.full(N, 40.0)]
     X = np.c_[rng.uniform(-10, 10, (P, 2)), rng.uniform(0, 3, P)]
-    intr = np.array([[900.0, 0.0, 0.0]])
+    intr = np.array([[900.0, 0.0, 0.0, 0.0, 600.0, 450.0]])
     pp = np.array([[600.0, 450.0]])
     cg = np.zeros(N, np.int32)
     oc = np.repeat(np.arange(N), P).astype(np.int32)
@@ -113,7 +113,7 @@ def test_gcp_anchors_block():
     sfm._add_gcps(rec, frames, list(range(N)), gdict, gcp_sigma=0.02)
     # loose camera prior (just gauge stabilisation); the GCPs do the absolute anchoring
     pri = sfm.Priors(rec.C.copy(), np.full((N, 3), 50.0), rec.intr_array(),
-                     np.full((1, 3), np.inf))
+                     np.full((1, 6), np.inf))
     for _ in range(4):
         err = sfm.bundle_adjust(rec, pri, huber=1e9)
     rep = sfm.gcp_report(rec, None)

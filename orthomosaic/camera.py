@@ -5,8 +5,9 @@ Conventions
 World: local East-North-Up metres (UTM minus a rounded origin; Z = height above
 take-off when DJI relative altitude is available).
 Camera:  x_c = R @ (X - C)   with x right, y down (image axes), z forward (viewing direction).
-Pixels:  n = x_c[:2] / x_c[2];  d = 1 + k1 r^2 + k2 r^4;  uv = f * d * n + (cx, cy)
-         (cx, cy) is the image centre in full-resolution pixel-centre coordinates.
+Pixels:  n = x_c[:2] / x_c[2];  d = 1 + k1 r^2 + k2 r^4 + k3 r^6;  uv = f * d * n + (cx, cy)
+         (cx, cy) is the principal point in full-resolution pixel-centre coordinates (the image
+         centre until the bundle adjustment refines it, as Pix4D/ODM do).
 """
 from __future__ import annotations
 
@@ -27,14 +28,17 @@ class Intrinsics:
     k2: float = 0.0
     f_known: bool = True
     images: list = field(default_factory=list)
+    k3: float = 0.0
+    ppx: float = None   # principal point (full-resolution pixels); None = image centre
+    ppy: float = None
 
     @property
     def cx(self) -> float:
-        return (self.width - 1) / 2.0
+        return (self.width - 1) / 2.0 if self.ppx is None else self.ppx
 
     @property
     def cy(self) -> float:
-        return (self.height - 1) / 2.0
+        return (self.height - 1) / 2.0 if self.ppy is None else self.ppy
 
 
 def focal_from_exif(frame) -> tuple[float, bool]:
@@ -90,24 +94,24 @@ def orthonormalize(R: np.ndarray) -> np.ndarray:
 # projection / back-projection (numpy, vectorised)
 # --------------------------------------------------------------------------
 
-def project(R, C, X, f, k1, k2, cx, cy):
+def project(R, C, X, f, k1, k2, cx, cy, k3=0.0):
     """R (n,3,3), C (n,3), X (n,3), per-row intrinsics (n,) -> uv (n,2), depth (n,)."""
     xc = np.einsum("nij,nj->ni", R, X - C)
     z = xc[:, 2]
     n = xc[:, :2] / z[:, None]
     r2 = np.sum(n * n, axis=1)
-    d = 1 + k1 * r2 + k2 * r2 * r2
+    d = 1 + r2 * (k1 + r2 * (k2 + r2 * k3))
     uv = (f * d)[:, None] * n + np.stack([cx, cy], 1)
     return uv, z
 
 
-def undistort_normalized(uv, f, k1, k2, cx, cy, iters: int = 8):
+def undistort_normalized(uv, f, k1, k2, cx, cy, iters: int = 8, k3=0.0):
     """Pixels -> undistorted normalised image coordinates (n,2)."""
     nd = (uv - np.stack([cx, cy], 1)) / f[:, None]
     n = nd.copy()
     for _ in range(iters):
         r2 = np.sum(n * n, axis=1)
-        n = nd / (1 + k1 * r2 + k2 * r2 * r2)[:, None]
+        n = nd / (1 + r2 * (k1 + r2 * (k2 + r2 * k3)))[:, None]
     return n
 
 

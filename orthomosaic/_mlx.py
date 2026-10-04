@@ -72,7 +72,7 @@ _SAMPLE = r"""
     float nx = (fp[0] * dx + fp[1] * dy + fp[2] * dz) / zc;
     float ny = (fp[3] * dx + fp[4] * dy + fp[5] * dz) / zc;
     float r2 = nx * nx + ny * ny;
-    float dd = 1.0f + fp[13] * r2 + fp[14] * r2 * r2;
+    float dd = 1.0f + r2 * (fp[13] + r2 * (fp[14] + r2 * fp[20]));
     float u = fp[12] * dd * nx + fp[15], v = fp[12] * dd * ny + fp[16];
     if (u < 0.0f || v < 0.0f || u > w - 1 || v > h - 1) return;
     int x0 = int(u), y0 = int(v);
@@ -165,14 +165,14 @@ class MLXBackend:
 
     # -- dense 3D -----------------------------------------------------------------
     def sample_view(self, img, cam, X0, Y0, gsd, Z):
-        R, C, f, k1, k2, cx, cy = cam
+        R, C, f, k1, k2, k3, cx, cy = cam
         Z = Z.astype(mx.float32) if isinstance(Z, mx.array) else mx.array(np.asarray(Z, np.float32))
         lead = Z.shape[:-2]                        # optional batch of height hypotheses
         Hs, W = Z.shape[-2:]
         H = int(np.prod(lead, dtype=np.int64)) * Hs if lead else Hs
         h, w, nch = img.shape
         fp = mx.array(np.concatenate([np.asarray(R, np.float64).ravel(), np.asarray(C, np.float64).ravel(),
-                                      [f, k1, k2, cx, cy, X0, Y0, gsd]]).astype(np.float32))
+                                      [f, k1, k2, cx, cy, X0, Y0, gsd, k3]]).astype(np.float32))
         ip = mx.array(np.array([h, w, nch, H, W, Hs], np.int32))
         out, valid = _k_sample(inputs=[img, Z, fp, ip], grid=(W, H, 1), threadgroup=(32, 8, 1),
                                output_shapes=[(H, W, nch), (H, W)], output_dtypes=[mx.float32, mx.uint8],
@@ -245,7 +245,7 @@ class MLXBackend:
         if self.finalize(blk, 0)[..., 3].max() != 255:
             raise RuntimeError("Metal self-test failed (warp)")
         s, v = self.sample_view(mx.ones((8, 8, 1), mx.float32),
-                                (np.diag([1.0, -1.0, -1.0]), np.array([0, 0, 10.0]), 10.0, 0.0, 0.0, 3.5, 3.5),
+                                (np.diag([1.0, -1.0, -1.0]), np.array([0, 0, 10.0]), 10.0, 0.0, 0.0, 0.0, 3.5, 3.5),
                                 -1.0, 1.0, 0.5, mx.zeros((4, 4), mx.float32))
         if int(np.array(v).sum()) != 16 or abs(float(np.array(s).mean()) - 1.0) > 1e-5:
             raise RuntimeError("Metal self-test failed (sampler)")

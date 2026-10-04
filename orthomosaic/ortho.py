@@ -169,7 +169,7 @@ def _global_sources(rec, dsm, minX, maxY, gsd, use_occ, occ_steps, occ_tol, zmax
         front = z > 1e-6
         nrm = xc[:, :2] / np.where(front, z, 1.0)[:, None]
         r2 = (nrm * nrm).sum(1)
-        uv = (it.f * (1 + it.k1 * r2 + it.k2 * r2 * r2))[:, None] * nrm + (it.cx, it.cy)
+        uv = (it.f * (1 + r2 * (it.k1 + r2 * (it.k2 + r2 * it.k3))))[:, None] * nrm + (it.cx, it.cy)
         bu = np.minimum(uv[:, 0], it.width - 1 - uv[:, 0]) / (0.5 * it.width)
         bv = np.minimum(uv[:, 1], it.height - 1 - uv[:, 1]) / (0.5 * it.height)
         border = np.minimum(bu, bv)
@@ -313,7 +313,7 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
         sx = rgb.shape[1] / fr.width
         return _View([], np.ascontiguousarray(rgb) if u8 else backend.upload(np.ascontiguousarray(rgb)),
                      np.ascontiguousarray(rec.R[k]), np.ascontiguousarray(rec.C[k]),
-                     it.f * sx, it.k1, it.k2, (it.cx + 0.5) * sx - 0.5, (it.cy + 0.5) * sx - 0.5)
+                     it.f * sx, it.k1, it.k2, (it.cx + 0.5) * sx - 0.5, (it.cy + 0.5) * sx - 0.5, it.k3)
 
     u8 = backend.name == "cpu" and _dense is not None and hasattr(_dense, "sample_view_u8")
     cache = ImageCache(load, lambda v: v.nbytes, int(g("cache_mb")) * 1024 * 1024)
@@ -322,11 +322,11 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
         if not u8:
             rv, vv = backend.sample_view(v.rgb, v.cam(0), X0, Y0, gsd, Ztile)
             return backend.to_numpy(rv), backend.to_numpy(vv)
-        R, C, f, k1, k2, cx, cy = v.cam(0)
+        R, C, f, k1, k2, k3, cx, cy = v.cam(0)
         out = np.zeros(Ztile.shape + (4,), np.float32)     # cells a photo misses stay 0, never garbage
         val = np.zeros(Ztile.shape, np.uint8)
         _dense.sample_view_u8(v.rgb, np.ascontiguousarray(R, np.float64), np.ascontiguousarray(C, np.float64),
-                              float(f), float(k1), float(k2), float(cx), float(cy), float(X0), float(Y0), float(gsd),
+                              float(f), float(k1), float(k2), float(k3), float(cx), float(cy), float(X0), float(Y0), float(gsd),
                               np.ascontiguousarray(Ztile, np.float32), out, val)
         out[..., 3] *= 1.0 / 255.0
         return out, val

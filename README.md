@@ -167,7 +167,8 @@ offset to absolute altitude.
    (each tie point is looked up in every other photo that sees it), Levenberg–Marquardt
    bundle adjustment (Schur complement, Huber loss) with GPS / barometric-altitude / GCP priors,
    a **gimbal attitude prior** (DJI pitch/roll, σ 2°) that stops a nadir block from drifting into
-   a common tilt, and lens self-calibration. Optional rolling-shutter correction.
+   a common tilt, and lens self-calibration (focal, principal point, radial k1-k3, as Pix4D).
+   Optional rolling-shutter correction.
 3. **Dense matching** — one depth map per photo: coarse-to-fine multi-view plane sweep (NCC,
    ¼ → ½ → full of `depth_max_image`, C kernels), geometric consistency across neighbouring depth
    maps, fusion into a 3D cloud. Settings adapt to each flight instead of being hand-tuned:

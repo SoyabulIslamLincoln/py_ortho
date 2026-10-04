@@ -12,7 +12,7 @@ cimport numpy as cnp
 # ---------------------------------------------------------------- depth maps
 def ncc_warp(const float[:, ::1] ref, const float[:, ::1] mu_i, const float[:, ::1] sd_i,
              const float[:, ::1] src, const float[:, :, ::1] ray, const double[:, ::1] Rs, const double[::1] b,
-             double f, double k1, double k2, double cx, double cy,
+             double f, double k1, double k2, double k3, double cx, double cy,
              const float[:, ::1] inv, int r, float[:, ::1] out,
              float[:, ::1] J, float[:, ::1] V, float[:, :, ::1] hs):
     """NCC of the reference against one source at per-pixel inverse depth `inv`.
@@ -47,7 +47,7 @@ def ncc_warp(const float[:, ::1] ref, const float[:, ::1] mu_i, const float[:, :
                 nx = X / Z
                 ny = Y / Z
                 r2 = nx * nx + ny * ny
-                dd = f * (1 + k1 * r2 + k2 * r2 * r2)
+                dd = f * (1 + r2 * (k1 + r2 * (k2 + r2 * k3)))
                 u = dd * nx + cx
                 v = dd * ny + cy
                 if u < 0 or v < 0 or u > w - 1.001 or v > h - 1.001:
@@ -427,7 +427,7 @@ cdef struct PMCtx:
 
 
 cdef inline int _proj(const double* p, double X, double Y, double Z, double* u, double* v, double* z) nogil:
-    """par layout: R(9) C(3) f k1 k2 cx cy."""
+    """par layout: R(9) C(3) f k1 k2 k3 cx cy (18 values per camera)."""
     cdef double dx = X - p[9], dy = Y - p[10], dz = Z - p[11]
     cdef double xc = p[0] * dx + p[1] * dy + p[2] * dz
     cdef double yc = p[3] * dx + p[4] * dy + p[5] * dz
@@ -438,9 +438,9 @@ cdef inline int _proj(const double* p, double X, double Y, double Z, double* u, 
     nx = xc / zc
     ny = yc / zc
     r2 = nx * nx + ny * ny
-    dd = p[12] * (1 + p[13] * r2 + p[14] * r2 * r2)
-    u[0] = dd * nx + p[15]
-    v[0] = dd * ny + p[16]
+    dd = p[12] * (1 + r2 * (p[13] + r2 * (p[14] + r2 * p[15])))
+    u[0] = dd * nx + p[16]
+    v[0] = dd * ny + p[17]
     z[0] = zc
     return 1
 
@@ -502,7 +502,7 @@ cdef double _pm_cost(PMCtx* c, int y, int x, double d, const double* n, double* 
             Z = c.cr2 + t * c.ray[2 * HW + q]
             nsamp += 1
             for s in range(c.S):
-                if _proj(c.par + 17 * s, X, Y, Z, &u, &v, &z):
+                if _proj(c.par + 18 * s, X, Y, Z, &u, &v, &z):
                     J = _bil(c.img[s], c.iw[s], c.ih[s], u, v)
                     if isfinite(J):
                         sI[s] += I; sJ[s] += J; sII[s] += I * I; sJJ[s] += J * J; sIJ[s] += I * J; cnt[s] += 1
@@ -541,7 +541,7 @@ cdef double _pm_cost(PMCtx* c, int y, int x, double d, const double* n, double* 
                 continue
             ng += 1
             e = 1.0
-            if _proj(c.par + 17 * s, X, Y, Z, &u, &v, &z):
+            if _proj(c.par + 18 * s, X, Y, Z, &u, &v, &z):
                 ui = <int>(u + 0.5)
                 vv = <int>(v + 0.5)
                 if ui >= 0 and vv >= 0 and ui < c.iw[s] and vv < c.ih[s]:
@@ -668,7 +668,7 @@ def pm_refine(const float[:, ::1] ref, const float[:, :, ::1] ray, const double[
 
 # ---------------------------------------------------------------- orthophoto sampling (8-bit images)
 def sample_view_u8(const unsigned char[:, :, ::1] img, const double[:, ::1] R, const double[::1] C,
-                   double f, double k1, double k2, double cx, double cy,
+                   double f, double k1, double k2, double k3, double cx, double cy,
                    double X0, double Y0, double gsd, const float[:, ::1] Z,
                    float[:, :, ::1] out, unsigned char[:, ::1] valid):
     """_mvs.sample_view for uint8 images (4x less cache memory than float32): grid cell (r, c) is
@@ -694,7 +694,7 @@ def sample_view_u8(const unsigned char[:, :, ::1] img, const double[:, ::1] R, c
                 nx = xc / zc
                 ny = yc / zc
                 r2 = nx * nx + ny * ny
-                d = 1.0 + k1 * r2 + k2 * r2 * r2
+                d = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))
                 u = f * d * nx + cx
                 v = f * d * ny + cy
                 if u < 0 or v < 0 or u > w - 1 or v > h - 1:

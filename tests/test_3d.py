@@ -36,7 +36,7 @@ def test_triangulate_exact():
     R = rodrigues(np.column_stack([np.full(N, np.pi), rng.normal(0, 0.03, (N, 2))]))
     C = np.column_stack([rng.uniform(-10, 10, (N, 2)), np.full(N, 60.0)])
     X = np.column_stack([rng.uniform(-15, 15, (P, 2)), rng.uniform(0, 15, P)])
-    intr = np.array([[1200.0, -0.05, 0.01]])
+    intr = np.array([[1200.0, -0.05, 0.01, 0.0, 600.0, 450.0]])
     pp = np.array([[600.0, 450.0]])
     cg = np.zeros(N, np.int32)
     oc = np.repeat(np.arange(N, dtype=np.int32)[None], P, 0).ravel()
@@ -57,7 +57,7 @@ def test_sample_view_projects_ground():
     f = 100.0
     X, Y = (60 - 49.5) / f * 10, -(50 - 49.5) / f * 10
     Z = np.zeros((1, 1), np.float32)
-    out, valid = be.sample_view(img, (R, C, f, 0.0, 0.0, 49.5, 49.5), X - 0.005, Y + 0.005, 0.01, Z)
+    out, valid = be.sample_view(img, (R, C, f, 0.0, 0.0, 0.0, 49.5, 49.5), X - 0.005, Y + 0.005, 0.01, Z)
     assert valid[0, 0] == 1 and abs(out[0, 0, 0] - 1.0) < 1e-4
 
 
