@@ -376,13 +376,13 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
 
     # ---- thermal: the dense colours are raw values (gray); keep them and colour with the palette
     if thermal:
-        from .thermal import legend, palette_lut
+        from .thermal import apply_contrast, legend, palette_lut
         lo, hi = ar.thermal_range
         raw = np.where(covered, lo + dense.rgb[..., 0].astype(np.float32) * ((hi - lo) / 255.0), np.nan)
         _write_raster(os.path.join(out_dir, "orthophoto_thermal.tif"), raw.astype(np.float32), "float32", epsg,
                       origin_xy, gsd, float("nan"))
-        colors = palette_lut(opt.palette)[dense.rgb[..., 0]]
-        legend(os.path.join(out_dir, "thermal_legend.png"), opt.palette, ar.thermal_range)
+        colors = palette_lut(opt.palette)[apply_contrast(dense.rgb[..., 0], covered, opt.contrast)]
+        legend(os.path.join(out_dir, "thermal_legend.png"), opt.palette, ar.thermal_range, contrast=opt.contrast)
 
     # ---- rasters
     dsm_out = np.where(covered, dsm, NODATA).astype(np.float32)
@@ -590,7 +590,7 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                             classes="ASPRS 2 ground / 3 low veg / 5 high veg / 6 building")
         if cls is not None else None,
         dense_points=int(len(xyz)), outputs=outputs, seconds=round(time.time() - t0, 1),
-        thermal=(dict(raw_range=list(ar.thermal_range), palette=opt.palette, raw_values="orthophoto_thermal.tif",
+        thermal=(dict(raw_range=list(ar.thermal_range), palette=opt.palette, contrast=opt.contrast, raw_values="orthophoto_thermal.tif",
                       legend="thermal_legend.png") if thermal else None),
         options={k: (list(v) if isinstance(v, tuple) else v) for k, v in asdict(opt).items()},
         cameras=cams,
@@ -615,7 +615,8 @@ def build_thermal_bound(rgb_images, thermal_images, out_dir, options: Optional[O
     opt = options or Options3D()
     topt = thermal_options or Options3D(backend=opt.backend, workers=opt.workers, gps_sigma=opt.gps_sigma,
                                         feature_max_dim=4000, n_features=8000, neighbors=16, min_inliers=15,
-                                        exposure_compensation=False, palette=opt.palette, gcp=opt.gcp,
+                                        exposure_compensation=False, palette=opt.palette,
+                                        contrast=opt.contrast, gcp=opt.gcp,
                                         gcp_sigma=opt.gcp_sigma, dsm_resolution=opt.dsm_resolution)
     t0 = time.time()
     os.makedirs(out_dir, exist_ok=True)

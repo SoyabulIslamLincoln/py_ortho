@@ -75,6 +75,79 @@ def apply_palette(gray: np.ndarray, palette: PaletteSpec = DEFAULT_PALETTE) -> n
     return palette_lut(palette)[np.asarray(gray, np.uint8)]
 
 
+CONTRASTS = ("linear", "equalize", "clahe")
+
+
+def _equalize_lut(hist: np.ndarray) -> np.ndarray:
+    """256-entry index remap that flattens a histogram (identity when it is empty)."""
+    cdf = np.cumsum(hist, dtype=np.float64)
+    if cdf[-1] <= 0:
+        return np.arange(256, dtype=np.float32)
+    lo = cdf[np.flatnonzero(hist)[0]]
+    return np.clip((cdf - lo) * (255.0 / max(cdf[-1] - lo, 1.0)), 0, 255).astype(np.float32)
+
+
+def apply_contrast(gray: np.ndarray, valid: Optional[np.ndarray] = None, contrast: str = "linear",
+                   clip_limit: float = 2.0, tiles: int = 8) -> np.ndarray:
+    """Re-map a uint8 index image before the palette: linear (unchanged), equalize (global
+    histogram equalisation) or clahe (contrast-limited adaptive equalisation, `tiles` x `tiles`
+    grid, OpenCV-style clip limit). Statistics use only `valid` pixels; display only - the
+    raw-value raster is never touched."""
+    gray = np.asarray(gray, np.uint8)
+    contrast = contrast.lower()
+    if contrast not in CONTRASTS:
+        raise ValueError(f"Unknown contrast '{contrast}'. Available: {', '.join(CONTRASTS)}")
+    if valid is None:
+        valid = np.ones(gray.shape, bool)
+    if contrast == "linear" or not valid.any():
+        return gray
+    if contrast == "equalize":
+        lut = _equalize_lut(np.bincount(gray[valid], minlength=256))
+        out = gray.copy()
+        out[valid] = (lut[gray[valid]] + 0.5).astype(np.uint8)
+        return out
+
+    H, W = gray.shape
+    ny, nx = min(tiles, H), min(tiles, W)
+    ys = np.linspace(0, H, ny + 1).round().astype(int)
+    xs = np.linspace(0, W, nx + 1).round().astype(int)
+    fallback = _equalize_lut(np.bincount(gray[valid], minlength=256))
+    luts = np.empty((ny, nx, 256), np.float32)
+    for i in range(ny):
+        for j in range(nx):
+            g = gray[ys[i]:ys[i + 1], xs[j]:xs[j + 1]][valid[ys[i]:ys[i + 1], xs[j]:xs[j + 1]]]
+            if g.size == 0:
+                luts[i, j] = fallback
+                continue
+            hist = np.bincount(g, minlength=256).astype(np.float64)
+            limit = max(clip_limit * g.size / 256.0, 1.0)
+            excess = np.maximum(hist - limit, 0).sum()
+            hist = np.minimum(hist, limit) + excess / 256.0       # clip and redistribute evenly
+            cdf = np.cumsum(hist)
+            luts[i, j] = np.clip(cdf * (255.0 / cdf[-1]), 0, 255)
+    # bilinear blend of the four nearest tile mappings (tile centres), in row strips to bound memory
+    cy = (ys[:-1] + ys[1:]) / 2.0
+    cx = (xs[:-1] + xs[1:]) / 2.0
+    fx = np.interp(np.arange(W) + 0.5, cx, np.arange(nx))
+    x0 = np.floor(fx).astype(int)
+    x1 = np.minimum(x0 + 1, nx - 1)
+    wx = (fx - x0).astype(np.float32)
+    out = gray.copy()
+    for r0 in range(0, H, 512):
+        r1 = min(r0 + 512, H)
+        fy = np.interp(np.arange(r0, r1) + 0.5, cy, np.arange(ny))
+        y0 = np.floor(fy).astype(int)
+        y1 = np.minimum(y0 + 1, ny - 1)
+        wy = (fy - y0).astype(np.float32)[:, None]
+        g = gray[r0:r1]
+        top = luts[y0[:, None], x0, g] * (1 - wx) + luts[y0[:, None], x1, g] * wx
+        bot = luts[y1[:, None], x0, g] * (1 - wx) + luts[y1[:, None], x1, g] * wx
+        blk = np.clip(top * (1 - wy) + bot * wy + 0.5, 0, 255).astype(np.uint8)
+        v = valid[r0:r1]
+        out[r0:r1][v] = blk[v]
+    return out
+
+
 def colorize_rgba(rgba: np.ndarray, lut: np.ndarray) -> np.ndarray:
     """Replace the (gray) RGB of an RGBA block by palette colours; transparent stays transparent."""
     out = rgba.copy()
@@ -157,8 +230,9 @@ def survey_range(frames, sample: int = 40, pct=(0.5, 99.5)) -> tuple[float, floa
 # products
 # --------------------------------------------------------------------------
 
-def legend(path: str, palette: PaletteSpec, value_range: tuple[float, float], label: str = "raw sensor value"):
-    """Small colour-bar PNG with the value range."""
+def legend(path: str, palette: PaletteSpec, value_range: tuple[float, float], label: str = "raw sensor value",
+           contrast: str = "linear"):
+    """Small colour-bar PNG with the value range (a non-linear contrast only marks the ends)."""
     from PIL import Image, ImageDraw
     lut = palette_lut(palette)
     W, H, bar = 360, 70, 22
@@ -167,17 +241,21 @@ def legend(path: str, palette: PaletteSpec, value_range: tuple[float, float], la
     img.paste(Image.fromarray(strip), (20, 10))
     d = ImageDraw.Draw(img)
     lo, hi = value_range
-    for frac in (0.0, 0.5, 1.0):
+    for frac in ((0.0, 0.5, 1.0) if contrast == "linear" else (0.0, 1.0)):
         x = 20 + frac * (W - 41)
         d.line([(x, 10 + bar), (x, 16 + bar)], fill="black")
         txt = f"{lo + frac * (hi - lo):.0f}"
         d.text((x - 4 * len(txt) / 2 * 1.5, 18 + bar), txt, fill="black")
-    d.text((20, H - 14), f"{label} ({palette if isinstance(palette, str) else 'custom'})", fill="black")
+    name = palette if isinstance(palette, str) else "custom"
+    if contrast != "linear":
+        name += f", {contrast}: non-linear scale"
+    d.text((20, H - 14), f"{label} ({name})", fill="black")
     img.save(path)
 
 
 def recolor(thermal_tif: str, out_tif: str, palette: PaletteSpec = DEFAULT_PALETTE,
-            value_range: Optional[tuple[float, float]] = None, legend_png: Optional[str] = None) -> str:
+            value_range: Optional[tuple[float, float]] = None, legend_png: Optional[str] = None,
+            contrast: str = "linear") -> str:
     """Re-render a raw-value thermal GeoTIFF (from build_orthomosaic / build_3d) with another palette."""
     from .geotiff import GeoTIFFWriter, read_geotiff
     val, geo = read_geotiff(thermal_tif)
@@ -187,7 +265,7 @@ def recolor(thermal_tif: str, out_tif: str, palette: PaletteSpec = DEFAULT_PALET
     lo, hi = value_range
     gray = np.clip((np.where(valid, val, lo) - lo) * (255.0 / max(hi - lo, 1e-6)) + 0.5, 0, 255).astype(np.uint8)
     rgba = np.zeros(val.shape + (4,), np.uint8)
-    rgba[..., :3] = palette_lut(palette)[gray]
+    rgba[..., :3] = palette_lut(palette)[apply_contrast(gray, valid, contrast)]
     rgba[..., 3] = valid * 255
     rgba[~valid, :3] = 0
     H, W = val.shape
@@ -199,7 +277,7 @@ def recolor(thermal_tif: str, out_tif: str, palette: PaletteSpec = DEFAULT_PALET
                 w.write_tile(tx // 512, ty // 512, w.compress_tile(blk))
     w.close()
     if legend_png:
-        legend(legend_png, palette, value_range)
+        legend(legend_png, palette, value_range, contrast=contrast)
     return out_tif
 
 
@@ -212,12 +290,14 @@ def main(argv=None):
     r.add_argument("-o", "--output", required=True)
     r.add_argument("--palette", default=DEFAULT_PALETTE)
     r.add_argument("--range", nargs=2, type=float, metavar=("MIN", "MAX"), help="value range (default: auto)")
+    r.add_argument("--contrast", choices=CONTRASTS, default="linear",
+                   help="linear (auto range), equalize (histogram) or clahe (local contrast)")
     a = ap.parse_args(argv)
     if a.cmd == "list":
         print("\n".join(palette_names()))
         return
     recolor(a.thermal_tif, a.output, a.palette, tuple(a.range) if a.range else None,
-            legend_png=a.output.rsplit(".", 1)[0] + "_legend.png")
+            legend_png=a.output.rsplit(".", 1)[0] + "_legend.png", contrast=a.contrast)
     print(a.output)
 
 

@@ -51,6 +51,7 @@ class Options:
     # thermal (DJI radiometric R-JPEG): mosaic raw sensor values, colour with a palette at the end
     thermal: str = "auto"              # auto (use raw data when every image has it) | off
     palette: str = "rainbow"           # rainbow | iron | white_hot | black_hot | arctic | lava | ... (see thermal.py)
+    contrast: str = "linear"           # linear | equalize | clahe - display only, applied by build_3d before the palette
 
 
 def _thermal_spec(ar, opt, output):
