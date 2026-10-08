@@ -84,13 +84,14 @@ def _run_old(ref, mu, sd, srcs, ray, geo, cams, hyps, r, top_k):
     return st, idx
 
 
-def _run_new(ref, mu, sd, srcs, ray, geo, cams, hyps, r, top_k):
+def _run_new(ref, mu, sd, srcs, ray, geo, cams, hyps, r, top_k, cached=False):
     H, W = ref.shape
     G = np.array([np.r_[Rs.ravel(), b, c] for (Rs, b), c in zip(geo, cams)], np.float64)
     st = [np.full((H, W), -2.0, np.float32) for _ in range(4)]
     idx = np.full((H, W), -1, np.int32)
+    rotated = _dense.sweep_rays(ray, G) if cached else None
     for i, inv in enumerate(hyps):
-        _dense.sweep_hypothesis(ref, mu, sd, srcs, ray, G, inv, r, top_k, i, st[0], st[1], st[2], st[3], idx)
+        _dense.sweep_hypothesis(ref, mu, sd, srcs, ray, G, inv, r, top_k, i, st[0], st[1], st[2], st[3], idx, rotated)
     return st, idx
 
 
@@ -104,6 +105,8 @@ def test_sweep_hypothesis_matches_ncc_warp_combine():
         assert _same(ia, ib), (H, W, n, r)
         for x, y in zip(a, b):
             assert _same(x, y), (H, W, n, r)
+        c, ic = _run_new(*case, r, top_k, cached=True)
+        assert _same(ia, ic) and all(_same(x, y) for x, y in zip(a, c)), (H, W, n, r, 'cached')
     # equal scores everywhere (flat images): ties keep the first hypothesis, as before
     ref, mu, sd, srcs, ray, geo, cams, hyps = _sweep_case(rng, 20, 24, 3, 2, 2, 5, 0.0)
     flat = [np.ones_like(s) for s in srcs]
@@ -117,7 +120,7 @@ def test_sweep_end_to_end_matches_reference_loop():
     from orthomosaic import densify
     rng = np.random.default_rng(3)
     H, W = 45, 61
-    ref, mu, sd, srcs, ray, geo, cams, hyps = _sweep_case(rng, H, W, 4, 5, 2, 7)
+    ref, mu, sd, srcs, ray, geo, cams, hyps = _sweep_case(rng, H, W, 4, 5, 2, 19)
 
     class Cam:
         def __init__(self, R, C, par):
@@ -515,6 +518,28 @@ def test_reconstruct_without_scipy():
     finally:
         builtins.__import__ = real
     assert n >= 0
+
+
+def test_box_sat_matches_numpy():
+    from orthomosaic.backend import _box_cumsum
+    rng = np.random.default_rng(73)
+    for shape in [(7, 11), (2, 3, 19, 13), (1, 1), (0, 5), (2, 0, 5), (0, 3, 5)]:
+        for dtype in (np.float32, np.float64):
+            a = rng.normal(0, 100, shape).astype(dtype)
+            if a.size > 10:
+                a.flat[0] = -0.0
+                a.flat[-2] = np.nan
+            for r in (0, 1, 5, 23):
+                k = 2 * r + 1
+                padded = np.pad(a.astype(np.float64), [(0, 0)] * (a.ndim - 2) + [(r + 1, r)] * 2)
+                c = padded.cumsum(axis=-2).cumsum(axis=-1)
+                ref = ((c[..., k:, k:] - c[..., :-k, k:] - c[..., k:, :-k] + c[..., :-k, :-k]) /
+                       (k * k)).astype(np.float32)
+                got = _box_cumsum(np, a, r)
+                assert _same(ref, got), (shape, dtype, r)
+    a = rng.normal(size=(3, 40, 50)).astype(np.float32)[:, ::2, ::-2]
+    a.flags.writeable = False
+    assert _same(_box_cumsum(np, a, 3), _box_cumsum(np, a.copy(), 3))
 
 
 if __name__ == "__main__":

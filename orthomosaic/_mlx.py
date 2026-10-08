@@ -9,6 +9,8 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 
+from . import _matching
+
 _HAMMING = r"""
     uint i = thread_position_in_grid.x;
     uint n1 = dims[0], n2 = dims[1];
@@ -94,6 +96,16 @@ _k_sample = mx.fast.metal_kernel(name="om_sample", input_names=["img", "Z", "fp"
                                  output_names=["out", "valid"], source=_SAMPLE)
 
 
+_k_match_tiles = mx.fast.metal_kernel(
+    name="om_match_tiles", input_names=["d1", "d2", "dims"],
+    output_names=["rb", "rs", "ri", "cb", "ci"],
+    source="const int n1 = dims[0], n2 = dims[1];\n" + _matching.kernel_body(_matching.TILE_BODY, True))
+_k_match_reduce = mx.fast.metal_kernel(
+    name="om_match_reduce", input_names=["rb", "rs", "ri", "cb", "ci", "dims"],
+    output_names=["idx", "bst", "sec", "back", "backbest"],
+    source="const int n1 = dims[0], n2 = dims[1];\n" + _matching.kernel_body(_matching.REDUCE_BODY, True))
+
+
 def _tg(n, cap=256):
     return max(1, min(cap, int(n)))
 
@@ -119,20 +131,46 @@ class MLXBackend:
         self._self_test()
 
     # -- matching ---------------------------------------------------------------
+    def _match_device(self, a, b):
+        n1, n2 = len(a), len(b)
+        dims = mx.array([n1, n2], mx.uint32)
+        return _k_hamming(inputs=[a, b, dims], grid=(n1, 1, 1), threadgroup=(_tg(n1), 1, 1),
+                          output_shapes=[(n1,), (n1,), (n1,)],
+                          output_dtypes=[mx.int32, mx.int32, mx.int32])
+
     def match(self, d1: np.ndarray, d2: np.ndarray):
-        n1, n2 = len(d1), len(d2)
-        a = mx.array(np.ascontiguousarray(d1, np.uint8).view(np.uint32).reshape(-1))
-        b = mx.array(np.ascontiguousarray(d2, np.uint8).view(np.uint32).reshape(-1))
-        dims = mx.array(np.array([n1, n2], np.uint32))
-        idx, best, sec = _k_hamming(inputs=[a, b, dims], grid=(n1, 1, 1), threadgroup=(_tg(n1), 1, 1),
-                                    output_shapes=[(n1,), (n1,), (n1,)],
-                                    output_dtypes=[mx.int32, mx.int32, mx.int32])
-        return np.array(idx), np.array(best), np.array(sec)
+        d1, d2 = _matching.descriptors(d1), _matching.descriptors(d2)
+        if not len(d1) or not len(d2):
+            return _matching.empty_result(len(d1), len(d2))[:3]
+        out = self._match_device(mx.array(d1.view(np.uint32)), mx.array(d2.view(np.uint32)))
+        mx.eval(*out)
+        return tuple(np.array(x) for x in out)
 
     def match_mutual(self, d1: np.ndarray, d2: np.ndarray):
-        idx12, best12, second12 = self.match(d1, d2)
-        idx21, _, _ = self.match(d2, d1)
-        return idx12, best12, second12, idx21
+        d1, d2 = _matching.descriptors(d1), _matching.descriptors(d2)
+        # Tiles amortise launch/transfer overhead on small pairs. Long scans are
+        # faster for large pairs on Apple GPUs; upload each descriptor set once.
+        if len(d1) * len(d2) <= _matching.TILED_PAIRS:
+            return _matching.match_mutual(d1, d2, mx.array, self._match_batch)
+        a, b = mx.array(d1.view(np.uint32)), mx.array(d2.view(np.uint32))
+        idx, best, second = self._match_device(a, b)
+        back, _, _ = self._match_device(b, a)
+        mx.eval(idx, best, second, back)
+        return tuple(np.array(x) for x in (idx, best, second, back))
+
+    def _match_batch(self, a, b):
+        n1, n2 = len(a), len(b)
+        t1, t2 = (n1 + 63) // 64, (n2 + 63) // 64
+        dims = mx.array([n1, n2], mx.int32)
+        partial = _k_match_tiles(
+            inputs=[a, b, dims], grid=(t1 * 256, t2, 1), threadgroup=(256, 1, 1),
+            output_shapes=[(t2, n1)] * 3 + [(t1, n2)] * 2, output_dtypes=[mx.int32] * 5)
+        n = max(n1, n2)
+        out = _k_match_reduce(
+            inputs=[*partial, dims], grid=(((n + 255) // 256) * 256, 1, 1), threadgroup=(256, 1, 1),
+            output_shapes=[(n1,)] * 3 + [(n2,)] * 2, output_dtypes=[mx.int32] * 5)
+        mx.eval(*out)
+        return tuple(np.array(x) for x in out)
 
     # -- 2D rendering -------------------------------------------------------------
     def new_block(self, H: int, W: int):
@@ -239,6 +277,9 @@ class MLXBackend:
         idx, best, _ = self.match(d, d)
         if not (idx == np.arange(40)).all() or best.max() != 0:
             raise RuntimeError("Metal self-test failed (matcher)")
+        mutual = self.match_mutual(d, d)
+        if not (mutual[0] == idx).all() or not (mutual[3] == idx).all() or mutual[1].max() != 0:
+            raise RuntimeError("Metal self-test failed (mutual matcher)")
         img = self.upload(rng.integers(0, 256, (16, 16, 3), dtype=np.uint8))
         blk = self.new_block(8, 8)
         self.warp_accumulate(blk, img, np.array([[1, 0, 2], [0, 1, 2]], float), np.ones(3), 1.0, 0)

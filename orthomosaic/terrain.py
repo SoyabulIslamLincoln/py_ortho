@@ -83,6 +83,11 @@ def _dilate(z, w):
 def _downsample_low(Z, f, q=25.0):
     """Block low percentile (ignoring NaN). The minimum would be the classic ground candidate,
     but photogrammetric noise makes it biased low; a low percentile is robust."""
+    from . import _fast
+    if np.ndim(q) == 0:
+        native = _fast.block_nanpercentile(np.ascontiguousarray(Z, np.float32), f, float(q))
+        if native is not None:
+            return native
     H, W = Z.shape
     h, w = -(-H // f), -(-W // f)
     p = np.full((h * f, w * f), np.nan, np.float32)

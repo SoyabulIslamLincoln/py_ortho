@@ -261,9 +261,62 @@ survey-wide scale, then coloured with a palette (`rainbow`, `iron`, `white_hot`,
 
 ## Performance
 
-Synthetic benchmark, Apple M1 8 GB, 48 photos at 12 MP, 40 M-cell DSM: **≈ 4.5 min** end to end
-(depth maps 67 s, DSM 30 s, orthophoto 65 s, DTM 45 s, mesh 17 s). Expect ~7–8 min for 120
-photos. On 8 GB machines close other heavy apps — swapping is the main slowdown.
+The Python API and CLI remain unchanged. Numerical work runs in compiled C (Cython and
+handwritten kernels), CUDA C++ through CuPy, or Metal through MLX. This is not a standalone,
+entirely-C application: Python still coordinates the pipeline and its file formats.
+
+The optimizations on top of **0.8.0** preserve the existing defaults, feature counts, depth
+hypotheses, resolutions, thresholds and iteration counts:
+
+- **Dense matching:** bounded double-precision caches reuse camera-ray rotations across long
+  coarse sweeps (at most 16 MiB per worker), with the original projection arithmetic.
+- **Terrain percentiles:** native block selection replaces NumPy's per-cell percentile calls;
+  the default lower-quartile interpolation keeps the same floating-point rounding. Unusual
+  percentiles, infinities and signed zeros retain the NumPy path.
+- **Box filters:** a native streaming summed-area table replaces full-raster float64
+  temporaries, preserving cumulative-sum and subtraction order. Terrain generation and cloud
+  classification benefit with **all three backends**; CPU dense matching also uses this filter.
+- **Matching:** a handwritten C matcher uses ARM64 NEON where available, with a portable
+  fallback. CUDA/Metal upload each descriptor set once per mutual match. Small GPU pairs
+  reuse distances in shared-memory tiles; large pairs retain the faster streaming scan.
+  Matching remains exhaustive, integer-exact, and keeps the same tie-breaking rules.
+
+Local measurements on Apple M1 (8 GB), macOS arm64, Python 3.9.6 / NumPy 2.0.2 (five timed kernel runs after
+warmup; identical output hashes):
+
+| Operation | 0.8.0 | Optimized | Speedup |
+|---|---:|---:|---:|
+| Block percentile, 2000 × 2000 DSM, factor 10 | 1.751 s | 0.094 s | 18.6× |
+| Box filter, same grid, radius 5 | 0.077 s | 0.0088 s | 8.7× |
+| Box filter, same grid, radius 25 | 0.081 s | 0.0087 s | 9.3× |
+| Mutual matching, 12 000 × 12 017 descriptors, CPU | 0.273 s | 0.247 s | 1.1× |
+| Mutual matching, 512 × 529 descriptors, Metal | 1.1 ms | 0.6 ms | 1.8× |
+| Mutual matching, 12 000 × 12 017 descriptors, Metal | 16.8 ms | 12.4 ms | 1.4× |
+
+A complete 48-image synthetic **CPU** reconstruction with unchanged options produced identical
+rasters, LAS/PLY clouds, OBJ/GLB meshes and report values (excluding timing). DTM generation
+fell from **3.85 s to 0.72 s**. Total time was **46.3 s versus 45.9 s** in that run: depth matching
+and bundle adjustment dominate, and their timing varied. These kernel improvements do **not**
+establish a substantial end-to-end speedup on every flight.
+
+CPU and Metal matching have exact regression tests, including duplicates, empty sets, tile
+edges and query batches. CUDA runtime/performance and Linux/Windows hardware were not available
+for local verification; wheel CI runs the CPU regression tests across its platform matrix.
+CPU and GPU floating-point image operations already differed slightly in 0.8.0; exact output
+parity is checked against the **same backend**, not promised across different backends.
+
+Reproduce kernel measurements and compare complete runs from isolated baseline/candidate imports:
+
+```bash
+python benchmarks/terrain.py --package-root /path/to/baseline --out terrain-base.json
+python benchmarks/terrain.py --out terrain-new.json
+python benchmarks/matching.py --backend mps --out matching-new.json
+python benchmarks/bench.py compare /path/to/baseline-output /path/to/new-output
+```
+
+`benchmarks/bench.py run --help` lists fixed-option survey benchmarks. See
+[performance notes](benchmarks/PERFORMANCE.md) for the earlier 0.7.2 comparisons; those speedups
+are historical and are not additional improvements over 0.8.0.
 
 ---
 

@@ -23,6 +23,36 @@ def test_running_min_matches_bruteforce():
         assert np.allclose(terrain._running(a, w, 0, np.minimum), ref)
 
 
+def test_block_percentile_exact():
+    import warnings
+    from orthomosaic import _fast
+    rng = np.random.default_rng(52)
+    for shape, factor in [((1, 1), 1), ((17, 21), 4), ((101, 99), 7),
+                          ((9, 8), 30), ((0, 5), 3), ((5, 0), 3)]:
+        z = rng.normal(0, 100, shape).astype(np.float32)
+        z[rng.random(shape) < 0.2] = np.nan
+        h, w = -(-shape[0] // factor), -(-shape[1] // factor)
+        p = np.full((h * factor, w * factor), np.nan, np.float32)
+        p[:shape[0], :shape[1]] = z
+        blocks = p.reshape(h, factor, w, factor).transpose(0, 2, 1, 3).reshape(h, w, factor * factor)
+        for q in (0, 12.7, 25, 50, 75, 99.9, 100):
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
+                expected = np.nanpercentile(blocks, q, axis=2).astype(np.float32)
+                actual = terrain._downsample_low(z, factor, q)
+            assert np.array_equal(expected.view('u4'), actual.view('u4')), (shape, factor, q)
+    for value in (np.inf, -np.inf, -0.0):
+        z = np.full((5, 7), value, np.float32)
+        assert _fast.block_nanpercentile(z, 2) is None
+    z = np.full((5, 7), np.nan, np.float32)
+    assert np.isnan(terrain._downsample_low(z, 2)).all()
+    # Read-only, strided input; no mutation of the source DSM.
+    z = rng.normal(size=(100, 80)).astype(np.float32)
+    z.flags.writeable = False
+    assert np.array_equal(terrain._downsample_low(z[::2, ::2], 3),
+                          terrain._downsample_low(z[::2, ::2].copy(), 3))
+
+
 def test_dtm_removes_buildings_and_keeps_terrain():
     rng = np.random.default_rng(1)
     H, W, gsd = 600, 800, 0.1

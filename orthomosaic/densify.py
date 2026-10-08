@@ -336,10 +336,14 @@ def _sweep(ref, cam_r, srcs, cams_s, inv_list, opt, ray=None):
     if 1 <= len(srcs) <= 16 and hasattr(_dense, "sweep_hypothesis"):
         G = np.array([np.r_[Rs.ravel(), b, [cs.f, cs.k1, cs.k2, cs.k3, cs.cx, cs.cy]]
                       for cs, (Rs, b) in zip(cams_s, geo)], np.float64)
+        # Amortise camera rotations across long coarse sweeps without growing the
+        # cache beyond 16 MiB per worker. Fine levels retain the streaming path.
+        rotated = (_dense.sweep_rays(ray, G)
+                   if len(inv_list) >= 16 and len(srcs) * 3 * H * W * 8 <= 16 * 1024 * 1024 else None)
         for i in range(len(inv_list)):
             inv = np.ascontiguousarray(inv_list[i], np.float32)
             _dense.sweep_hypothesis(ref, mu, sd, srcs, ray, G, inv, r, opt.top_k, i, best, prev, s_prev_best,
-                                    s_next_best, idx)
+                                    s_next_best, idx, rotated)
     else:
         S = np.empty((len(srcs), H, W), np.float32)
         J = np.empty((H, W), np.float32)

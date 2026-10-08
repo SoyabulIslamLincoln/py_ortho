@@ -96,6 +96,12 @@ class CPUBackend:
 
 def _box_cumsum(xp, a, r):
     """Mean over a (2r+1)^2 window (zero padding) via float64 summed-area tables."""
+    if xp is np and isinstance(a, np.ndarray) and a.ndim >= 2 and a.dtype in (np.float32, np.float64):
+        from . import _fast
+        shape = a.shape
+        batch = int(np.prod(shape[:-2]))
+        planes = np.ascontiguousarray(a).reshape((batch,) + shape[-2:])
+        return _fast.box_sat_mean(planes, r).reshape(shape)
     k = 2 * r + 1
     p = xp.pad(a.astype(xp.float64), [(0, 0)] * (a.ndim - 2) + [(r + 1, r), (r + 1, r)])
     c = xp.cumsum(xp.cumsum(p, axis=-2), axis=-1)
@@ -105,7 +111,9 @@ def _box_cumsum(xp, a, r):
 
 def _as_u64(d: np.ndarray) -> np.ndarray:
     d = np.ascontiguousarray(d, np.uint8)
-    return d.view(np.uint64).reshape(d.shape[0], -1)
+    if d.ndim != 2 or d.shape[1] % 8:
+        raise ValueError("descriptors must be a 2D array with a byte width divisible by 8")
+    return d.view(np.uint64)
 
 
 _CUDA_HELP = ("Install the CUDA headers CuPy needs to compile kernels: "

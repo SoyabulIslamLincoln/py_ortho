@@ -20,6 +20,9 @@ extensions = [
     Extension(
         f"orthomosaic.{name}",
         [f"orthomosaic/{name}.pyx"],
+        depends=[f"orthomosaic/{header}" for header in {
+            "_core": ["_hamming.h"], "_ba": ["_ba_kern.h"], "_dense": ["_sweep.h"],
+        }.get(name, [])],
         include_dirs=[np.get_include()],
         define_macros=[("NPY_NO_DEPRECATED_API", "NPY_1_7_API_VERSION")],
         extra_compile_args=compile_args + (exact_args if name == "_fast" else []),

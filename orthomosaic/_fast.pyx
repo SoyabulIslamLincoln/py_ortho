@@ -9,7 +9,7 @@ left to NumPy/BLAS by the callers. All loops release the GIL.
 """
 import numpy as np
 cimport numpy as cnp
-from libc.math cimport isfinite, isnan, rint, hypot, fabs, sqrt, floor, NAN
+from libc.math cimport isfinite, isnan, rint, hypot, fabs, sqrt, floor, NAN, signbit
 from libc.stdlib cimport malloc, free
 from libc.stdint cimport int32_t, int64_t, uint8_t
 
@@ -797,3 +797,147 @@ def knn_radius(const double[:, ::1] pts, const double[:, ::1] q, int k, double r
                 iout[j, a] = bi[a]
     free(fill); free(bd); free(bi)
     return d_np, i_np
+
+
+# ---------------------------------------------------------------- terrain downsampling
+cdef float _select_float(float* a, Py_ssize_t n, Py_ssize_t rank) noexcept nogil:
+    """In-place Hoare selection; no floating-point arithmetic on the samples."""
+    cdef Py_ssize_t lo = 0, hi = n - 1, i, j
+    cdef float pivot, tmp
+    while lo < hi:
+        pivot = a[lo + (hi - lo) // 2]
+        i, j = lo, hi
+        while i <= j:
+            while a[i] < pivot:
+                i += 1
+            while a[j] > pivot:
+                j -= 1
+            if i <= j:
+                tmp = a[i]
+                a[i] = a[j]
+                a[j] = tmp
+                i += 1
+                j -= 1
+        if rank <= j:
+            hi = j
+        elif rank >= i:
+            lo = i
+        else:
+            break
+    return a[rank]
+
+
+def block_nanpercentile(const float[:, ::1] z, Py_ssize_t factor, double q=25.0):
+    """Block nanpercentile (linear), with NumPy's float32 difference / float64 lerp.
+
+    Only one block is buffered. Return None for non-quartile percentiles,
+    infinities or signed zero so the caller retains NumPy's version-specific
+    scalar promotion, ordering and NaN payload behavior.
+    """
+    cdef Py_ssize_t H = z.shape[0], W = z.shape[1], h, w, y, x, yy, xx, n, rank
+    cdef float v, a, b, diff
+    cdef double pos, fraction, value, t, quantile = q / 100.0
+    cdef bint unsupported = False
+    if factor < 1 or not (0 <= q <= 100):
+        raise ValueError("factor must be positive and q must be in [0, 100]")
+    if q not in (0.0, 25.0, 50.0, 75.0, 100.0):
+        return None
+    h = (H + factor - 1) // factor
+    w = (W + factor - 1) // factor
+    result = np.empty((h, w), np.float32)
+    cdef float[:, ::1] out = result
+    # Partial edge blocks never need a factor*factor allocation larger than z.
+    scratch = np.empty(min(factor, H) * min(factor, W), np.float32)
+    cdef float[::1] buf = scratch
+    with nogil:
+        for y in range(h):
+            for x in range(w):
+                n = 0
+                for yy in range(y * factor, min((y + 1) * factor, H)):
+                    for xx in range(x * factor, min((x + 1) * factor, W)):
+                        v = z[yy, xx]
+                        if isnan(v):
+                            continue
+                        if not isfinite(v) or (v == 0 and signbit(v)):
+                            unsupported = True
+                        buf[n] = v
+                        n += 1
+                if unsupported:
+                    break
+                if n == 0:
+                    out[y, x] = NAN
+                    continue
+                if n > 16777216:  # NumPy 2 may round the sample count to float32
+                    unsupported = True
+                    break
+                pos = (n - 1) * quantile
+                rank = <Py_ssize_t>floor(pos)
+                fraction = pos - rank
+                a = _select_float(&buf[0], n, rank)
+                b = _select_float(&buf[0], n, min(rank + 1, n - 1))
+                diff = b - a
+                if fraction >= 0.5:
+                    t = 1.0 - fraction
+                    t = <double>diff * t
+                    value = <double>b - t
+                else:
+                    t = <double>diff * fraction
+                    value = <double>a + t
+                out[y, x] = <float>value
+            if unsupported:
+                break
+    return None if unsupported else result
+
+
+ctypedef fused box_scalar:
+    float
+    double
+
+
+def box_sat_mean(const box_scalar[:, :, ::1] a, Py_ssize_t r):
+    """Float64 summed-area mean, preserving the two cumsums and four-corner order.
+
+    Leading dimensions are flattened by the caller. The integral table is a ring
+    of rows: scratch scales with window height, not the entire raster height.
+    """
+    cdef Py_ssize_t B = a.shape[0], H = a.shape[1], W = a.shape[2], b, i, x, y, ay
+    cdef Py_ssize_t k = 2 * r + 1, PW = W + 2 * r + 1, PH = H + 2 * r + 1, R = k + 1
+    cdef double val, total, denom = <double>k * <double>k
+    cdef double* cur
+    cdef double* old
+    if r < 0:
+        raise ValueError("radius must be nonnegative")
+    result = np.empty((B, H, W), np.float32)
+    cdef float[:, :, ::1] out = result
+    if B == 0 or H == 0 or W == 0:
+        return result
+    col_np = np.empty(W, np.float64)
+    ring_np = np.empty((R, PW), np.float64)
+    cdef double[::1] col = col_np
+    cdef double[:, ::1] ring = ring_np
+    with nogil:
+        for b in range(B):
+            for x in range(W):
+                col[x] = 0.0
+            for i in range(PH):
+                ay = i - r - 1
+                cur = &ring[i % R, 0]
+                total = 0.0
+                for x in range(r + 1):
+                    cur[x] = 0.0
+                for x in range(W):
+                    val = <double>a[b, ay, x] if 0 <= ay < H else 0.0
+                    col[x] = col[x] + val
+                    total = total + col[x]
+                    cur[x + r + 1] = total
+                for x in range(r + 1 + W, PW):
+                    cur[x] = total
+                y = i - k
+                if y >= 0:
+                    old = &ring[y % R, 0]
+                    for x in range(W):
+                        val = cur[x + k] - old[x + k]
+                        val = val - cur[x]
+                        val = val + old[x]
+                        out[b, y, x] = <float>(val / denom)
+    return result
