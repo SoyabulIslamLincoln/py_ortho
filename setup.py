@@ -15,6 +15,11 @@ else:
 # _fast reproduces NumPy expressions operation by operation (bit-identical results), so the
 # compiler must not fuse a multiply and an add into one FMA there (MSVC does not by default)
 exact_args = [] if sys.platform == "win32" else ["-ffp-contract=off"]
+# GCC (Linux) contracts across statements by default, so on aarch64 the serial and threaded
+# bundle-adjustment kernels fuse differently and stop being bit-identical. Clang (macOS) only
+# contracts within an expression and x86-64 baseline has no FMA, so this changes Linux arm64 only.
+if sys.platform.startswith("linux"):
+    compile_args.append("-ffp-contract=off")
 
 extensions = [
     Extension(
