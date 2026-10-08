@@ -27,7 +27,7 @@ pip install onnxruntime                         # optional: AI sky / background 
 
 macOS: `open3d` also needs `brew install libusb`.
 
-From source (compiles the C kernels `_core`, `_ba`, `_mvs`, `_dense`):
+From source (compiles the C kernels `_core`, `_ba`, `_mvs`, `_dense`, `_fast`):
 
 ```bash
 git clone <repo> && cd ODM

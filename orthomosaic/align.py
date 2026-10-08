@@ -69,10 +69,21 @@ def candidate_pairs(positions: Optional[np.ndarray], n: int, k: int = 8,
 
 def match_pair(backend, i: int, j: int, fi: Features, fj: Features, ransac_thresh: float,
                ratio: float = 0.8, max_hamming: int = 80, min_inliers: int = 25,
-               max_points: int = 150, seed: int = 1) -> Optional[PairMatch]:
+               max_points: int = 150, seed: int = 1, mutual_out: Optional[dict] = None) -> Optional[PairMatch]:
+    """`mutual_out`: when given, a verified pair also stores its mutual nearest neighbours
+    (Hamming <= 90) there under (i, j), so sfm.reconstruct can reuse them instead of matching
+    the same descriptors again."""
     if len(fi) < min_inliers or len(fj) < min_inliers:
         return None
-    idx12, b12, s12, idx21 = backend.match_mutual(fi.desc, fj.desc)
+    return _verify_pair(i, j, fi, fj, backend.match_mutual(fi.desc, fj.desc), ransac_thresh, ratio, max_hamming,
+                        min_inliers, max_points, seed, mutual_out)
+
+
+def _verify_pair(i, j, fi, fj, mutual, ransac_thresh, ratio=0.8, max_hamming=80, min_inliers=25, max_points=150,
+                 seed=1, mutual_out=None):
+    """match_pair after the descriptor matching: ratio + mutual test, RANSAC affine, geometry
+    check. `mutual` = backend.match_mutual(fi.desc, fj.desc)."""
+    idx12, b12, s12, idx21 = mutual
     q = np.arange(len(idx12))
     ok = (idx12 >= 0) & (b12 <= max_hamming) & (b12 < ratio * s12)
     ok &= idx21[np.clip(idx12, 0, None)] == q            # mutual nearest neighbours
@@ -98,7 +109,26 @@ def match_pair(backend, i: int, j: int, fi: Features, fj: Features, ransac_thres
         rng = np.random.default_rng(i * 1000003 + j)
         sel = rng.choice(len(a), max_points, replace=False)
         a, b = a[sel], b[sel]
+    if mutual_out is not None:
+        mutual_out[(i, j)] = _compact_mutual(fi.desc, fj.desc, idx12, b12, s12, idx21)
     return PairMatch(i, j, fi.xy[a].copy(), fj.xy[b].copy(), fi.color[a].copy(), fj.color[b].copy(), n_in)
+
+
+def _compact_mutual(di, dj, idx12, b12, s12, idx21, max_hamming=90):
+    """Mutual nearest neighbours with Hamming <= max_hamming, in the smallest exact dtypes:
+    (di, dj, q, idx12[q], b12[q], s12[q])."""
+    q = np.arange(len(idx12))
+    m = (idx12 >= 0) & (b12 <= max_hamming)
+    m &= idx21[np.clip(idx12, 0, None)] == q
+    q = q[m]
+
+    def small(v):
+        v = np.asarray(v)
+        for dt in (np.uint8, np.uint16, np.int32):
+            if v.size == 0 or (v.min() >= np.iinfo(dt).min and v.max() <= np.iinfo(dt).max):
+                return v.astype(dt)
+        return v
+    return (di, dj, small(q), small(idx12[q]), small(b12[q]), small(s12[q]))
 
 
 # --------------------------------------------------------------------------

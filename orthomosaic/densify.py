@@ -35,7 +35,6 @@ import os
 import shutil
 import threading
 import time
-from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
@@ -43,9 +42,14 @@ from typing import Optional
 import numpy as np
 
 from . import _dense
+try:
+    from . import _fast
+except ImportError:                       # source tree built before _fast existed
+    _fast = None
 from .imageio import load_rgb
 from .masks import load_mask
 from .mvs import DenseResult, _near
+from .render import ImageCache
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +94,8 @@ class DenseCloud:
 def _box(a: np.ndarray, r: int) -> np.ndarray:
     """Mean over a (2r+1)^2 window, zero padded (divide by a boxed mask for partial windows).
     float32 is enough because the images are normalised to roughly [-2, 2] (see `_norm`)."""
+    if _fast is not None and a.ndim == 2 and a.dtype == np.float32:
+        return _fast.box_zero_mean(np.ascontiguousarray(a), int(r))      # same float32 sums, compiled
     k = 2 * r + 1
     c = np.cumsum(np.pad(a.astype(np.float32, copy=False), ((r + 1, r), (0, 0))), 0)
     a1 = c[k:] - c[:-k]
@@ -152,6 +158,25 @@ class _Cam:
         r2 = x * x + y * y
         d = self.f * (1 + r2 * (self.k1 + r2 * (self.k2 + r2 * self.k3)))
         return d * x + self.cx, d * y + self.cy
+
+
+def _exact(*cams) -> bool:
+    """The compiled camera kernels (``_fast``) reproduce _Cam's float64 NumPy arithmetic; use them
+    only when every parameter is a float64 scalar (NumPy would compute other types differently)."""
+    if _fast is None:
+        return False
+    return all(isinstance(v, float) for c in cams for v in (c.f, c.k1, c.k2, c.k3, c.cx, c.cy))
+
+
+def _project_neighbour(X, cj, Dj, cr, uu, vv, px_tol, rel_tol):
+    """One neighbour of the fusion / consistency check (compiled, same arithmetic as the NumPy
+    code it replaces; the 3x3 matrix products stay in NumPy): returns (ui, vi, ok, Xj)."""
+    xc = (X - cj.C) @ cj.R.T
+    ui, vi, dj, M = _fast.neighbour_sample(xc, Dj, cj.f, cj.k1, cj.k2, cj.k3, cj.cx, cj.cy, cj.w, cj.h)
+    Xj = cj.C + (M @ cj.R)
+    xk = (Xj - cr.C) @ cr.R.T
+    ok = _fast.agreement(xk, xc, dj, uu, vv, cr.f, cr.k1, cr.k2, cr.k3, cr.cx, cr.cy, float(px_tol), float(rel_tol))
+    return ui, vi, ok, Xj
 
 
 # ------------------------------------------------------------------ neighbours / depth ranges
@@ -263,17 +288,37 @@ def _num_depths(rec, k, nbrs_k, rng, f_coarse, base: int) -> int:
 def _rays_world(shape, cam_r):
     """(3, H, W) float32 world direction of every reference pixel (camera-axis depth 1)."""
     H, W = shape
-    vv, uu = np.mgrid[0:H, 0:W].astype(np.float64)
-    x, y = cam_r.rays(uu, vv)
+    if _exact(cam_r):
+        x, y = _fast.rays_grid(H, W, cam_r.cx, cam_r.cy, cam_r.f, cam_r.k1, cam_r.k2, cam_r.k3)
+    else:
+        vv, uu = np.mgrid[0:H, 0:W].astype(np.float64)
+        x, y = cam_r.rays(uu, vv)
     ray_c = np.stack([x, y, np.ones_like(x)])
     return np.ascontiguousarray(np.einsum("ji,jhw->ihw", cam_r.R, ray_c), np.float32)
+
+
+class _Hypotheses:
+    """Inverse-depth hypothesis maps generated one at a time (``make(i)``) instead of a list
+    holding all of them (up to 3 x 64 coarse maps per image and worker)."""
+
+    def __init__(self, make, n):
+        self._make, self._n = make, n
+
+    def __len__(self):
+        return self._n
+
+    def __getitem__(self, i):
+        if not -self._n <= i < self._n:
+            raise IndexError(i)
+        return self._make(i % self._n)
 
 
 def _sweep(ref, cam_r, srcs, cams_s, inv_list, opt, ray=None):
     """Winner-take-all over inverse-depth hypotheses `inv_list` (per-pixel maps, uniformly
     spaced), refined to sub-step precision with a parabola through the best score and its two
-    neighbours. The warp + NCC (``_dense.ncc_warp``) and the top-k / winner bookkeeping
-    (``_dense.combine``) are C kernels that release the GIL; memory does not grow with the
+    neighbours. The warp + NCC of every source and the top-k / winner bookkeeping run in one C
+    kernel per hypothesis (``_dense.sweep_hypothesis``, bit-identical to ``_dense.ncc_warp`` per
+    source followed by ``_dense.combine``) that releases the GIL; memory does not grow with the
     number of hypotheses."""
     r = opt.window
     H, W = ref.shape
@@ -283,20 +328,29 @@ def _sweep(ref, cam_r, srcs, cams_s, inv_list, opt, ray=None):
     sd = np.ascontiguousarray(np.sqrt(np.maximum(_box(ref * ref, r) - mu * mu, 1e-6)), np.float32)
     geo = [(np.ascontiguousarray(cs.R, np.float64), np.ascontiguousarray(cs.R @ (cam_r.C - cs.C), np.float64))
            for cs in cams_s]
-    S = np.empty((len(srcs), H, W), np.float32)
-    J = np.empty((H, W), np.float32)
-    V = np.empty((H, W), np.float32)
-    hs = np.empty((4, H, W), np.float32)
     best = np.full((H, W), -2.0, np.float32)
     s_prev_best = np.full((H, W), -2.0, np.float32)
     s_next_best = np.full((H, W), -2.0, np.float32)
     prev = np.full((H, W), -2.0, np.float32)
     idx = np.full((H, W), -1, np.int32)
-    for i, inv in enumerate(inv_list):
-        inv = np.ascontiguousarray(inv, np.float32)
-        for j, (src, cs, (Rs, b)) in enumerate(zip(srcs, cams_s, geo)):
-            _dense.ncc_warp(ref, mu, sd, src, ray, Rs, b, cs.f, cs.k1, cs.k2, cs.k3, cs.cx, cs.cy, inv, r, S[j], J, V, hs)
-        _dense.combine(S, opt.top_k, i, best, prev, s_prev_best, s_next_best, idx)
+    if 1 <= len(srcs) <= 16 and hasattr(_dense, "sweep_hypothesis"):
+        G = np.array([np.r_[Rs.ravel(), b, [cs.f, cs.k1, cs.k2, cs.k3, cs.cx, cs.cy]]
+                      for cs, (Rs, b) in zip(cams_s, geo)], np.float64)
+        for i in range(len(inv_list)):
+            inv = np.ascontiguousarray(inv_list[i], np.float32)
+            _dense.sweep_hypothesis(ref, mu, sd, srcs, ray, G, inv, r, opt.top_k, i, best, prev, s_prev_best,
+                                    s_next_best, idx)
+    else:
+        S = np.empty((len(srcs), H, W), np.float32)
+        J = np.empty((H, W), np.float32)
+        V = np.empty((H, W), np.float32)
+        hs = np.empty((4, H, W), np.float32)
+        for i in range(len(inv_list)):
+            inv = np.ascontiguousarray(inv_list[i], np.float32)
+            for j, (src, cs, (Rs, b)) in enumerate(zip(srcs, cams_s, geo)):
+                _dense.ncc_warp(ref, mu, sd, src, ray, Rs, b, cs.f, cs.k1, cs.k2, cs.k3, cs.cx, cs.cy, inv, r, S[j],
+                                J, V, hs)
+            _dense.combine(S, opt.top_k, i, best, prev, s_prev_best, s_next_best, idx)
     n = len(inv_list)
     inv0 = inv_list[0]
     dinv = inv_list[1] - inv_list[0] if n > 1 else np.zeros_like(inv0)
@@ -356,7 +410,8 @@ def depth_map(k, nbrs, rec, views, opt: DepthOptions):
     inv_lo, inv_hi = _depth_band(rec, k, pyr_c[L], shape, rng, block=max(8, shape[1] // 16))
     step = (inv_hi - inv_lo) / max(nd - 1, 1)
     d, _, _ = _sweep(pyr_r[L], pyr_c[L], pyr_s[L], pyr_cs[L],
-                     [(inv_lo + i * step).astype(np.float32) for i in range(nd)], opt, rays[L])
+                     _Hypotheses((lambda i: _fast.hyp_linear(inv_lo, step, i)) if _fast is not None else
+                                 (lambda i: (inv_lo + i * step).astype(np.float32)), nd), opt, rays[L])
     dstep = step / 2
     # refine: at each finer level search +-refine_steps around the upsampled depth, half the spacing
     for lvl in range(L - 1, -1, -1):
@@ -365,8 +420,13 @@ def depth_map(k, nbrs, rec, views, opt: DepthOptions):
         up = np.pad(up, ((0, H - up.shape[0]), (0, W - up.shape[1])), mode="edge")
         dstep = np.repeat(np.repeat(dstep, 2, 0), 2, 1)[:H, :W]
         dstep = np.pad(dstep, ((0, H - dstep.shape[0]), (0, W - dstep.shape[1])), mode="edge")
-        hyp = [np.maximum(1.0 / up + t * dstep, 1e-6).astype(np.float32)
-               for t in range(-opt.refine_steps, opt.refine_steps + 1)]
+        iu, rs_ = np.ascontiguousarray(1.0 / up), opt.refine_steps
+        if _fast is not None and iu.dtype == np.float32 and dstep.dtype == np.float32:
+            hyp = _Hypotheses(lambda q, iu=iu, ds=np.ascontiguousarray(dstep): _fast.hyp_refine(iu, ds, q - rs_),
+                              2 * rs_ + 1)
+        else:
+            hyp = _Hypotheses(lambda q, iu=iu, ds=dstep: np.maximum(iu + (q - rs_) * ds, 1e-6).astype(np.float32),
+                              2 * rs_ + 1)
         d, score, sd = _sweep(pyr_r[lvl], pyr_c[lvl], pyr_s[lvl], pyr_cs[lvl], hyp, opt, rays[lvl])
         dstep /= 2
     depth = d
@@ -383,22 +443,30 @@ def _consistency(k, D, nbrs_k, dm, cams, px_tol, rel_tol):
     reprojection within px_tol and relative depth within rel_tol[j])."""
     cr = cams[k]
     cnt = np.zeros(D.shape, np.int16)
-    vv, uu = np.nonzero(np.isfinite(D))
+    vv, uu = (np.ascontiguousarray(a) for a in np.nonzero(np.isfinite(D)))
     if len(vv) == 0:
         return cnt
-    d = D[vv, uu].astype(np.float64)
-    x, y = cr.rays(uu.astype(np.float64), vv.astype(np.float64))
-    X = cr.C + (np.stack([x * d, y * d, d], 1) @ cr.R)
-    c = np.zeros(len(d), np.int16)
+    fast = _exact(cr, *(cams[j] for j in nbrs_k if j in dm))
+    if fast:
+        X = cr.C + (_fast.ref_points(np.ascontiguousarray(D, np.float32), vv, uu, cr.cx, cr.cy, cr.f, cr.k1, cr.k2,
+                                     cr.k3) @ cr.R)
+    else:
+        d = D[vv, uu].astype(np.float64)
+        x, y = cr.rays(uu.astype(np.float64), vv.astype(np.float64))
+        X = cr.C + (np.stack([x * d, y * d, d], 1) @ cr.R)
+    c = np.zeros(len(vv), np.int16)
     for j in nbrs_k:
         if j not in dm:
             continue
         cj = cams[j]
+        if fast:
+            c += _project_neighbour(X, cj, np.asarray(dm[j]), cr, uu, vv, px_tol, rel_tol[j])[2]
+            continue
         xc = (X - cj.C) @ cj.R.T
         u, v = cj.project_cam(xc[:, 0], xc[:, 1], xc[:, 2])
         ui, vi = np.rint(u).astype(np.int64), np.rint(v).astype(np.int64)
         ins = (xc[:, 2] > 0) & (ui >= 0) & (vi >= 0) & (ui < cj.w) & (vi < cj.h)
-        dj = np.full(len(d), np.nan)
+        dj = np.full(len(vv), np.nan)
         dj[ins] = dm[j][vi[ins], ui[ins]]
         xj, yj = cj.rays(ui.astype(np.float64), vi.astype(np.float64))
         Xj = cj.C + (np.stack([xj * dj, yj * dj, dj], 1) @ cj.R)
@@ -457,23 +525,19 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
         cams[k] = _Cam(rec.R[k], rec.C[k], it.f, it.k1, it.k2, it.cx, it.cy, fr.width, fr.height, it.k3).scaled(w / fr.width, w, h)
         scales[k] = s
 
-    cache, lock = OrderedDict(), threading.Lock()
-    budget = int(opt.cache_mb) * 1024 * 1024
-    used_bytes = [0]
-
-    def views(k):
-        """(normalised grey float32 with NaN = masked, uint8 RGB, camera), LRU-cached by bytes."""
-        with lock:
-            v = cache.get(k)
-            if v is not None:
-                cache.move_to_end(k)
-                return v
+    def load_view(k):
+        """(normalised grey float32 with NaN = masked, uint8 RGB, camera) of image k."""
         i = rec.used[k]
+        b = None if biases is None else biases.get(i)
+        if _fast is not None:                          # one compiled pass, same rounding
+            rgb = np.ascontiguousarray(load_rgb(frames[i], scales[k]), np.uint8)
+            grey, rgb8 = _fast.depth_view(rgb, gains.get(i), b,
+                                          load_mask(frames[i].path, rgb.shape[1], rgb.shape[0]))
+            return grey, rgb8, cams[k]
         rgb = load_rgb(frames[i], scales[k]).astype(np.float32)
         g = gains.get(i)
         if g is not None:
             rgb *= np.asarray(g, np.float32)
-        b = None if biases is None else biases.get(i)
         if b is not None:
             rgb += np.asarray(b, np.float32)
         grey = np.ascontiguousarray(_norm(rgb.mean(-1)))
@@ -481,16 +545,11 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
         if m is not None:
             grey[~m] = np.nan                          # masked: never matched, never fused
         rgb8 = np.clip(rgb + 0.5, 0, 255).astype(np.uint8)
-        v = (grey, rgb8, cams[k])
-        nb = grey.nbytes + rgb8.nbytes
-        with lock:
-            if k not in cache:
-                cache[k] = v
-                used_bytes[0] += nb
-                while used_bytes[0] > budget and len(cache) > 1:
-                    _, old = cache.popitem(last=False)
-                    used_bytes[0] -= old[0].nbytes + old[1].nbytes
-        return v
+        return grey, rgb8, cams[k]
+
+    # LRU by bytes; threads asking for an image that is being decoded wait for that one load
+    cache = ImageCache(load_view, lambda v: v[0].nbytes + v[1].nbytes, int(opt.cache_mb) * 1024 * 1024)
+    views = cache.get
 
     nbrs = _neighbours(rec, opt.neighbors)
     med_gsd = float(np.median([np.nanmedian((rec.R[k] @ (rec.X[rec.obs_pt[rec.obs_cam == k]] - rec.C[k]).T)[2])
@@ -597,7 +656,40 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
     dm = {k: np.load(os.path.join(wd, f"{k:05d}.npy"), mmap_mode="r") for k in have}
     used = {k: np.zeros(dm[k].shape, bool) for k in have}
     pts, cols, nv, owner = [], [], [], []
-    for n_done, k in enumerate(sorted(have)):
+    fpool = ThreadPoolExecutor(max(1, min(workers, opt.neighbors or 1)))
+    try:
+        _fuse(sorted(have), dm, used, cams, nbrs, have, rel_tols, opt, px_tol, min_views, views, cache,
+              pts, cols, nv, owner, step, fpool)
+    finally:
+        fpool.shutdown()
+    del dm
+    if not pts:
+        raise RuntimeError("Densification produced no consistent points: too little overlap or texture "
+                           "(try min_views=2 or a larger max_image_dim)")
+    cloud = DenseCloud(np.concatenate(pts), np.concatenate(cols), np.concatenate(nv), np.concatenate(owner),
+                       med_gsd * max(1, opt.point_stride))
+    log.info("Dense cloud: %d points (median %d views/point) fused in %.1fs",
+             len(cloud.xyz), int(np.median(cloud.views)), time.time() - t1)
+    return cloud
+
+
+def _fuse(order, dm, used, cams, nbrs, have, rel_tols, opt, px_tol, min_views, views, cache, pts, cols, nv, owner,
+          step, fpool):
+    """Sequential geometric-consistency fusion (pixels fused once are marked as used). The next
+    reference image is decoded in the background while the current one is fused."""
+    pre = ThreadPoolExecutor(1)
+    try:
+        _fuse_loop(order, dm, used, cams, nbrs, have, rel_tols, opt, px_tol, min_views, views, cache, pts, cols, nv,
+                   owner, step, fpool, pre)
+    finally:
+        pre.shutdown()
+
+
+def _fuse_loop(order, dm, used, cams, nbrs, have, rel_tols, opt, px_tol, min_views, views, cache, pts, cols, nv,
+               owner, step, fpool, pre):
+    nxt = pre.submit(views, order[0]) if order else None
+    for n_done, k in enumerate(order):
+        cur, nxt = nxt, (pre.submit(views, order[n_done + 1]) if n_done + 1 < len(order) else None)
         D = np.asarray(dm[k])
         cr = cams[k]
         tol_k = rel_tols(k)
@@ -606,16 +698,31 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
             sub = np.zeros_like(cand)
             sub[::opt.point_stride, ::opt.point_stride] = True
             cand &= sub
-        vv, uu = np.nonzero(cand)
+        vv, uu = (np.ascontiguousarray(a) for a in np.nonzero(cand))
         if len(vv) == 0:
             continue
-        d = D[vv, uu].astype(np.float64)
-        x, y = cr.rays(uu.astype(np.float64), vv.astype(np.float64))
-        X = cr.C + (np.stack([x * d, y * d, d], 1) @ cr.R)             # R^T (d * ray)
+        nb_k = [j for j in nbrs[k] if j in have]
+        fast = _exact(cr, *(cams[j] for j in nb_k))
+        if fast:
+            X = cr.C + (_fast.ref_points(np.ascontiguousarray(D, np.float32), vv, uu, cr.cx, cr.cy, cr.f, cr.k1,
+                                         cr.k2, cr.k3) @ cr.R)
+        else:
+            d = D[vv, uu].astype(np.float64)
+            x, y = cr.rays(uu.astype(np.float64), vv.astype(np.float64))
+            X = cr.C + (np.stack([x * d, y * d, d], 1) @ cr.R)             # R^T (d * ray)
         acc = X.copy()
-        cnt = np.ones(len(d), np.int32)
+        cnt = np.ones(len(vv), np.int32)
         marks = []
-        for j in nbrs[k]:
+        if fast:
+            # the neighbours are independent: project them in parallel, then add them up in the
+            # original neighbour order (the sums are order dependent)
+            res = list(fpool.map(lambda j: _project_neighbour(X, cams[j], np.asarray(dm[j]), cr, uu, vv, px_tol,
+                                                              tol_k[j]), nb_k))
+            for j, (ui, vi, ok, Xj) in zip(nb_k, res):
+                _fast.accumulate(acc, cnt, Xj, ok.view(np.uint8))
+                marks.append((j, vi[ok], ui[ok], ok))
+            del res
+        for j in (() if fast else nbrs[k]):
             if j not in have:
                 continue
             cj = cams[j]
@@ -623,7 +730,7 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
             u, v = cj.project_cam(xc[:, 0], xc[:, 1], xc[:, 2])
             ui, vi = np.rint(u).astype(np.int64), np.rint(v).astype(np.int64)
             ins = (xc[:, 2] > 0) & (ui >= 0) & (vi >= 0) & (ui < cj.w) & (vi < cj.h)
-            dj = np.full(len(d), np.nan)
+            dj = np.full(len(vv), np.nan)
             dj[ins] = dm[j][vi[ins], ui[ins]]
             ok = np.isfinite(dj)
             xj, yj = cj.rays(ui.astype(np.float64), vi.astype(np.float64))
@@ -645,7 +752,7 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
             # reference (only those pixels are candidates); otherwise every overlapping photo
             # re-emits the same point
             used[j][(vi[sel] // st_) * st_, (ui[sel] // st_) * st_] = True
-        _, rgb, _ = views(k)
+        _, rgb, _ = cur.result()
         pts.append((acc[keep] / cnt[keep, None]))
         cols.append(rgb[vv[keep], uu[keep]])
         nv.append(np.minimum(cnt[keep], 255).astype(np.uint8))
@@ -653,15 +760,6 @@ def _densify(ar, rec, gains, biases, wd, opt) -> DenseCloud:
         cache.clear()
         if (n_done + 1) % step == 0:
             log.info("  fusion: %d/%d", n_done + 1, len(have))
-    del dm
-    if not pts:
-        raise RuntimeError("Densification produced no consistent points: too little overlap or texture "
-                           "(try min_views=2 or a larger max_image_dim)")
-    cloud = DenseCloud(np.concatenate(pts), np.concatenate(cols), np.concatenate(nv), np.concatenate(owner),
-                       med_gsd * max(1, opt.point_stride))
-    log.info("Dense cloud: %d points (median %d views/point) fused in %.1fs",
-             len(cloud.xyz), int(np.median(cloud.views)), time.time() - t1)
-    return cloud
 
 
 # ------------------------------------------------------------------ DSM from the cloud

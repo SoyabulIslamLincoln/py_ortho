@@ -20,13 +20,12 @@ from PIL import Image
 # point clouds
 # --------------------------------------------------------------------------
 
+_CHUNK = 4_000_000          # points per block when writing large clouds (bounded memory, same bytes)
+
+
 def write_ply(path: str, xyz: np.ndarray, rgb: np.ndarray, offset=(0.0, 0.0, 0.0), comment: str = ""):
     """Binary little-endian PLY. Coordinates are stored relative to `offset` (float32)."""
     n = len(xyz)
-    rec = np.empty(n, dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
-                             ("red", "u1"), ("green", "u1"), ("blue", "u1")])
-    rec["x"], rec["y"], rec["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
-    rec["red"], rec["green"], rec["blue"] = rgb[:, 0], rgb[:, 1], rgb[:, 2]
     header = ["ply", "format binary_little_endian 1.0",
               f"comment offset {offset[0]:.3f} {offset[1]:.3f} {offset[2]:.3f}"]
     if comment:
@@ -35,15 +34,37 @@ def write_ply(path: str, xyz: np.ndarray, rgb: np.ndarray, offset=(0.0, 0.0, 0.0
                "property uchar red", "property uchar green", "property uchar blue", "end_header"]
     with open(path, "wb") as fh:
         fh.write(("\n".join(header) + "\n").encode())
-        fh.write(rec.tobytes())
+        for c0 in range(0, n, _CHUNK):
+            c1 = min(n, c0 + _CHUNK)
+            rec = np.empty(c1 - c0, dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
+                                           ("red", "u1"), ("green", "u1"), ("blue", "u1")])
+            rec["x"], rec["y"], rec["z"] = xyz[c0:c1, 0], xyz[c0:c1, 1], xyz[c0:c1, 2]
+            rec["red"], rec["green"], rec["blue"] = rgb[c0:c1, 0], rgb[c0:c1, 1], rgb[c0:c1, 2]
+            fh.write(memoryview(rec).cast("B"))
 
 
 def write_las(path: str, xyz_abs: np.ndarray, rgb: np.ndarray, epsg: Optional[int] = None,
-              scale: float = 0.001, classification: Optional[np.ndarray] = None):
+              scale: float = 0.001, classification: Optional[np.ndarray] = None, add: Optional[np.ndarray] = None):
     """LAS 1.2, point format 2 (XYZ + RGB), absolute coordinates, optional EPSG GeoKey VLR.
-    classification: optional per-point ASPRS class (1 = unclassified, 2 = ground)."""
+    classification: optional per-point ASPRS class (1 = unclassified, 2 = ground).
+    add: optional (3,) offset added to `xyz_abs` block by block (the file is the same as for
+    ``write_las(path, xyz_abs + add, ...)`` without the full-size sum in memory)."""
     n = len(xyz_abs)
-    mins, maxs = xyz_abs.min(0), xyz_abs.max(0)
+
+    def coords(c0, c1):
+        blk = xyz_abs[c0:c1]
+        return blk if add is None else blk + add
+    if n > _CHUNK:
+        parts = [coords(c0, min(n, c0 + _CHUNK)) for c0 in range(0, n, _CHUNK)]
+        mins = np.min([p.min(0) for p in parts], 0)
+        maxs = np.max([p.max(0) for p in parts], 0)
+        del parts
+        if not (np.all(np.isfinite(mins) & (mins != 0)) and np.all(np.isfinite(maxs) & (maxs != 0))):
+            full = coords(0, n)              # +-0 / NaN ties: the original whole-array reduction
+            mins, maxs = full.min(0), full.max(0)
+            del full
+    else:
+        mins, maxs = coords(0, n).min(0), coords(0, n).max(0)
     offset = np.floor(mins)
     vlrs = b""
     if epsg:
@@ -64,19 +85,23 @@ def write_las(path: str, xyz_abs: np.ndarray, rgb: np.ndarray, epsg: Optional[in
     hdr += struct.pack("<3d", *offset)
     hdr += struct.pack("<6d", maxs[0], mins[0], maxs[1], mins[1], maxs[2], mins[2])
     assert len(hdr) == header_size
-    pts = np.zeros(n, dtype=[("X", "<i4"), ("Y", "<i4"), ("Z", "<i4"), ("I", "<u2"), ("ret", "u1"),
-                             ("cls", "u1"), ("ang", "i1"), ("ud", "u1"), ("src", "<u2"),
-                             ("R", "<u2"), ("G", "<u2"), ("B", "<u2")])
-    q = np.round((xyz_abs - offset) / scale).astype(np.int64)
-    pts["X"], pts["Y"], pts["Z"] = q[:, 0], q[:, 1], q[:, 2]
-    pts["ret"] = 0b00001001          # return 1 of 1
-    pts["cls"] = 1 if classification is None else classification   # ASPRS: 1 unclassified, 2 ground
-    rgb16 = rgb.astype(np.uint16) * 257
-    pts["R"], pts["G"], pts["B"] = rgb16[:, 0], rgb16[:, 1], rgb16[:, 2]
     with open(path, "wb") as fh:
         fh.write(bytes(hdr))
         fh.write(vlrs)
-        fh.write(pts.tobytes())
+        for c0 in range(0, n, _CHUNK):
+            c1 = min(n, c0 + _CHUNK)
+            pts = np.zeros(c1 - c0, dtype=[("X", "<i4"), ("Y", "<i4"), ("Z", "<i4"), ("I", "<u2"), ("ret", "u1"),
+                                           ("cls", "u1"), ("ang", "i1"), ("ud", "u1"), ("src", "<u2"),
+                                           ("R", "<u2"), ("G", "<u2"), ("B", "<u2")])
+            q = np.round((coords(c0, c1) - offset) / scale).astype(np.int64)
+            pts["X"], pts["Y"], pts["Z"] = q[:, 0], q[:, 1], q[:, 2]
+            pts["ret"] = 0b00001001          # return 1 of 1
+            # ASPRS: 1 unclassified, 2 ground
+            pts["cls"] = 1 if classification is None else (
+                classification[c0:c1] if np.ndim(classification) else classification)
+            rgb16 = rgb[c0:c1].astype(np.uint16) * 257
+            pts["R"], pts["G"], pts["B"] = rgb16[:, 0], rgb16[:, 1], rgb16[:, 2]
+            fh.write(memoryview(pts).cast("B"))
 
 
 def las_to_laz(las_path: str) -> Optional[str]:

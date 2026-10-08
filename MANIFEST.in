@@ -1,5 +1,6 @@
 include README.md
 include orthomosaic/*.pyx
+include orthomosaic/*.h
 exclude orthomosaic/*.c
 global-exclude *.so *.pyd __pycache__/*
 recursive-include tests *.py

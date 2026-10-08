@@ -3,6 +3,7 @@
 """Dense-stereo CPU kernel: project a ground grid at per-cell heights into a view and sample it."""
 import numpy as np
 cimport numpy as cnp
+from libc.stdlib cimport malloc, free
 from libc.math cimport floor
 from libc.stdint cimport uint8_t
 
@@ -53,11 +54,58 @@ def sample_view(const float[:, :, ::1] img, const double[:, ::1] R, const double
                 valid[r, c] = 1
 
 
-def sgm(const float[:, :, ::1] cost, float P1, float P2):
+cdef void _sgm_dir(const float* C, float* L, Py_ssize_t D, Py_ssize_t H, Py_ssize_t W, int dy, int dx,
+                   float P1, float P2) noexcept nogil:
+    """One SGM path direction on (H, W, D)-ordered buffers (the depth values of a cell are
+    contiguous); per value the same operations as `sgm` below."""
+    cdef Py_ssize_t yy, xx, y, x, py, px, d
+    cdef float best_prev, v, a, b
+    cdef const float* c
+    cdef float* cur
+    cdef const float* prv
+    for yy in range(H):
+        y = yy if dy >= 0 else H - 1 - yy
+        for xx in range(W):
+            x = xx if dx >= 0 else W - 1 - xx
+            py = y - dy
+            px = x - dx
+            c = C + (y * W + x) * D
+            cur = L + (y * W + x) * D
+            if py < 0 or py >= H or px < 0 or px >= W:
+                for d in range(D):
+                    cur[d] = c[d]
+            else:
+                prv = L + (py * W + px) * D
+                best_prev = prv[0]
+                for d in range(1, D):
+                    if prv[d] < best_prev:
+                        best_prev = prv[d]
+                for d in range(D):
+                    v = prv[d]
+                    if d > 0:
+                        a = prv[d - 1] + P1
+                        if a < v:
+                            v = a
+                    if d < D - 1:
+                        b = prv[d + 1] + P1
+                        if b < v:
+                            v = b
+                    if best_prev + P2 < v:
+                        v = best_prev + P2
+                    cur[d] = c[d] + v - best_prev
+
+
+def sgm(const float[:, :, ::1] cost, float P1, float P2, int workers=1):
     """Semi-global matching: aggregate a (D, H, W) cost volume along 8 directions.
     L_r(p, d) = C(p, d) + min(L(p-r, d), L(p-r, d+-1) + P1, min_k L(p-r, k) + P2) - min_k L(p-r, k)
-    Returns the summed aggregated volume (D, H, W) float32."""
+    Returns the summed aggregated volume (D, H, W) float32.
+
+    The paths are computed on a (H, W, D) copy of the volume (contiguous per cell) and, with
+    workers > 1, the 8 directions in parallel; each value sees the same operations and the
+    directions are summed in the same order, so the result is identical."""
     cdef Py_ssize_t D = cost.shape[0], H = cost.shape[1], W = cost.shape[2]
+    if D > 0 and H > 0 and W > 0:
+        return _sgm_hwd(cost, P1, P2, max(1, workers))
     agg_np = np.zeros((D, H, W), np.float32)
     L_np = np.zeros((D, H, W), np.float32)
     cdef float[:, :, ::1] agg = agg_np
@@ -107,6 +155,98 @@ def sgm(const float[:, :, ::1] cost, float P1, float P2):
                             L[d, y, x] = cost[d, y, x] + v - best_prev
                     for d in range(D):
                         agg[d, y, x] += L[d, y, x]
+    return agg_np
+
+
+cdef void _sgm_to_hwd(const float[:, :, ::1] cost, float* C, Py_ssize_t y0, Py_ssize_t y1) noexcept nogil:
+    cdef Py_ssize_t D = cost.shape[0], W = cost.shape[2], y, x, d
+    for d in range(D):
+        for y in range(y0, y1):
+            for x in range(W):
+                C[(y * W + x) * D + d] = cost[d, y, x]
+
+
+cdef void _sgm_from_hwd(const float* A, float[:, :, ::1] agg, Py_ssize_t y0, Py_ssize_t y1) noexcept nogil:
+    cdef Py_ssize_t D = agg.shape[0], W = agg.shape[2], y, x, d
+    for d in range(D):
+        for y in range(y0, y1):
+            for x in range(W):
+                agg[d, y, x] = A[(y * W + x) * D + d]
+
+
+def _sgm_hwd(const float[:, :, ::1] cost, float P1, float P2, int workers):
+    """sgm on (H, W, D)-ordered buffers. workers > 1: two rounds of four directions computed in
+    parallel, each round added to the sum in direction order (6 volumes of memory at most)."""
+    cdef Py_ssize_t D = cost.shape[0], H = cost.shape[1], W = cost.shape[2], n = D * H * W, i
+    cdef int dirs[8][2]
+    dirs[0][:] = [0, 1]
+    dirs[1][:] = [0, -1]
+    dirs[2][:] = [1, 0]
+    dirs[3][:] = [-1, 0]
+    dirs[4][:] = [1, 1]
+    dirs[5][:] = [1, -1]
+    dirs[6][:] = [-1, 1]
+    dirs[7][:] = [-1, -1]
+    cdef int nbuf = 4 if workers > 1 else 1, k, rnd
+    cdef float* C = <float*>malloc(n * sizeof(float))
+    cdef float* Ls = <float*>malloc(nbuf * n * sizeof(float))
+    cdef float* A = <float*>malloc(n * sizeof(float))
+    if C == NULL or Ls == NULL or A == NULL:
+        free(C); free(Ls); free(A)
+        raise MemoryError()
+    agg_np = np.empty((D, H, W), np.float32)
+    cdef float[:, :, ::1] agg = agg_np
+    try:
+        if nbuf == 1:
+            with nogil:
+                _sgm_to_hwd(cost, C, 0, H)
+                for i in range(n):
+                    A[i] = 0
+                for k in range(8):
+                    _sgm_dir(C, Ls, D, H, W, dirs[k][0], dirs[k][1], P1, P2)
+                    for i in range(n):
+                        A[i] += Ls[i]
+                _sgm_from_hwd(A, agg, 0, H)
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            nt = min(workers, 8)
+            rows = [(H * t // nt, H * (t + 1) // nt) for t in range(nt) if H * (t + 1) // nt > H * t // nt]
+            parts = [(n * t // nt, n * (t + 1) // nt) for t in range(nt)]
+
+            def to_hwd(r):
+                cdef Py_ssize_t a = r[0], b = r[1]
+                with nogil:
+                    _sgm_to_hwd(cost, C, a, b)
+
+            def from_hwd(r):
+                cdef Py_ssize_t a = r[0], b = r[1]
+                with nogil:
+                    _sgm_from_hwd(A, agg, a, b)
+
+            def one(int kk):
+                with nogil:
+                    _sgm_dir(C, Ls + (kk % 4) * n, D, H, W, dirs[kk][0], dirs[kk][1], P1, P2)
+
+            def add_round(r):
+                cdef Py_ssize_t a = r[0], b = r[1], q
+                cdef int first = r[2], kk
+                with nogil:
+                    for q in range(a, b):
+                        if first:
+                            A[q] = 0
+                        for kk in range(4):              # directions in their original order
+                            A[q] += Ls[kk * n + q]
+
+            with ThreadPoolExecutor(nt) as ex:
+                list(ex.map(to_hwd, rows))
+                for rnd in range(2):
+                    list(ex.map(one, range(4 * rnd, 4 * rnd + 4)))
+                    list(ex.map(add_round, [(a, b, 1 if rnd == 0 else 0) for a, b in parts]))
+                list(ex.map(from_hwd, rows))
+    finally:
+        free(C)
+        free(Ls)
+        free(A)
     return agg_np
 
 

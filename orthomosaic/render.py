@@ -57,6 +57,12 @@ class ImageCache:
                 self._loading.pop(key).set()
             return value
 
+    def clear(self):
+        """Drop every cached entry (loads in progress finish normally)."""
+        with self._lock:
+            self._data.clear()
+            self._size = 0
+
 
 def render(frames, affines: dict, gains: dict, backend, out_path: str, gsd: float,
            epsg: Optional[int], origin_offset: tuple[float, float], render_scale: float = 1.0,

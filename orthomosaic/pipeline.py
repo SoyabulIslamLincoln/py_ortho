@@ -182,16 +182,30 @@ def align_images(images: Union[str, Sequence[str]], opt: Options) -> AlignResult
              "" if opt.neighbors else ", auto", backend.name)
     t = time.time()
     thresh = 3.0 / work_scale
+    mutual = {}                     # verified pairs' mutual nearest neighbours, reused by sfm.reconstruct
 
     def _m(ij):
         i, j = ij
-        return match_pair(backend, i, j, feats[i], feats[j], thresh, opt.ratio, min_inliers=opt.min_inliers)
+        return match_pair(backend, i, j, feats[i], feats[j], thresh, opt.ratio, min_inliers=opt.min_inliers,
+                          mutual_out=mutual)
 
     if backend.parallel_blocks:
         with ThreadPoolExecutor(workers) as ex:
             pairs = [p for p in ex.map(_m, cand) if p is not None]
     else:
-        pairs = [p for p in map(_m, cand) if p is not None]
+        # one device stream: match on the GPU pair after pair while CPU threads verify the
+        # previous pairs (same per-pair computation and result order as match_pair)
+        from .align import _verify_pair
+        with ThreadPoolExecutor(workers) as ex:
+            futs = []
+            for i, j in cand:
+                fi, fj = feats[i], feats[j]
+                if len(fi) < opt.min_inliers or len(fj) < opt.min_inliers:
+                    continue
+                mm = backend.match_mutual(fi.desc, fj.desc)
+                futs.append(ex.submit(_verify_pair, i, j, fi, fj, mm, thresh, opt.ratio,
+                                      min_inliers=opt.min_inliers, mutual_out=mutual))
+            pairs = [p for p in (f.result() for f in futs) if p is not None]
     log.info("  %d/%d pairs verified in %.1fs", len(pairs), len(cand), time.time() - t)
     if not pairs:
         raise RuntimeError("No image pairs could be matched; check overlap / image quality")
@@ -204,8 +218,10 @@ def align_images(images: Union[str, Sequence[str]], opt: Options) -> AlignResult
                     len(dropped), ", ".join(dropped[:10]) + (" ..." if len(dropped) > 10 else ""))
     log.info("Aligned %d images, georeferenced=%s, native GSD=%.4f, match RMS=%.2f px",
              len(al.used), al.georeferenced, al.gsd, al.residual_px)
-    return AlignResult(frames, feats, work_scale, pairs, len(cand), al, positions, epsg, origin,
-                       backend, workers, dropped, thermal_range)
+    res = AlignResult(frames, feats, work_scale, pairs, len(cand), al, positions, epsg, origin,
+                      backend, workers, dropped, thermal_range)
+    res._mutual = mutual            # private cache (not a field: absent after dataclasses.replace)
+    return res
 
 
 def build_orthomosaic(images: Union[str, Sequence[str]], output: str,

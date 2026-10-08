@@ -319,7 +319,8 @@ def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions
                     vol.append(backend.to_numpy(score_at(Zst, level, gsd_l, X0, Y0)))
                 vol = np.concatenate(vol)
                 cost = np.ascontiguousarray(1.0 - np.clip(vol, -1.0, 1.0), np.float32)
-                agg = _mvs.sgm(cost, opt.sgm_p1, opt.sgm_p2)
+                # GPU backends run one tile at a time: give the CPU aggregation every core
+                agg = _mvs.sgm(cost, opt.sgm_p1, opt.sgm_p2, 1 if backend.parallel_blocks else max(1, workers))
                 bi = np.argmin(agg, axis=0)
                 bestZ = backend.asarray(cands[bi], xp.float32)
             else:
@@ -493,6 +494,12 @@ def fill_holes(Z: np.ndarray) -> np.ndarray:
 
 def _box_mean(a: np.ndarray, r: int) -> np.ndarray:
     """Mean over a (2r+1)^2 window (edge-clamped), via cumulative sums."""
+    if r > 0 and a.ndim == 2 and a.dtype in (np.float32, np.bool_):
+        try:
+            from . import _fast                       # same float64 table, compiled
+            return _fast.box_edge_mean(np.ascontiguousarray(a, np.float32), int(r))
+        except ImportError:
+            pass
     p = np.pad(a.astype(np.float64), r + 1, mode="edge")
     c = p.cumsum(0).cumsum(1)
     k = 2 * r + 1

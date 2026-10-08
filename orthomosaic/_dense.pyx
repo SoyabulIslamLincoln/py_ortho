@@ -709,3 +709,130 @@ def sample_view_u8(const unsigned char[:, :, ::1] img, const double[:, ::1] R, c
                     out[r, c, ch] = <float>((1 - fy) * ((1 - fx) * img[y0, x0, ch] + fx * img[y0, x1, ch])
                                             + fy * ((1 - fx) * img[y1, x0, ch] + fx * img[y1, x1, ch]))
                 valid[r, c] = 1
+
+
+# ---------------------------------------------------------------- fused plane-sweep step
+cdef extern from "_sweep.h" nogil:
+    ctypedef struct om_sw_src:
+        const float* img
+        Py_ssize_t h
+        Py_ssize_t w
+        double r00, r01, r02, r10, r11, r12, r20, r21, r22
+        double b0, b1, b2
+        double f, k1, k2, k3, cx, cy
+        float* Jrow
+        float* Vrow
+        float* ring
+        double* cs
+        float* nrow
+    void om_sw_warp_row(const float* inv_row, const float* ray0, const float* ray1, const float* ray2,
+                        om_sw_src* src, int n, Py_ssize_t W, double* U, double* Vv, double* D)
+    void om_sw_cs_addsub(double* cs, const float* ha, const float* hs, Py_ssize_t W)
+    void om_sw_hsum_row(const float* ref_row, const om_sw_src* p, Py_ssize_t W, int r, float* hs)
+    void om_sw_cs_add(double* cs, const float* hs, Py_ssize_t W)
+    void om_sw_cs_sub(double* cs, const float* hs, Py_ssize_t W)
+    void om_sw_ncc_row(const double* cs, const float* mu_row, const float* sd_row, double kk, Py_ssize_t W,
+                       float* out)
+    void om_sw_combine_row(const om_sw_src* src, int n, int kk, int i, Py_ssize_t W, float* best, float* prev,
+                           float* s_prev_best, float* s_next_best, int* idx)
+
+
+def sweep_hypothesis(const float[:, ::1] ref, const float[:, ::1] mu_i, const float[:, ::1] sd_i,
+                     list srcs, const float[:, :, ::1] ray, const double[:, ::1] geo,
+                     const float[:, ::1] inv, int r, int top_k, int i, float[:, ::1] best, float[:, ::1] prev,
+                     float[:, ::1] s_prev_best, float[:, ::1] s_next_best, int[:, ::1] idx):
+    """One hypothesis of the plane sweep for all sources at once: ``ncc_warp`` for every source
+    followed by ``combine``, computed row by row (each row's warp, window sums and NCC stay in
+    cache instead of five full-image passes per source). Per pixel the arithmetic, its order and
+    the float32/float64 rounding points are exactly those of the two kernels (_sweep.h), so the
+    result is bit-identical. geo: (n, 18) per source = Rs (9, row-major), b (3), f, k1, k2, k3, cx, cy."""
+    cdef Py_ssize_t H = ref.shape[0], W = ref.shape[1], y, x, yy, k = 2 * r + 1, R2 = 2 * r + 2, HW
+    cdef int n = len(srcs), s, kk
+    cdef double kkd = 1.0 / (k * k)
+    cdef const float[:, ::1] mv
+    cdef om_sw_src* src
+    cdef om_sw_src* p
+    cdef float* hs
+    cdef float* fblock = NULL
+    cdef double* dblock = NULL
+    cdef Py_ssize_t per_f
+    if n < 1 or n > 16:
+        raise ValueError("sweep_hypothesis needs 1..16 sources")
+    if geo.shape[0] != n or geo.shape[1] != 18:
+        raise ValueError("geo must be (n_sources, 18)")
+    if (mu_i.shape[0] != H or mu_i.shape[1] != W or sd_i.shape[0] != H or sd_i.shape[1] != W
+            or inv.shape[0] != H or inv.shape[1] != W or ray.shape[0] != 3 or ray.shape[1] != H
+            or ray.shape[2] != W or best.shape[0] != H or best.shape[1] != W or prev.shape[0] != H
+            or prev.shape[1] != W or s_prev_best.shape[0] != H or s_prev_best.shape[1] != W
+            or s_next_best.shape[0] != H or s_next_best.shape[1] != W or idx.shape[0] != H
+            or idx.shape[1] != W):
+        raise ValueError("sweep_hypothesis: array shapes do not match the reference image")
+    if r < 0:
+        raise ValueError("sweep_hypothesis: negative window radius")
+    if H == 0 or W == 0:
+        return
+    HW = H * W
+    per_f = 3 * W + R2 * 4 * W
+    src = <om_sw_src*>malloc(n * sizeof(om_sw_src))
+    fblock = <float*>malloc(n * per_f * sizeof(float))
+    dblock = <double*>malloc((n * 4 * W + 3 * W) * sizeof(double))
+    if src == NULL or fblock == NULL or dblock == NULL:
+        free(src); free(fblock); free(dblock)
+        raise MemoryError()
+    for s in range(n):
+        mv = srcs[s]
+        p = &src[s]
+        p.img = &mv[0, 0]
+        p.h = mv.shape[0]
+        p.w = mv.shape[1]
+        p.r00 = geo[s, 0]; p.r01 = geo[s, 1]; p.r02 = geo[s, 2]
+        p.r10 = geo[s, 3]; p.r11 = geo[s, 4]; p.r12 = geo[s, 5]
+        p.r20 = geo[s, 6]; p.r21 = geo[s, 7]; p.r22 = geo[s, 8]
+        p.b0 = geo[s, 9]; p.b1 = geo[s, 10]; p.b2 = geo[s, 11]
+        p.f = geo[s, 12]; p.k1 = geo[s, 13]; p.k2 = geo[s, 14]; p.k3 = geo[s, 15]
+        p.cx = geo[s, 16]; p.cy = geo[s, 17]
+        p.Jrow = fblock + s * per_f
+        p.Vrow = p.Jrow + W
+        p.nrow = p.Vrow + W
+        p.ring = p.nrow + W
+        p.cs = dblock + s * 4 * W
+    kk = top_k if top_k < n else n
+    cdef const float* rayp = &ray[0, 0, 0]
+    cdef double* wU = dblock + n * 4 * W
+    cdef double* wV = wU + W
+    cdef double* wD = wV + W
+    with nogil:
+        for s in range(n):
+            for x in range(4 * W):
+                src[s].cs[x] = 0
+        # rows 0 .. r-1 enter the vertical sums first (ncc_warp phase 3 initialisation)
+        for yy in range(min(r, H)):
+            om_sw_warp_row(&inv[yy, 0], rayp + yy * W, rayp + HW + yy * W, rayp + 2 * HW + yy * W, src, n, W,
+                           wU, wV, wD)
+            for s in range(n):
+                p = &src[s]
+                hs = p.ring + (yy % R2) * 4 * W
+                om_sw_hsum_row(&ref[yy, 0], p, W, r, hs)
+                om_sw_cs_add(p.cs, hs, W)
+        for y in range(H):
+            if y + r < H:
+                yy = y + r
+                om_sw_warp_row(&inv[yy, 0], rayp + yy * W, rayp + HW + yy * W, rayp + 2 * HW + yy * W, src, n, W,
+                               wU, wV, wD)
+            for s in range(n):
+                p = &src[s]
+                if y + r < H:
+                    hs = p.ring + ((y + r) % R2) * 4 * W
+                    om_sw_hsum_row(&ref[y + r, 0], p, W, r, hs)
+                    if y - r - 1 >= 0:
+                        om_sw_cs_addsub(p.cs, hs, p.ring + ((y - r - 1) % R2) * 4 * W, W)
+                    else:
+                        om_sw_cs_add(p.cs, hs, W)
+                elif y - r - 1 >= 0:
+                    om_sw_cs_sub(p.cs, p.ring + ((y - r - 1) % R2) * 4 * W, W)
+                om_sw_ncc_row(p.cs, &mu_i[y, 0], &sd_i[y, 0], kkd, W, p.nrow)
+            om_sw_combine_row(src, n, kk, i, W, &best[y, 0], &prev[y, 0], &s_prev_best[y, 0], &s_next_best[y, 0],
+                              &idx[y, 0])
+    free(src)
+    free(fblock)
+    free(dblock)

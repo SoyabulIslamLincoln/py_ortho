@@ -85,10 +85,19 @@ def _visibility(dsm, minX, maxY, gsd, C, X, Y, Z, max_steps, tol, zmax=None):
     return vis
 
 
+try:
+    from . import _fast
+except ImportError:                       # source tree without the compiled kernel
+    _fast = None
+
+
 def _box(a, r):
     """Mean over a (2r+1)^2 window (edge-clamped), via cumulative sums."""
     if r <= 0:
         return a.astype(np.float32)
+    if _fast is not None and a.ndim == 2 and a.dtype in (np.float32, np.bool_):
+        # same float64 summed-area table, compiled (exact for these input types)
+        return _fast.box_edge_mean(np.ascontiguousarray(a, np.float32), int(r))
     p = np.pad(a.astype(np.float64), r + 1, mode="edge")
     c = p.cumsum(0).cumsum(1)
     k = 2 * r + 1
@@ -290,6 +299,17 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
     def load(k):
         i = rec.used[k]
         fr = frames[i]
+        if _fast is not None:
+            # one compiled pass (same rounding as the NumPy steps below)
+            rgb = load_rgb(fr, img_scale)
+            h, w = rgb.shape[:2]
+            rgb = _fast.ortho_rgbw(np.ascontiguousarray(rgb, np.uint8), gains.get(i), biases.get(i),
+                                   load_mask(fr.path, w, h), u8)
+            it = rec.intr[rec.cam_group[k]]
+            sx = rgb.shape[1] / fr.width
+            return _View([], rgb if u8 else backend.upload(rgb),
+                         np.ascontiguousarray(rec.R[k]), np.ascontiguousarray(rec.C[k]),
+                         it.f * sx, it.k1, it.k2, (it.cx + 0.5) * sx - 0.5, (it.cy + 0.5) * sx - 0.5, it.k3)
         rgb = load_rgb(fr, img_scale).astype(np.float32)
         gg = gains.get(i)
         if gg is not None:
@@ -376,6 +396,23 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
     log.info("True orthophoto: global source selection, %d photos over %d grid cells of %.2f m (%.1fs)",
              len(np.unique(gl)), gl.size, gstep * gsd, time.time() - t_g)
 
+    def _vis_map(C, sub, X0, Y0, py0, px0, vis_h, vis_w):
+        """Occlusion test on every `occ_stride`-th cell of the tile; a coarse cell is visible only
+        if it and its 4-neighbours are."""
+        sr, scc = np.nonzero(sub[::occ_stride, ::occ_stride])
+        vis_map = np.ones((vis_h, vis_w), bool)
+        if sr.size:
+            sr_, sc_ = sr * occ_stride, scc * occ_stride
+            vis_map[sr, scc] = _visibility(dsm_c, minX, maxY, gsd, C, X0 + (sc_ + 0.5) * gsd,
+                                           Y0 - (sr_ + 0.5) * gsd, dsm[py0 + sr_, px0 + sc_],
+                                           occ_steps, occ_tol, zmax)
+            if occ_stride > 1:   # a coarse cell is visible only if it and its 4-neighbours are
+                vm = vis_map.copy()
+                vm[1:] &= vis_map[:-1]; vm[:-1] &= vis_map[1:]
+                vm[:, 1:] &= vis_map[:, :-1]; vm[:, :-1] &= vis_map[:, 1:]
+                vis_map = vm
+        return vis_map
+
     def process(tile):
         tx, ty = tile
         tw, th = min(T, W - tx), min(T, H - ty)
@@ -401,55 +438,62 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
         views = [cache.get(k) for k in cand]
 
         rr, cc = np.nonzero(sub)
-        wx = X0 + (cc + 0.5) * gsd                 # map coordinates of cell centres
-        wy = Y0 - (rr + 0.5) * gsd
-        wz = dsm[py0 + rr, px0 + cc].astype(np.float64)
-        n_c = normals(py0, py1, px0, px1)[rr, cc]
-        vis_h, vis_w = -(-ph // occ_stride), -(-pw // occ_stride)
         L = len(cand)
         cols = np.zeros((L, ph, pw, 3), np.float32)
         score = np.full((L, ph, pw), -1.0, np.float32)            # -1 = not usable
         score_nv = np.full((L, ph, pw), -1.0, np.float32)         # same, ignoring occlusion (hidden fill)
         inv_depth = np.zeros((L, rr.size), np.float32)
-        for j, (k, v) in enumerate(zip(cand, views)):
-            rgbw, vv = sample(v, X0, Y0, Ztile)
-            rgbw = np.nan_to_num(rgbw, nan=0.0, posinf=0.0, neginf=0.0)
-            valid = (vv[rr, cc] > 0) & (rgbw[rr, cc, 3] > 0)
-            C = rec.C[k].astype(np.float64)
-            ray = np.column_stack([C[0] - wx, C[1] - wy, C[2] - wz])
-            rng_ = np.linalg.norm(ray, axis=1) + 1e-9
-            cos_n = np.clip(np.sum(ray * n_c, 1) / rng_, 0.0, 1.0)     # vs. surface normal
-            if use_occ:
-                sr, scc = np.nonzero(sub[::occ_stride, ::occ_stride])
-                vis_map = np.ones((vis_h, vis_w), bool)
-                if sr.size:
-                    sr_, sc_ = sr * occ_stride, scc * occ_stride
-                    vis_map[sr, scc] = _visibility(dsm_c, minX, maxY, gsd, C, X0 + (sc_ + 0.5) * gsd,
-                                                   Y0 - (sr_ + 0.5) * gsd, dsm[py0 + sr_, px0 + sc_],
-                                                   occ_steps, occ_tol, zmax)
-                    if occ_stride > 1:   # a coarse cell is visible only if it and its 4-neighbours are
-                        vm = vis_map.copy()
-                        vm[1:] &= vis_map[:-1]; vm[:-1] &= vis_map[1:]
-                        vm[:, 1:] &= vis_map[:, :-1]; vm[:, :-1] &= vis_map[:, 1:]
-                        vis_map = vm
-                vis = vis_map[rr // occ_stride, cc // occ_stride]
-            else:
-                vis = np.ones(rr.size, bool)
-            ok = valid & vis
-            px = rgbw[rr, cc, :3]
-            lum = px.mean(1)
-            expo = np.where((lum > 250) | (lum < 5), 0.0, 1.0)            # clipped samples
-            depth = np.sum((np.column_stack([wx, wy, wz]) - C) * rec.R[k][2], 1)   # camera-axis depth
-            inv_depth[j] = np.where(ok, 1.0 / np.maximum(depth, 1e-3), 0)
-            s = (w_ang * cos_n ** va_power + w_bord * np.clip(rgbw[rr, cc, 3], 0, 1) + w_exp * expo)
-            cols[j, rr, cc] = px
-            score[j, rr, cc] = np.where(ok, s, -1.0)
-            score_nv[j, rr, cc] = np.where(valid, s, -1.0)
-        # resolution term: projected pixel size relative to the finest view at this cell
-        best = inv_depth.max(0)
-        res_t = np.where(best > 0, inv_depth / np.maximum(best, 1e-9), 0)
-        for j in range(L):
-            score[j, rr, cc] = np.where(score[j, rr, cc] >= 0, score[j, rr, cc] + w_res * res_t[j], -1.0)
+        vis_h, vis_w = -(-ph // occ_stride), -(-pw // occ_stride)
+        if _fast is not None:
+            # compiled per-view scoring (same arithmetic as the NumPy branch below)
+            sub8 = np.ascontiguousarray(sub).view(np.uint8)
+            nwin = np.ascontiguousarray(normals(py0, py1, px0, px1), np.float32)
+            for j, (k, v) in enumerate(zip(cand, views)):
+                rgbw, vv = sample(v, X0, Y0, Ztile)
+                C = rec.C[k].astype(np.float64)
+                vis_map = _vis_map(C, sub, X0, Y0, py0, px0, vis_h, vis_w) if use_occ else None
+                cos_n = _fast.ortho_view_cos(sub8, dsm, py0, px0, float(X0), float(Y0), float(gsd), nwin,
+                                             float(C[0]), float(C[1]), float(C[2]))
+                Rz = np.asarray(rec.R[k][2], np.float64)
+                _fast.ortho_view_fill(sub8, dsm, py0, px0, float(X0), float(Y0), float(gsd),
+                                      np.ascontiguousarray(rgbw, np.float32), np.ascontiguousarray(vv, np.uint8),
+                                      (vis_map if use_occ else np.ones((1, 1), bool)).view(np.uint8), occ_stride,
+                                      use_occ, float(C[0]), float(C[1]), float(C[2]), float(Rz[0]), float(Rz[1]),
+                                      float(Rz[2]), np.ascontiguousarray(cos_n ** va_power, np.float64), w_ang,
+                                      w_bord, w_exp, cols[j], score[j], score_nv[j], inv_depth[j])
+            _fast.ortho_resolution(sub8, inv_depth, score, w_res)
+        else:
+            wx = X0 + (cc + 0.5) * gsd                 # map coordinates of cell centres
+            wy = Y0 - (rr + 0.5) * gsd
+            wz = dsm[py0 + rr, px0 + cc].astype(np.float64)
+            n_c = normals(py0, py1, px0, px1)[rr, cc]
+            for j, (k, v) in enumerate(zip(cand, views)):
+                rgbw, vv = sample(v, X0, Y0, Ztile)
+                rgbw = np.nan_to_num(rgbw, nan=0.0, posinf=0.0, neginf=0.0)
+                valid = (vv[rr, cc] > 0) & (rgbw[rr, cc, 3] > 0)
+                C = rec.C[k].astype(np.float64)
+                ray = np.column_stack([C[0] - wx, C[1] - wy, C[2] - wz])
+                rng_ = np.linalg.norm(ray, axis=1) + 1e-9
+                cos_n = np.clip(np.sum(ray * n_c, 1) / rng_, 0.0, 1.0)     # vs. surface normal
+                if use_occ:
+                    vis = _vis_map(C, sub, X0, Y0, py0, px0, vis_h, vis_w)[rr // occ_stride, cc // occ_stride]
+                else:
+                    vis = np.ones(rr.size, bool)
+                ok = valid & vis
+                px = rgbw[rr, cc, :3]
+                lum = px.mean(1)
+                expo = np.where((lum > 250) | (lum < 5), 0.0, 1.0)            # clipped samples
+                depth = np.sum((np.column_stack([wx, wy, wz]) - C) * rec.R[k][2], 1)   # camera-axis depth
+                inv_depth[j] = np.where(ok, 1.0 / np.maximum(depth, 1e-3), 0)
+                s = (w_ang * cos_n ** va_power + w_bord * np.clip(rgbw[rr, cc, 3], 0, 1) + w_exp * expo)
+                cols[j, rr, cc] = px
+                score[j, rr, cc] = np.where(ok, s, -1.0)
+                score_nv[j, rr, cc] = np.where(valid, s, -1.0)
+            # resolution term: projected pixel size relative to the finest view at this cell
+            best = inv_depth.max(0)
+            res_t = np.where(best > 0, inv_depth / np.maximum(best, 1e-9), 0)
+            for j in range(L):
+                score[j, rr, cc] = np.where(score[j, rr, cc] >= 0, score[j, rr, cc] + w_res * res_t[j], -1.0)
         wsum_w = max(w_ang + w_res + w_bord + w_exp, 1e-6)
         usable = score >= 0
         count = usable.sum(0)                                     # views that *see* the cell

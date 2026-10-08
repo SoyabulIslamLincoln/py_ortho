@@ -15,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -60,15 +61,22 @@ class Reconstruction:
 # 1. plane + parallax matching
 # --------------------------------------------------------------------------
 
-def _pair_matches(backend, fi, fj, M_ij, epipole_j, perp_thresh, max_parallax, ratio):
-    """Return (idx_i, idx_j) of verified matches between two images."""
+def _pair_matches(backend, fi, fj, M_ij, epipole_j, perp_thresh, max_parallax, ratio, mutual=None):
+    """Return (idx_i, idx_j) of verified matches between two images. `mutual`: the same pair's
+    mutual nearest neighbours already found by the 2D matching (align.match_pair's
+    ``mutual_out``), used instead of matching the descriptors a second time (same result)."""
     if len(fi) < 8 or len(fj) < 8:
         return None
-    i12, b12, s12, i21 = backend.match_mutual(fi.desc, fj.desc)
-    q = np.arange(len(i12))
-    ok = (i12 >= 0) & (b12 < ratio * s12) & (b12 <= 90)
-    ok &= i21[np.clip(i12, 0, None)] == q
-    a, b = q[ok], i12[ok]
+    if mutual is not None and mutual[0] is fi.desc and mutual[1] is fj.desc:
+        _, _, mq, mi, mb, ms = mutual
+        ok = (mb < ratio * ms) & (mb <= 90)
+        a, b = mq[ok].astype(np.int64), mi[ok].astype(np.int32)
+    else:
+        i12, b12, s12, i21 = backend.match_mutual(fi.desc, fj.desc)
+        q = np.arange(len(i12))
+        ok = (i12 >= 0) & (b12 < ratio * s12) & (b12 <= 90)
+        ok &= i21[np.clip(i12, 0, None)] == q
+        a, b = q[ok], i12[ok]
     if len(a) < 8:
         return None
     pi = fi.xy[a]
@@ -138,6 +146,43 @@ def _build_tracks(n_feats, pair_results, min_len=2):
             continue
         tracks.append((ti, tf))
     return tracks
+
+
+def _build_tracks_flat(n_feats, pair_results, min_len=2):
+    """_build_tracks with the union-find loop in C (``_fast.union_tracks``): the same edge order,
+    merge refusals and roots, hence the same tracks in the same order. Returns the concatenated
+    (image, feature) arrays of the kept tracks and their lengths."""
+    if not pair_results:
+        tracks = _build_tracks(n_feats, pair_results, min_len)        # raises as before
+        return (np.concatenate([t[0] for t in tracks]), np.concatenate([t[1] for t in tracks]),
+                np.array([len(t[0]) for t in tracks], np.int64))
+    from . import _fast
+    offs = np.concatenate([[0], np.cumsum(n_feats)])
+    strong = sorted(pair_results, key=lambda r: -len(r[1][0]))        # strongest pairs first
+    na = np.ascontiguousarray(np.concatenate([offs[i] + a for (i, j), (a, b) in strong]), np.int64)
+    nb = np.ascontiguousarray(np.concatenate([offs[j] + b for (i, j), (a, b) in strong]), np.int64)
+    ia = np.concatenate([np.full(len(a), i, np.int32) for (i, j), (a, b) in strong])
+    ib = np.concatenate([np.full(len(b), j, np.int32) for (i, j), (a, b) in strong])
+    parent = _fast.union_tracks(na, nb, ia, ib, int(offs[-1]), len(n_feats))
+    del na, nb, ia, ib
+    nodes = np.unique(np.concatenate([np.concatenate([offs[i] + a, offs[j] + b])
+                                      for (i, j), (a, b) in pair_results]))
+    roots = _fast.find_roots(parent, np.ascontiguousarray(nodes, np.int64))
+    order = np.argsort(roots, kind="stable")
+    nodes, roots = nodes[order], roots[order]
+    img = np.searchsorted(offs, nodes, side="right") - 1
+    feat = nodes - offs[img]
+    splits = np.flatnonzero(np.diff(roots)) + 1
+    starts = np.concatenate([[0], splits])
+    lens = np.diff(np.concatenate([starts, [len(nodes)]]))
+    # nodes ascend inside a track, so two features of one image are adjacent
+    dup = np.zeros(len(nodes), bool)
+    dup[1:] = img[1:] == img[:-1]
+    dup[starts] = False
+    bad = np.add.reduceat(dup.astype(np.int64), starts) > 0
+    keep = (lens >= min_len) & ~bad
+    m = np.repeat(keep, lens)
+    return img[m], feat[m], lens[keep]
 
 
 # --------------------------------------------------------------------------
@@ -242,7 +287,11 @@ def _prior_cost(C, intr, pri: Priors, X=None, R=None):
 
 
 def bundle_adjust(rec: Reconstruction, pri: Priors, huber: float, max_iter: int = 30,
-                  tol: float = 1e-6) -> float:
+                  tol: float = 1e-6, workers: int = 0) -> float:
+    """Levenberg-Marquardt on the Schur-reduced system. `workers` threads build the system
+    (0 = all cores); the result does not depend on the thread count."""
+    import os
+    nt = workers or os.cpu_count() or 1
     R = np.ascontiguousarray(rec.R)
     C = np.ascontiguousarray(rec.C)
     X = np.ascontiguousarray(rec.X)
@@ -259,10 +308,11 @@ def bundle_adjust(rec: Reconstruction, pri: Priors, huber: float, max_iter: int 
         pri.X_weight, pri.X_target = rec.pt_prior_w, rec.pt_prior_t
     pw, pt_tgt = pri.point_arrays(len(X))
     lam = 1e-3
-    _, cost0 = _ba.residuals(R, C, X, intr, pp, cg, oc, op, uv, huber)
+    _, cost0 = _ba.residuals(R, C, X, intr, pp, cg, oc, op, uv, huber, workers=nt)
     cost = cost0 + _prior_cost(C, intr, pri, X, R)
     for it in range(max_iter):
-        S, g, Vinv, gp, _, _ = _ba.reduced_system(R, C, X, intr, pp, cg, oc, uv, ptr, huber, lam, pw, pt_tgt)
+        S, g, Vinv, gp, _, _ = _ba.reduced_system(R, C, X, intr, pp, cg, oc, uv, ptr, huber, lam, pw, pt_tgt,
+                                                  workers=nt)
         _apply_priors(S, g, C, intr, pri, N, R)
         improved = False
         for _ in range(8):
@@ -270,13 +320,13 @@ def bundle_adjust(rec: Reconstruction, pri: Priors, huber: float, max_iter: int 
                 dc = np.linalg.solve(S, -g)
             except np.linalg.LinAlgError:
                 dc = np.linalg.lstsq(S, -g, rcond=None)[0]
-            dp = _ba.back_substitute(R, C, X, intr, pp, cg, oc, uv, ptr, huber, Vinv, gp, dc)
+            dp = _ba.back_substitute(R, C, X, intr, pp, cg, oc, uv, ptr, huber, Vinv, gp, dc, workers=nt)
             dcam = dc[:6 * N].reshape(N, 6)
             R2 = np.ascontiguousarray(rodrigues(dcam[:, :3]) @ R)
             C2 = C + dcam[:, 3:]
             I2 = intr + dc[6 * N:].reshape(-1, 6)
             X2 = X + dp
-            _, c2 = _ba.residuals(R2, C2, X2, I2, pp, cg, oc, op, uv, huber)
+            _, c2 = _ba.residuals(R2, C2, X2, I2, pp, cg, oc, op, uv, huber, workers=nt)
             c2 += _prior_cost(C2, I2, pri, X2, R2)
             if c2 < cost:
                 R, C, intr, X = R2, C2, I2, np.ascontiguousarray(X2)
@@ -287,14 +337,15 @@ def bundle_adjust(rec: Reconstruction, pri: Priors, huber: float, max_iter: int 
                 break
             # reject: increase damping and rebuild the damped system
             lam *= 10
-            S, g, Vinv, gp, _, _ = _ba.reduced_system(R, C, X, intr, pp, cg, oc, uv, ptr, huber, lam, pw, pt_tgt)
+            S, g, Vinv, gp, _, _ = _ba.reduced_system(R, C, X, intr, pp, cg, oc, uv, ptr, huber, lam, pw, pt_tgt,
+                                                      workers=nt)
             _apply_priors(S, g, C, intr, pri, N, R)
         if not improved or rel < tol:
             break
     rec.R, rec.C, rec.X = R, C, X
     for k, it in enumerate(rec.intr):
         it.f, it.k1, it.k2, it.k3, it.ppx, it.ppy = (float(v) for v in intr[k])
-    err, _ = _ba.residuals(R, C, X, intr, pp, cg, oc, op, uv, huber)
+    err, _ = _ba.residuals(R, C, X, intr, pp, cg, oc, op, uv, huber, workers=nt)
     return err
 
 
@@ -329,7 +380,8 @@ def _keep_observations(rec: Reconstruction, keep_obs: np.ndarray, min_views: int
 _POPCOUNT = np.array([bin(v).count("1") for v in range(256)], np.uint8)
 
 
-def _extend_tracks(rec: Reconstruction, feats, radius: float, max_track: int = 8, max_ham: int = 24):
+def _extend_tracks(rec: Reconstruction, feats, radius: float, max_track: int = 8, max_ham: int = 24,
+                   workers: int = 0):
     """Guided track extension (as Pix4D/OpenSfM do when they grow tracks): project every point
     into each image that sees it but has no observation of it, and adopt the nearest unused
     keypoint within `radius` px with the best descriptor (Lowe ratio against the runner-up). The
@@ -337,7 +389,13 @@ def _extend_tracks(rec: Reconstruction, feats, radius: float, max_track: int = 8
     the current lens model and biases the distortion estimate (doming). Pairwise matching only links each image
     to its ~12 nearest neighbours, so a point seen by 40 images otherwise gets a 2-3 view track.
     Tracks are capped at `max_track` views (bundle-adjustment cost grows with track length^2)."""
-    from scipy.spatial import cKDTree
+    try:
+        from scipy.spatial import cKDTree
+        query = lambda pts, q: cKDTree(pts).query(q, k=4, distance_upper_bound=radius)   # noqa: E731
+    except ImportError:            # SciPy is optional: the same exact radius-limited 4-NN, compiled
+        from . import _fast
+        query = lambda pts, q: _fast.knn_radius(np.ascontiguousarray(pts, np.float64),   # noqa: E731
+                                                np.ascontiguousarray(q, np.float64), 4, float(radius))
     P, N = len(rec.X), len(rec.used)
     if P == 0 or rec.obs_feat is None:
         return 0
@@ -352,12 +410,15 @@ def _extend_tracks(rec: Reconstruction, feats, radius: float, max_track: int = 8
     room[f0 < 0] = 0                                       # never extend control points
     observed = np.zeros(N * P, bool)
     observed[rec.obs_cam.astype(np.int64) * P + rec.obs_pt] = True
-    cand_pt, cand_cam, cand_feat, cand_ham = [], [], [], []
-    for k, i in enumerate(rec.used):
+    taken_all = rec.obs_feat >= 0
+
+    def camera(k):
+        """Candidate observations of camera k (independent of the other cameras)."""
+        i = rec.used[k]
         it = rec.intr[rec.cam_group[k]]
         idx = np.flatnonzero((room > 0) & ~observed[k * P:(k + 1) * P])
         if len(idx) == 0 or len(feats[i]) == 0:
-            continue
+            return None
         Xc = (rec.X[idx] - rec.C[k]) @ rec.R[k].T
         front = Xc[:, 2] > 0
         idx = idx[front]
@@ -367,11 +428,11 @@ def _extend_tracks(rec: Reconstruction, feats, radius: float, max_track: int = 8
         inb = (uv[:, 0] >= 0) & (uv[:, 0] < it.width) & (uv[:, 1] >= 0) & (uv[:, 1] < it.height)
         idx, uv = idx[inb], uv[inb]
         if len(idx) == 0:
-            continue
+            return None
         nkp = len(feats[i])
-        d, nn = cKDTree(feats[i].xy).query(uv, k=4, distance_upper_bound=radius)
+        d, nn = query(feats[i].xy, uv)
         taken = np.zeros(nkp + 1, bool)                    # index nkp = "no neighbour"
-        taken[rec.obs_feat[(rec.obs_cam == k) & (rec.obs_feat >= 0)]] = True
+        taken[rec.obs_feat[(rec.obs_cam == k) & taken_all]] = True
         valid = np.isfinite(d) & ~taken[nn]
         ham = np.full(nn.shape, 999, np.int32)
         ham[valid] = _POPCOUNT[feats[i].desc[nn[valid]] ^ pdesc[np.broadcast_to(idx[:, None], nn.shape)[valid]]
@@ -382,12 +443,19 @@ def _extend_tracks(rec: Reconstruction, feats, radius: float, max_track: int = 8
         good = (best <= max_ham) & (best < 0.8 * second)
         idx, nn, ham = idx[good], np.take_along_axis(nn, o[:, :1], 1)[good, 0], best[good]
         if len(idx) == 0:
-            continue
+            return None
         o = np.lexsort((ham, nn))                          # one point per keypoint: best descriptor
         first_kp = np.r_[True, np.diff(nn[o]) != 0]
         o = o[first_kp]
-        cand_pt.append(idx[o]); cand_cam.append(np.full(len(o), k, np.int32))
-        cand_feat.append(nn[o]); cand_ham.append(ham[o])
+        return idx[o], np.full(len(o), k, np.int32), nn[o], ham[o]
+
+    # cameras in parallel, results kept in camera order
+    with ThreadPoolExecutor(max(1, min(workers or os.cpu_count() or 1, N))) as ex:
+        found = [r for r in ex.map(camera, range(N)) if r is not None]
+    cand_pt = [r[0] for r in found]
+    cand_cam = [r[1] for r in found]
+    cand_feat = [r[2] for r in found]
+    cand_ham = [r[3] for r in found]
     if not cand_pt:
         return 0
     pt, cam, ft, ham = (np.concatenate(a) for a in (cand_pt, cand_cam, cand_feat, cand_ham))
@@ -396,8 +464,12 @@ def _extend_tracks(rec: Reconstruction, feats, radius: float, max_track: int = 8
     start = np.searchsorted(pt, pt)
     keep = (np.arange(len(pt)) - start) < room[pt]
     pt, cam, ft = pt[keep], cam[keep], ft[keep]
-    uv = np.concatenate([feats[rec.used[k]].xy[f][None] for k, f in zip(cam.tolist(), ft.tolist())]) \
-        if len(pt) else np.zeros((0, 2))
+    if len(pt):
+        offs = np.concatenate([[0], np.cumsum([len(feats[i]) for i in rec.used])])
+        xy_all = np.concatenate([feats[i].xy for i in rec.used])     # keypoints of camera k at offs[k]
+        uv = xy_all[offs[cam] + ft]
+    else:
+        uv = np.zeros((0, 2))
     rec.obs_cam = np.concatenate([rec.obs_cam, cam]).astype(np.int32)
     rec.obs_pt = np.concatenate([rec.obs_pt, pt.astype(np.int32)])
     rec.obs_uv = np.concatenate([rec.obs_uv, uv])
@@ -528,27 +600,41 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
         it = intr[cam_group[lj]]
         K = np.array([[it.f, 0, it.cx], [0, it.f, it.cy], [0, 0, 1]])
         e = K @ (R[lj] @ (C[li] - C[lj]))
-        res = _pair_matches(ar.backend, feats[i], feats[j], M, e, perp, max_par, ratio)
+        res = _pair_matches(ar.backend, feats[i], feats[j], M, e, perp, max_par, ratio, mutual.get((i, j)))
         return (i, j), res
 
+    # the 2D matching already found every verified pair's mutual nearest neighbours: reuse them
+    # (identical descriptors and matcher -> identical matches) instead of matching again
+    mutual = getattr(ar, "_mutual", None) or {}
+    cached = all((i, j) in mutual for i, j in pair_list)
     t = time.time()
-    if ar.backend.parallel_blocks:
+    if ar.backend.parallel_blocks or (cached and pair_list):    # no device calls left: CPU threads
         with ThreadPoolExecutor(ar.workers) as ex:
             results = [r for r in ex.map(job, pair_list) if r[1] is not None]
     else:
         results = [r for r in map(job, pair_list) if r[1] is not None]
     n_matches = sum(len(r[1][0]) for r in results)
     log.info("3D matching: %d pairs, %d verified matches in %.1fs", len(results), n_matches, time.time() - t)
+    if mutual:
+        ar._mutual = None                       # release the cached 2D matches
 
     # ---- 2. tracks
     t = time.time()
-    tracks = _build_tracks([len(f) for f in feats], results, min_track)
-    obs_cam = np.concatenate([np.array([local[i] for i in ti], np.int32) for ti, _ in tracks])
-    obs_pt = np.concatenate([np.full(len(ti), k, np.int32) for k, (ti, _) in enumerate(tracks)])
-    obs_uv = np.concatenate([np.stack([feats[i].xy[f] for i, f in zip(ti, tf)]) for ti, tf in tracks])
-    obs_feat = np.concatenate([np.asarray(tf, np.int64) for _, tf in tracks])
-    obs_col = np.concatenate([np.stack([feats[i].color[f] for i, f in zip(ti, tf)]) for ti, tf in tracks])
-    P = len(tracks)
+    n_feats = [len(f) for f in feats]
+    ti, tf, lens = _build_tracks_flat(n_feats, results, min_track)
+    P = len(lens)
+    if P == 0:
+        np.concatenate([])                      # no track: same error as before
+    offs = np.concatenate([[0], np.cumsum(n_feats)])
+    cam_of = np.full(len(feats), -1, np.int64)
+    cam_of[np.asarray(list(local), np.int64)] = np.asarray(list(local.values()), np.int64)
+    obs_cam = cam_of[ti].astype(np.int32)
+    obs_pt = np.repeat(np.arange(P, dtype=np.int32), lens)
+    gidx = offs[ti] + tf
+    obs_uv = np.concatenate([f.xy for f in feats])[gidx]
+    obs_feat = np.asarray(tf, np.int64)
+    obs_col = np.concatenate([f.color for f in feats])[gidx]
+    del gidx
     color = np.zeros((P, 3))
     np.add.at(color, obs_pt, obs_col)
     color = np.clip(color / np.bincount(obs_pt, minlength=P)[:, None], 0, 255).astype(np.uint8)
@@ -622,7 +708,7 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
         rec.X, ang = triangulate(rec.R, rec.C, rec.intr_array(), rec.pp_array(), rec.cam_group,
                                  rec.obs_cam, rec.obs_pt, rec.obs_uv, P)
         err, _ = _ba.residuals(rec.R, rec.C, rec.X, rec.intr_array(), rec.pp_array(), rec.cam_group,
-                               rec.obs_cam, rec.obs_pt, rec.obs_uv, 1e9)
+                               rec.obs_cam, rec.obs_pt, rec.obs_uv, 1e9, workers=ar.workers)
         keep = (err < (0.02 * diag if attempt == 0 else 30 * px)) & (ang[rec.obs_pt] > 1.0)
         _keep_observations(rec, keep)
         if keep.mean() >= 0.6 or keep.mean() < prev + 0.05 or attempt == 5:
@@ -632,7 +718,8 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
                  "(median error %.0f px); refining poses and re-triangulating", 100 * keep.mean(), np.median(err))
         # poses only: on this small, still-contaminated subset a free lens (k1-k3, principal
         # point) would absorb pose errors and corrupt every later triangulation
-        bundle_adjust(rec, dataclasses.replace(pri, intr_sigma=np.full_like(pri.intr_sigma, 1e-9)), 8 * px)
+        bundle_adjust(rec, dataclasses.replace(pri, intr_sigma=np.full_like(pri.intr_sigma, 1e-9)), 8 * px,
+                      workers=ar.workers)
     log.info("  %d points, %d observations pass the initial triangulation (%.0f%%)",
              len(rec.X), len(rec.obs_pt), 100 * keep.mean())
 
@@ -643,7 +730,7 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
     # ---- 5. robust BA rounds with outlier rejection
     for rnd, (huber, thr) in enumerate([(8 * px, 30 * px), (3 * px, 8 * px), (2 * px, 4 * px)]):
         t = time.time()
-        err = bundle_adjust(rec, pri, huber)
+        err = bundle_adjust(rec, pri, huber, workers=ar.workers)
         keep = err < thr
         log.info("  BA round %d: %d points, %d obs, median err %.2f px, dropping %d obs > %.1f px (%.1fs)",
                  rnd + 1, len(rec.X), len(err), float(np.median(err)), int((~keep).sum()), thr, time.time() - t)
@@ -659,11 +746,11 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
             t = time.time()
             rad = float(np.clip(6.0 * 1.4826 * np.median(err[keep]), 4.0 * px, 12.0 * px))
             n_obs = len(rec.obs_pt)
-            added = _extend_tracks(rec, feats, rad, max_track)
+            added = _extend_tracks(rec, feats, rad, max_track, workers=ar.workers)
             log.info("  track extension: +%d observations (radius %.1f px), mean track %.2f -> %.2f (%.1fs)",
                      added, rad, n_obs / len(rec.X), len(rec.obs_pt) / len(rec.X), time.time() - t)
 
-    err = bundle_adjust(rec, pri, 2 * px)
+    err = bundle_adjust(rec, pri, 2 * px, workers=ar.workers)
     rec.rms_px = float(np.sqrt(np.mean(np.square(err))))
     rec.stats = dict(points=int(len(rec.X)), observations=int(len(err)), pairs=len(results),
                      rms_px=rec.rms_px, focal_px=[it.f for it in rec.intr],

@@ -490,8 +490,8 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                 cls = np.where(below & (cls == 2), 1, cls).astype(np.uint8)
         las_path = os.path.join(out_dir, "dense.las")
         spacing = cloud.spacing if cloud is not None else gsd * max(1, opt.cloud_step)
-        export.write_las(las_path, xyz + np.array(offset3), col, epsg, scale=las_scale(spacing),
-                         classification=cls)
+        export.write_las(las_path, xyz, col, epsg, scale=las_scale(spacing), classification=cls,
+                         add=np.array(offset3))
         outputs["dense_las"] = "dense.las"
         if "laz" in opt.formats:
             laz = export.las_to_laz(las_path)
