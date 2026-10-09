@@ -84,14 +84,13 @@ def _run_old(ref, mu, sd, srcs, ray, geo, cams, hyps, r, top_k):
     return st, idx
 
 
-def _run_new(ref, mu, sd, srcs, ray, geo, cams, hyps, r, top_k, cached=False):
+def _run_new(ref, mu, sd, srcs, ray, geo, cams, hyps, r, top_k):
     H, W = ref.shape
     G = np.array([np.r_[Rs.ravel(), b, c] for (Rs, b), c in zip(geo, cams)], np.float64)
     st = [np.full((H, W), -2.0, np.float32) for _ in range(4)]
     idx = np.full((H, W), -1, np.int32)
-    rotated = _dense.sweep_rays(ray, G) if cached else None
     for i, inv in enumerate(hyps):
-        _dense.sweep_hypothesis(ref, mu, sd, srcs, ray, G, inv, r, top_k, i, st[0], st[1], st[2], st[3], idx, rotated)
+        _dense.sweep_hypothesis(ref, mu, sd, srcs, ray, G, inv, r, top_k, i, st[0], st[1], st[2], st[3], idx)
     return st, idx
 
 
@@ -105,8 +104,6 @@ def test_sweep_hypothesis_matches_ncc_warp_combine():
         assert _same(ia, ib), (H, W, n, r)
         for x, y in zip(a, b):
             assert _same(x, y), (H, W, n, r)
-        c, ic = _run_new(*case, r, top_k, cached=True)
-        assert _same(ia, ic) and all(_same(x, y) for x, y in zip(a, c)), (H, W, n, r, 'cached')
     # equal scores everywhere (flat images): ties keep the first hypothesis, as before
     ref, mu, sd, srcs, ray, geo, cams, hyps = _sweep_case(rng, 20, 24, 3, 2, 2, 5, 0.0)
     flat = [np.ones_like(s) for s in srcs]

@@ -48,6 +48,7 @@ class DenseOptions:
     view_angle_power: float = 1.5     # cos(incidence) exponent when blending true-ortho colour
     cache_mb: int = 1536
     workers: int = 0
+    extent_trim: float = 1.0          # percent of extreme image corners dropped from the grid extent
 
 
 @dataclass
@@ -100,12 +101,13 @@ def _pyramid(gray, n):
     return [np.ascontiguousarray(g) for g in out]
 
 
-def grid_extent(rec, gsd: float, native_gsd: float, max_cells: float = 40e6):
+def grid_extent(rec, gsd: float, native_gsd: float, max_cells: float = 40e6, trim: float = 1.0):
     """North-up DSM grid covering the camera footprints at typical ground height.
 
     Returns (minX, maxY, W, H, gsd, img_scale); minX/maxY are the top-left cell *corner*, the
     extent is snapped to multiples of the cell size and the cell size grows if the area would
-    need more than `max_cells` cells."""
+    need more than `max_cells` cells. `trim` percent of the extreme corners is dropped on each
+    side (0 = every footprint, e.g. a narrow-FOV thermal strip whose end images would be cut)."""
     img_scale = min(1.0, native_gsd / gsd)
     zg = float(np.percentile(rec.X[:, 2], 20)) if len(rec.X) else 0.0
     corners = []
@@ -118,10 +120,10 @@ def grid_extent(rec, gsd: float, native_gsd: float, max_cells: float = 40e6):
                 corners.append(C + d * (zg - C[2]) / d[2])
     corners = np.array(corners)
     # keep the area imaged by at least a couple of cameras: trim extreme corners
-    minX = math.floor(np.percentile(corners[:, 0], 1) / gsd) * gsd
-    maxX = math.ceil(np.percentile(corners[:, 0], 99) / gsd) * gsd
-    minY = math.floor(np.percentile(corners[:, 1], 1) / gsd) * gsd
-    maxY = math.ceil(np.percentile(corners[:, 1], 99) / gsd) * gsd
+    minX = math.floor(np.percentile(corners[:, 0], trim) / gsd) * gsd
+    maxX = math.ceil(np.percentile(corners[:, 0], 100 - trim) / gsd) * gsd
+    minY = math.floor(np.percentile(corners[:, 1], trim) / gsd) * gsd
+    maxY = math.ceil(np.percentile(corners[:, 1], 100 - trim) / gsd) * gsd
     if (maxX - minX) * (maxY - minY) / gsd ** 2 > max_cells:
         gsd = math.sqrt((maxX - minX) * (maxY - minY) / max_cells)
         img_scale = min(1.0, native_gsd / gsd)
@@ -145,7 +147,7 @@ def dense_reconstruct(ar, rec, gains: dict, native_gsd: float, opt: DenseOptions
     img_scale = min(1.0, native_gsd / gsd)          # decode images so 1 px ~ 1 DSM cell
     workers = opt.workers or ar.workers
 
-    minX, maxY, W, H, gsd, img_scale = grid_extent(rec, gsd, native_gsd, opt.max_cells)
+    minX, maxY, W, H, gsd, img_scale = grid_extent(rec, gsd, native_gsd, opt.max_cells, opt.extent_trim)
     zg = float(np.percentile(rec.X[:, 2], 20)) if len(rec.X) else 0.0
     log.info("Dense: %d x %d cells at %.3f m, images at %.2f scale, %s backend", W, H, gsd, img_scale, backend.name)
 

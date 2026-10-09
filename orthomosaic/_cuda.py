@@ -5,8 +5,6 @@ from __future__ import annotations
 import cupy as cp
 import numpy as np
 
-from . import _matching
-
 _SRC = r"""
 extern "C" __global__
 void hamming_match(const unsigned long long* __restrict__ d1,
@@ -126,21 +124,10 @@ void sample_view(const float* __restrict__ img, const int h, const int w, const 
 }
 """
 
-_SRC += (r'''extern "C" __global__
-void match_tiles(const unsigned int* d1, const unsigned int* d2, int n1, int n2,
-                 int* rb, int* rs, int* ri, int* cb, int* ci) {
-''' + _matching.kernel_body(_matching.TILE_BODY, False) + "}\n" + r'''
-extern "C" __global__
-void match_reduce(const int* rb, const int* rs, const int* ri, const int* cb, const int* ci,
-                  int n1, int n2, int* idx, int* bst, int* sec, int* back, int* backbest) {
-''' + _matching.kernel_body(_matching.REDUCE_BODY, False) + "}\n")
-
 _module = cp.RawModule(code=_SRC, options=("-std=c++11",))
 _k_match = _module.get_function("hamming_match")
 _k_warp = _module.get_function("warp_accumulate")
 _k_sample = _module.get_function("sample_view")
-_k_match_tiles = _module.get_function("match_tiles")
-_k_match_reduce = _module.get_function("match_reduce")
 
 
 class CUDABackend:
@@ -164,9 +151,6 @@ class CUDABackend:
         idx, best, _ = self.match(d, d)
         if not (idx == np.arange(40)).all() or best.max() != 0:
             raise RuntimeError("CUDA self-test failed (matcher)")
-        mutual = self.match_mutual(d, d)
-        if not (mutual[0] == idx).all() or not (mutual[3] == idx).all() or mutual[1].max() != 0:
-            raise RuntimeError("CUDA self-test failed (mutual matcher)")
         img = self.upload(rng.integers(0, 256, (16, 16, 3), dtype=np.uint8))
         blk = self.new_block(8, 8)
         self.warp_accumulate(blk, img, np.array([[1, 0, 2], [0, 1, 2]], float), np.ones(3), 1.0, 0)
@@ -180,43 +164,26 @@ class CUDABackend:
         if float(cp.asnumpy(v).sum()) <= 0 or not np.isfinite(float(a.sum())):
             raise RuntimeError("CUDA self-test failed (sampler)")
 
-    def _match_device(self, a, b):
-        n1, n2 = len(a), len(b)
-        idx = cp.empty(n1, cp.int32)
-        best = cp.empty(n1, cp.int32)
-        second = cp.empty(n1, cp.int32)
+    def match(self, d1: np.ndarray, d2: np.ndarray):
+        n1, n2 = len(d1), len(d2)
+        if not n1 or not n2:
+            return (np.full(n1, -1, np.int32), np.full(n1, 1 << 30, np.int32),
+                    np.full(n1, 1 << 30, np.int32))
+        a = cp.asarray(np.ascontiguousarray(d1, np.uint8).view(np.uint64).reshape(n1, 4))
+        b = cp.asarray(np.ascontiguousarray(d2, np.uint8).view(np.uint64).reshape(n2, 4))
+        idx = cp.full(n1, -1, cp.int32)
+        best = cp.full(n1, 1 << 30, cp.int32)
+        second = cp.full(n1, 1 << 30, cp.int32)
         threads = 128
         _k_match(((n1 + threads - 1) // threads,), (threads,),
                  (a, b, np.int32(n1), np.int32(n2), idx, best, second),
                  shared_mem=threads * 4 * 8)
-        return idx, best, second
-
-    def match(self, d1: np.ndarray, d2: np.ndarray):
-        d1, d2 = _matching.descriptors(d1), _matching.descriptors(d2)
-        if not len(d1) or not len(d2):
-            return _matching.empty_result(len(d1), len(d2))[:3]
-        out = self._match_device(cp.asarray(d1.view(np.uint64)), cp.asarray(d2.view(np.uint64)))
-        return tuple(cp.asnumpy(x) for x in out)
+        return cp.asnumpy(idx), cp.asnumpy(best), cp.asnumpy(second)
 
     def match_mutual(self, d1: np.ndarray, d2: np.ndarray):
-        d1, d2 = _matching.descriptors(d1), _matching.descriptors(d2)
-        if len(d1) * len(d2) <= _matching.TILED_PAIRS:
-            return _matching.match_mutual(d1, d2, cp.asarray, self._match_batch)
-        a, b = cp.asarray(d1.view(np.uint64)), cp.asarray(d2.view(np.uint64))
-        idx, best, second = self._match_device(a, b)
-        back, _, _ = self._match_device(b, a)
-        return tuple(cp.asnumpy(x) for x in (idx, best, second, back))
-
-    def _match_batch(self, a, b):
-        n1, n2 = len(a), len(b)
-        t1, t2 = (n1 + 63) // 64, (n2 + 63) // 64
-        partial = [cp.empty((t2, n1), cp.int32) for _ in range(3)]
-        partial += [cp.empty((t1, n2), cp.int32) for _ in range(2)]
-        _k_match_tiles((t1, t2), (256,), (a, b, np.int32(n1), np.int32(n2), *partial))
-        out = [cp.empty(n1, cp.int32) for _ in range(3)] + [cp.empty(n2, cp.int32) for _ in range(2)]
-        _k_match_reduce(((max(n1, n2) + 255) // 256,), (256,),
-                        (*partial, np.int32(n1), np.int32(n2), *out))
-        return tuple(cp.asnumpy(x) for x in out)
+        idx12, best12, second12 = self.match(d1, d2)
+        idx21, _, _ = self.match(d2, d1)
+        return idx12, best12, second12, idx21
 
     def new_block(self, H: int, W: int):
         return cp.zeros((H, W, 3), cp.float32), cp.zeros((H, W), cp.float32)

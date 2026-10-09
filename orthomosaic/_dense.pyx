@@ -726,9 +726,7 @@ cdef extern from "_sweep.h" nogil:
         double* cs
         float* nrow
     void om_sw_warp_row(const float* inv_row, const float* ray0, const float* ray1, const float* ray2,
-                        om_sw_src* src, int n, Py_ssize_t W, double* U, double* Vv, double* D,
-                        const double* rot, Py_ssize_t HW)
-    void om_sw_rotate(const float* ray, const double* geo, Py_ssize_t HW, double* out)
+                        om_sw_src* src, int n, Py_ssize_t W, double* U, double* Vv, double* D)
     void om_sw_cs_addsub(double* cs, const float* ha, const float* hs, Py_ssize_t W)
     void om_sw_hsum_row(const float* ref_row, const om_sw_src* p, Py_ssize_t W, int r, float* hs)
     void om_sw_cs_add(double* cs, const float* hs, Py_ssize_t W)
@@ -739,24 +737,10 @@ cdef extern from "_sweep.h" nogil:
                            float* s_prev_best, float* s_next_best, int* idx)
 
 
-def sweep_rays(const float[:, :, ::1] ray, const double[:, ::1] geo):
-    """Cache invariant source-frame directions, in the warp kernel's exact arithmetic."""
-    if ray.shape[0] != 3 or geo.shape[1] != 18:
-        raise ValueError("expected ray (3, H, W) and geo (n, 18)")
-    cdef Py_ssize_t n = geo.shape[0], H = ray.shape[1], W = ray.shape[2], s
-    result = np.empty((n, 3, H, W), np.float64)
-    cdef double[:, :, :, ::1] out = result
-    if H and W:
-        with nogil:
-            for s in range(n):
-                om_sw_rotate(&ray[0, 0, 0], &geo[s, 0], H * W, &out[s, 0, 0, 0])
-    return result
-
-
 def sweep_hypothesis(const float[:, ::1] ref, const float[:, ::1] mu_i, const float[:, ::1] sd_i,
                      list srcs, const float[:, :, ::1] ray, const double[:, ::1] geo,
                      const float[:, ::1] inv, int r, int top_k, int i, float[:, ::1] best, float[:, ::1] prev,
-                     float[:, ::1] s_prev_best, float[:, ::1] s_next_best, int[:, ::1] idx, rotated=None):
+                     float[:, ::1] s_prev_best, float[:, ::1] s_next_best, int[:, ::1] idx):
     """One hypothesis of the plane sweep for all sources at once: ``ncc_warp`` for every source
     followed by ``combine``, computed row by row (each row's warp, window sums and NCC stay in
     cache instead of five full-image passes per source). Per pixel the arithmetic, its order and
@@ -772,8 +756,6 @@ def sweep_hypothesis(const float[:, ::1] ref, const float[:, ::1] mu_i, const fl
     cdef float* fblock = NULL
     cdef double* dblock = NULL
     cdef Py_ssize_t per_f
-    cdef const double[:, :, :, ::1] rot
-    cdef const double* rotp = NULL
     if n < 1 or n > 16:
         raise ValueError("sweep_hypothesis needs 1..16 sources")
     if geo.shape[0] != n or geo.shape[1] != 18:
@@ -789,11 +771,6 @@ def sweep_hypothesis(const float[:, ::1] ref, const float[:, ::1] mu_i, const fl
         raise ValueError("sweep_hypothesis: negative window radius")
     if H == 0 or W == 0:
         return
-    if rotated is not None:
-        rot = rotated
-        if rot.shape[0] != n or rot.shape[1] != 3 or rot.shape[2] != H or rot.shape[3] != W:
-            raise ValueError("rotated rays must be (n_sources, 3, H, W)")
-        rotp = &rot[0, 0, 0, 0]
     HW = H * W
     per_f = 3 * W + R2 * 4 * W
     src = <om_sw_src*>malloc(n * sizeof(om_sw_src))
@@ -831,7 +808,7 @@ def sweep_hypothesis(const float[:, ::1] ref, const float[:, ::1] mu_i, const fl
         # rows 0 .. r-1 enter the vertical sums first (ncc_warp phase 3 initialisation)
         for yy in range(min(r, H)):
             om_sw_warp_row(&inv[yy, 0], rayp + yy * W, rayp + HW + yy * W, rayp + 2 * HW + yy * W, src, n, W,
-                           wU, wV, wD, rotp + yy * W if rotp != NULL else NULL, HW)
+                           wU, wV, wD)
             for s in range(n):
                 p = &src[s]
                 hs = p.ring + (yy % R2) * 4 * W
@@ -841,7 +818,7 @@ def sweep_hypothesis(const float[:, ::1] ref, const float[:, ::1] mu_i, const fl
             if y + r < H:
                 yy = y + r
                 om_sw_warp_row(&inv[yy, 0], rayp + yy * W, rayp + HW + yy * W, rayp + 2 * HW + yy * W, src, n, W,
-                               wU, wV, wD, rotp + yy * W if rotp != NULL else NULL, HW)
+                               wU, wV, wD)
             for s in range(n):
                 p = &src[s]
                 if y + r < H:

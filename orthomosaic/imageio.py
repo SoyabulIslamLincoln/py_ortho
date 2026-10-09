@@ -40,6 +40,7 @@ class Frame:
     model: str = ""
     raw_shape: Optional[tuple] = None     # (h, w) of embedded radiometric thermal data (DJI R-JPEG)
     thermal_range: Optional[tuple] = None  # set by the pipeline: decode raw thermal with this range
+    thermal_flat: Optional[np.ndarray] = None  # set by build_3d: sensor flat-field coefficients (thermal.flat_field)
     # filled by the pipeline
     E: Optional[float] = None
     N: Optional[float] = None
@@ -154,8 +155,10 @@ def load_rgb(frame: Frame, scale: float = 1.0) -> np.ndarray:
     th = max(1, int(round(frame.height * scale)))
     if frame.thermal_range is not None and frame.raw_shape is not None:
         # radiometric thermal: use the raw sensor values (common survey-wide scale) as gray
-        from .thermal import raw_to_gray, read_raw_thermal
-        g = raw_to_gray(read_raw_thermal(frame.path, frame.raw_shape), frame.thermal_range, (tw, th))
+        from .thermal import flat_field, raw_to_gray, read_raw_thermal
+        flat = (None if frame.thermal_flat is None
+                else flat_field(frame.thermal_flat, frame.width, frame.height, (tw, th)))
+        g = raw_to_gray(read_raw_thermal(frame.path, frame.raw_shape), frame.thermal_range, (tw, th), flat)
         return np.repeat(g[..., None], 3, axis=2)
     with Image.open(frame.path) as im:
         if scale < 1.0 and im.format == "JPEG":

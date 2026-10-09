@@ -219,6 +219,7 @@ Resolution is never finer than GSD − 10 % (`ignore_gsd=True` to override).
 | `fill_hidden` | — | True | Colour fully occluded cells from the best photo |
 | `occlusion` | `--no-occlusion` | True | Occlusion test in the orthophoto |
 | `color_balance` | `--no-color-balance` | True | Per-image gain + offset |
+| `thermal_offsets` | — | True | Thermal only: per-photo drift offsets + sensor flat field (additive, raw values kept) |
 | `dtm` | `--no-dtm` | True | Bare-ground DTM |
 | `contour_interval` | `--contours` | 0 | Contour spacing (m), 0 = off |
 | `mesh_method` | — | `auto` | Poisson from the cloud (open3d) or DSM mesh |
@@ -257,6 +258,25 @@ survey-wide scale, then coloured with a palette (`rainbow`, `iron`, `white_hot`,
 `arctic`, `lava`, `hot_metal`, `medical`, `green_hot`, `rainbow_hc`). Raw values are written to
 `*_thermal.tif`; `python -m orthomosaic.thermal recolor` changes the palette afterwards.
 
+The 3D pipeline (`build_3d`, `orthomosaic-3d`) calibrates every thermal flight automatically,
+with no hand tuning. These steps apply only to radiometric thermal; RGB processing is unchanged:
+
+- **Frame drift and sensor flat field.** Uncooled thermal cores drift between frames and read the
+  sensor borders differently from its centre, so neighbouring photos record the same surface a
+  few levels apart and the mosaic shows rectangular blocks. Tie points between overlapping photos
+  are used to solve one additive offset per photo plus one flat-field surface shared by all photos
+  (robust least squares). Gains are never changed, the offsets average to zero, and the flat field
+  has zero mean, so absolute raw values are preserved. On a 300-photo M4T flight this reduced the
+  90th-percentile tie-point mismatch from 11.4 to 6.4 gray levels. `report.json` records the
+  offsets and flat field (`thermal.drift_offsets_gray`, `thermal.flat_field`);
+  `thermal_offsets=False` turns this off.
+- **Seam-blended orthophoto.** Thermal uses the same renderer as RGB, which picks coherent source
+  photos and blends their seams. This removes the block grid left by per-tile colours. Disable it
+  with `true_ortho=False`.
+- **Full footprint.** The narrow thermal field of view puts the end-of-strip photos at the outer
+  edge of the survey, so the thermal grid includes every footprint rather than trimming extreme
+  corners. This trimming previously cut straight edges into long strips.
+
 ---
 
 ## Performance
@@ -268,18 +288,18 @@ entirely-C application: Python still coordinates the pipeline and its file forma
 The optimizations on top of **0.8.0** preserve the existing defaults, feature counts, depth
 hypotheses, resolutions, thresholds and iteration counts:
 
-- **Dense matching:** bounded double-precision caches reuse camera-ray rotations across long
-  coarse sweeps (at most 16 MiB per worker), with the original projection arithmetic.
 - **Terrain percentiles:** native block selection replaces NumPy's per-cell percentile calls;
   the default lower-quartile interpolation keeps the same floating-point rounding. Unusual
   percentiles, infinities and signed zeros retain the NumPy path.
 - **Box filters:** a native streaming summed-area table replaces full-raster float64
   temporaries, preserving cumulative-sum and subtraction order. Terrain generation and cloud
   classification benefit with **all three backends**; CPU dense matching also uses this filter.
-- **Matching:** a handwritten C matcher uses ARM64 NEON where available, with a portable
-  fallback. CUDA/Metal upload each descriptor set once per mutual match. Small GPU pairs
-  reuse distances in shared-memory tiles; large pairs retain the faster streaming scan.
-  Matching remains exhaustive, integer-exact, and keeps the same tie-breaking rules.
+
+The experimental CPU/Metal/CUDA matcher changes and cached camera-ray rotations introduced
+in 0.8.1/0.8.2 have been reverted to the 0.8.0 implementations following a reported runtime
+regression. Faster isolated kernels did not establish faster complete reconstructions. Matching
+remains exhaustive, with the same tie-breaking, and depth-sweep parameters are unchanged.
+On Linux, the floating-point contraction parity fix is now limited to bundle adjustment.
 
 Local measurements on Apple M1 (8 GB), macOS arm64, Python 3.9.6 / NumPy 2.0.2 (five timed kernel runs after
 warmup; identical output hashes):
@@ -289,19 +309,27 @@ warmup; identical output hashes):
 | Block percentile, 2000 × 2000 DSM, factor 10 | 1.751 s | 0.094 s | 18.6× |
 | Box filter, same grid, radius 5 | 0.077 s | 0.0088 s | 8.7× |
 | Box filter, same grid, radius 25 | 0.081 s | 0.0087 s | 9.3× |
-| Mutual matching, 12 000 × 12 017 descriptors, CPU | 0.273 s | 0.247 s | 1.1× |
-| Mutual matching, 512 × 529 descriptors, Metal | 1.1 ms | 0.6 ms | 1.8× |
-| Mutual matching, 12 000 × 12 017 descriptors, Metal | 16.8 ms | 12.4 ms | 1.4× |
 
-A complete 48-image synthetic **CPU** reconstruction with unchanged options produced identical
-rasters, LAS/PLY clouds, OBJ/GLB meshes and report values (excluding timing). DTM generation
-fell from **3.85 s to 0.72 s**. Total time was **46.3 s versus 45.9 s** in that run: depth matching
-and bundle adjustment dominate, and their timing varied. These kernel improvements do **not**
-establish a substantial end-to-end speedup on every flight.
+Previous measurements of the experimental build showed why full-pipeline validation matters:
+DTM generation fell from **3.85 s to 0.71 s**, but final total times were **46.3 → 45.4 s on CPU**
+and **46.6 → 47.1 s on Metal**. These are single synthetic runs, not a demonstrated overall
+speedup, and are not measurements of the rollback described above.
 
-CPU and Metal matching have exact regression tests, including duplicates, empty sets, tile
-edges and query batches. CUDA runtime/performance and Linux/Windows hardware were not available
-for local verification; wheel CI runs the CPU regression tests across its platform matrix.
+A fresh rollback check on the same 48-image survey ran in the order baseline, repaired,
+repaired, baseline (Metal, unchanged options):
+
+| Run | 0.8.0 | Repaired tree |
+|---|---:|---:|
+| 1 | 91.95 s | 95.20 s |
+| 2 | 169.28 s | 88.82 s |
+
+The baseline itself varied too much to infer an overall speedup from these runs. The rollback
+restores the 0.8.0 matching and depth-sweep code; real-flight timing still needs verification
+under comparable conditions. The terrain microbenchmarks above are not an end-to-end promise.
+
+CPU and Metal matching have exact regression tests, including duplicate descriptors and empty
+sets. CUDA runtime/performance and Linux/Windows hardware were not available for local
+verification; wheel CI runs the CPU regression tests across its platform matrix.
 CPU and GPU floating-point image operations already differed slightly in 0.8.0; exact output
 parity is checked against the **same backend**, not promised across different backends.
 

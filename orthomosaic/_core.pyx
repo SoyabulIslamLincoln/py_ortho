@@ -24,10 +24,6 @@ cdef extern from *:
     """
     int om_popcount64(unsigned long long x) nogil
 
-cdef extern from "_hamming.h" nogil:
-    void om_match256(const uint64_t* a, const uint64_t* b, Py_ssize_t n1, Py_ssize_t n2,
-                     int32_t* idx, int32_t* best, int32_t* second, int32_t* back, int32_t* cb)
-
 
 # --------------------------------------------------------------------------
 # Image basics
@@ -333,12 +329,6 @@ def match_hamming(const uint64_t[:, ::1] d1, const uint64_t[:, ::1] d2):
     cdef int32_t[::1] idx = idx_np, bst = best_np, sec = sec_np
     if d2.shape[1] != words:
         raise ValueError("descriptor widths must match")
-    if n1 == 0 or n2 == 0:
-        return idx_np, best_np, sec_np
-    if words == 4:
-        with nogil:
-            om_match256(&d1[0, 0], &d2[0, 0], n1, n2, &idx[0], &bst[0], &sec[0], NULL, NULL)
-        return idx_np, best_np, sec_np
     with nogil:
         for i in range(n1):
             best = 1 << 30
@@ -364,7 +354,9 @@ def match_hamming_mutual(const uint64_t[:, ::1] d1, const uint64_t[:, ::1] d2):
     """One pass over the distance matrix giving, for d1 rows, (best idx, best,
     second best) and, for d2 rows, the best index back into d1 -- everything
     needed for ratio test + mutual check at half the cost of two passes."""
-    cdef Py_ssize_t n1 = d1.shape[0], n2 = d2.shape[0]
+    cdef Py_ssize_t n1 = d1.shape[0], n2 = d2.shape[0], i, j
+    cdef int d, best, second, bi
+    cdef uint64_t a0, a1, a2, a3
     idx_np = np.full(n1, -1, np.int32)
     best_np = np.full(n1, 1 << 30, np.int32)
     sec_np = np.full(n1, 1 << 30, np.int32)
@@ -373,10 +365,30 @@ def match_hamming_mutual(const uint64_t[:, ::1] d1, const uint64_t[:, ::1] d2):
     cdef int32_t[::1] idx = idx_np, bst = best_np, sec = sec_np, back = back_np, cb = colbest_np
     if d1.shape[1] != 4 or d2.shape[1] != 4:
         raise ValueError("expected 256-bit descriptors")
-    if n1 == 0 or n2 == 0:
-        return idx_np, best_np, sec_np, back_np
     with nogil:
-        om_match256(&d1[0, 0], &d2[0, 0], n1, n2, &idx[0], &bst[0], &sec[0], &back[0], &cb[0])
+        for i in range(n1):
+            a0 = d1[i, 0]
+            a1 = d1[i, 1]
+            a2 = d1[i, 2]
+            a3 = d1[i, 3]
+            best = 1 << 30
+            second = 1 << 30
+            bi = -1
+            for j in range(n2):
+                d = (om_popcount64(a0 ^ d2[j, 0]) + om_popcount64(a1 ^ d2[j, 1])
+                     + om_popcount64(a2 ^ d2[j, 2]) + om_popcount64(a3 ^ d2[j, 3]))
+                if d < best:
+                    second = best
+                    best = d
+                    bi = <int>j
+                elif d < second:
+                    second = d
+                if d < cb[j]:
+                    cb[j] = d
+                    back[j] = <int>i
+            idx[i] = bi
+            bst[i] = best
+            sec[i] = second
     return idx_np, best_np, sec_np, back_np
 
 

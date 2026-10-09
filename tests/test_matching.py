@@ -1,4 +1,4 @@
-"""Exact matcher regression tests, including tile/batch boundaries and equal distances."""
+"""Exact matcher regression tests, including empty inputs, varied set sizes and equal distances."""
 import os
 import sys
 
@@ -41,7 +41,7 @@ def cases():
             b[:] = 255                 # distance 256, every index tied
             yield a.copy(), b.copy()
             if n > 32 and m > 32:
-                a[0] = a[-1] = b[32]   # ties across tiles and query batches
+                a[0] = a[-1] = b[32]   # ties at distant descriptor indices
                 b[0] = b[-1] = 0
                 yield a.copy(), b.copy()
     # Noncontiguous user input must be copied by the backend.

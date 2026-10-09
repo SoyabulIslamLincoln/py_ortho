@@ -25,27 +25,13 @@ typedef struct {
     float *nrow;      /* (W,) NCC of the current output row */
 } om_sw_src;
 
-/* These dot products are invariant over depth hypotheses. Keep exactly the
- * expression tree used by the uncached warp; double storage preserves rounding. */
-static inline void om_sw_rotate(const float *ray, const double *g, ptrdiff_t HW, double *out)
-{
-    ptrdiff_t x;
-    for (x = 0; x < HW; ++x) {
-        double rx = ray[x], ry = ray[HW + x], rz = ray[2 * HW + x];
-        out[x] = (((g[0] * rx) + (g[1] * ry)) + (g[2] * rz));
-        out[HW + x] = (((g[3] * rx) + (g[4] * ry)) + (g[5] * rz));
-        out[2 * HW + x] = (((g[6] * rx) + (g[7] * ry)) + (g[8] * rz));
-    }
-}
-
 /* ncc_warp phase 1 for one row and every source. inv_row: (W,), ray0/1/2: rows of the 3 planes.
  * Two passes per source: the projection of every pixel (no data-dependent memory access, so the
  * compiler vectorises it; pixels behind the camera are flagged with u = -1, which fails the
  * bounds test exactly as the original early exit did), then the bilinear fetch.
  * U, Vv, D: (W,) double scratch. */
 static inline void om_sw_warp_row(const float *inv_row, const float *ray0, const float *ray1, const float *ray2,
-                                  om_sw_src *src, int n, ptrdiff_t W, double *U, double *Vv, double *D,
-                                  const double *rot, ptrdiff_t HW)
+                                  om_sw_src *src, int n, ptrdiff_t W, double *U, double *Vv, double *D)
 {
     ptrdiff_t x, x0, y0;
     int s;
@@ -62,9 +48,9 @@ static inline void om_sw_warp_row(const float *inv_row, const float *ray0, const
         float *J = p->Jrow, *V = p->Vrow;
         for (x = 0; x < W; x++) {
             double d = D[x], rx = ray0[x], ry = ray1[x], rz = ray2[x];
-            double X = (b0 + (d * (rot ? rot[(3 * s) * HW + x] : (((r00 * rx) + (r01 * ry)) + (r02 * rz)))));
-            double Y = (b1 + (d * (rot ? rot[(3 * s + 1) * HW + x] : (((r10 * rx) + (r11 * ry)) + (r12 * rz)))));
-            double Z = (b2 + (d * (rot ? rot[(3 * s + 2) * HW + x] : (((r20 * rx) + (r21 * ry)) + (r22 * rz)))));
+            double X = (b0 + (d * (((r00 * rx) + (r01 * ry)) + (r02 * rz))));
+            double Y = (b1 + (d * (((r10 * rx) + (r11 * ry)) + (r12 * rz))));
+            double Z = (b2 + (d * (((r20 * rx) + (r21 * ry)) + (r22 * rz))));
             double nx = (X / Z), ny = (Y / Z);
             double r2 = ((nx * nx) + (ny * ny));
             double dd = (f * (1.0 + (r2 * (k1 + (r2 * (k2 + (r2 * k3)))))));

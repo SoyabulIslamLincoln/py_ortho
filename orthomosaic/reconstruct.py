@@ -70,6 +70,7 @@ class Options3D(Options):
     dtm_slope: float = 0.3                  # terrain slope tolerated by the ground filter
     #changed here: Pix4D-grade true orthophoto + elevation-mapping controls
     true_ortho: bool = True                 # re-render the ortho on the final DSM (occlusion-aware)
+    thermal_offsets: bool = True            # radiometric thermal: remove per-frame drift + sensor flat field (additive)
     occlusion: bool = True                  # drop views hidden behind buildings/trees
     occlusion_tol: float = 0.20             # metres a ray may pass under the surface before it blocks
     occlusion_steps: int = 96               # max line-of-sight samples per ray (1 DSM cell apart when possible)
@@ -276,6 +277,14 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
             gains, biases = solve_radiometric(al.used, ar.pairs)
         else:
             gains, biases = solve_gains(al.used, ar.pairs), {}
+    elif thermal and getattr(opt, "thermal_offsets", True):
+        from .thermal import solve_offsets
+        sizes = {(frames[i].width, frames[i].height) for i in al.used}
+        # one sensor size: one flat field (tie points are in that sensor's pixels) for every frame
+        biases, flat = solve_offsets(al.used, ar.pairs, next(iter(sizes)) if len(sizes) == 1 else None)
+        gains = {}
+        for i in al.used:
+            frames[i].thermal_flat = flat
     else:
         gains, biases = {}, {}
     res = cap_resolution(opt.dsm_resolution, al.gsd, opt.ignore_gsd)
@@ -306,7 +315,10 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     else:
         dopt = mvs.DenseOptions(gsd=res, max_views=opt.max_views, min_score=opt.min_score,
                                 window=opt.ncc_window, tile=opt.tile, cache_mb=opt.cache_mb, workers=ar.workers,
-                                view_angle_power=opt.view_angle_power)
+                                view_angle_power=opt.view_angle_power,
+                                # thermal's narrow FOV makes the strip-end images the outermost
+                                # corners: trimming them cut flat edges into the mosaic
+                                extent_trim=0.0 if thermal else 1.0)
         dense = mvs.dense_reconstruct(ar, rec, gains, al.gsd, dopt, biases=biases)
     gsd = dense.gsd
     max_fill = -1 if opt.dsm_max_fill < 0 else int(math.ceil(opt.dsm_max_fill / gsd))
@@ -344,7 +356,10 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     src_id = count = rgba_o = ortho_tmp = None
     ortho_valid = covered              # cells of the orthomosaic that carry colour (alpha)
     o_gsd, dsm_o, covered_o = gsd, dsm, covered            # orthophoto grid (same as DSM unless finer)
-    if getattr(opt, "true_ortho", True) and not thermal and covered.any():
+    # thermal renders here too: the sweep's colours are chosen per 160-cell tile, which prints a
+    # visible block grid; the renderer picks one coherent source per region and blends seams.
+    # Thermal frames load as raw-value gray (imageio) and have no gains, so the values stay raw.
+    if getattr(opt, "true_ortho", True) and covered.any():
         from .ortho import true_orthophoto
         t1 = time.time()
         o_gsd = cap_resolution(opt.ortho_resolution or al.gsd, al.gsd, opt.ignore_gsd)
@@ -378,10 +393,17 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     if thermal:
         from .thermal import apply_contrast, legend, palette_lut
         lo, hi = ar.thermal_range
-        raw = np.where(covered, lo + dense.rgb[..., 0].astype(np.float32) * ((hi - lo) / 255.0), np.nan)
+        gray, gvalid, g_gsd = ((rgba_o[..., 0], ortho_valid, o_gsd) if rgba_o is not None
+                               else (dense.rgb[..., 0], covered, gsd))
+        raw = np.where(gvalid, lo + gray.astype(np.float32) * ((hi - lo) / 255.0), np.nan)
         _write_raster(os.path.join(out_dir, "orthophoto_thermal.tif"), raw.astype(np.float32), "float32", epsg,
-                      origin_xy, gsd, float("nan"))
-        colors = palette_lut(opt.palette)[apply_contrast(dense.rgb[..., 0], covered, opt.contrast)]
+                      origin_xy, g_gsd, float("nan"))
+        del raw
+        colors = palette_lut(opt.palette)[apply_contrast(np.asarray(gray), gvalid, opt.contrast)]
+        if rgba_o is not None:
+            rgba_o[..., :3] = colors               # palette into the rendered RGBA (alpha kept)
+            rgba_o[~gvalid, :3] = 0
+            colors = rgba_o[..., :3]
         legend(os.path.join(out_dir, "thermal_legend.png"), opt.palette, ar.thermal_range, contrast=opt.contrast)
 
     # ---- rasters
@@ -591,7 +613,12 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         if cls is not None else None,
         dense_points=int(len(xyz)), outputs=outputs, seconds=round(time.time() - t0, 1),
         thermal=(dict(raw_range=list(ar.thermal_range), palette=opt.palette, contrast=opt.contrast, raw_values="orthophoto_thermal.tif",
-                      legend="thermal_legend.png") if thermal else None),
+                      legend="thermal_legend.png",
+                      drift_offsets_gray=([round(float(min(v[0] for v in biases.values())), 2),
+                                           round(float(max(v[0] for v in biases.values())), 2)] if biases else None),
+                      flat_field=(None if frames[rec.used[0]].thermal_flat is None
+                                  else [round(float(c), 4) for c in frames[rec.used[0]].thermal_flat]))
+                 if thermal else None),
         options={k: (list(v) if isinstance(v, tuple) else v) for k, v in asdict(opt).items()},
         cameras=cams,
     )
