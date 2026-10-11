@@ -61,6 +61,7 @@ class Options3D(Options):
     ortho_max_cells: float = 0              # orthophoto pixel cap; 0 = auto from the machine's RAM (outputs are
                                             # disk-backed, ~6 bytes/pixel stay in memory)
     dem_gapfill_steps: int = 3              # ODM radius steps: point spacing * sqrt(2)^k, k < steps
+    gps_warp: bool = True                   # RTK flights: map the products onto the GPS camera layout
     attitude_sigma_deg: float = 2.0         # gimbal pitch/roll prior in the BA (0 = off); fixes block tilt
     ignore_gsd: bool = False                # ODM: never allow a DSM/ortho finer than GSD * (1 - 10%)
     mesh_method: str = "auto"               # "auto": Poisson from the dense cloud (needs open3d), else DSM grid
@@ -122,14 +123,117 @@ def _colorize(Z, valid, gsd=1.0):
     return np.dstack([out, alpha])
 
 
-def _write_raster(path, arr, kind, epsg, origin_xy, gsd, nodata=None, tile=512):
+class GpsWarp:
+    """Horizontal affine (local frame) that moves the block from the bundle-adjusted camera layout
+    onto the RTK GPS layout. On narrow strips the tie points spread the cameras ~2% wider than
+    their RTK positions across the flight lines (049: roof 23.04 m vs Pix4D 22.60 m) even under a
+    1 cm GPS prior; the products are mapped back instead, as Pix4D's block follows its GPS."""
+
+    def __init__(self, L, t, c):
+        self.L, self.t, self.c = np.asarray(L, float), np.asarray(t, float), np.asarray(c, float)
+        self.Li = np.linalg.inv(self.L)
+
+    def xy(self, P):
+        """Transform (n, >=2) local coordinates (x, y columns), returning a copy."""
+        P = np.asarray(P)
+        Q = np.array(P, np.float64 if P.dtype.kind != "f" else P.dtype, copy=True)
+        off = self.t + self.c - self.c @ self.L.T
+        for i in range(0, len(Q), 1 << 21):            # chunks: dense clouds have tens of millions
+            xy = Q[i:i + (1 << 21), :2].astype(np.float64)
+            Q[i:i + (1 << 21), :2] = xy @ self.L.T + off
+        return Q
+
+    def grid(self, origin_xy, gsd, W, H, offset):
+        """Output grid (origin, W, H) covering the warped source grid, same cell size."""
+        x0, y0 = origin_xy[0] - offset[0], origin_xy[1] - offset[1]
+        corners = self.xy(np.array([[x0, y0], [x0 + W * gsd, y0], [x0, y0 - H * gsd], [x0 + W * gsd, y0 - H * gsd]]))
+        nx0, ny0 = corners[:, 0].min(), corners[:, 1].max()
+        Wn = int(math.ceil((corners[:, 0].max() - nx0) / gsd))
+        Hn = int(math.ceil((ny0 - corners[:, 1].min()) / gsd))
+        # A: output (col, row, 1) -> source (col, row); output pixel -> world -> BA frame -> source pixel
+        Li, c, t = self.Li, self.c, self.t
+        M = np.array([[gsd, 0.0, nx0 + 0.5 * gsd], [0.0, -gsd, ny0 - 0.5 * gsd]])
+        M[:, 2] -= c + t
+        M = Li @ M
+        M[:, 2] += c
+        S = np.array([[1.0 / gsd, 0.0, -x0 / gsd - 0.5], [0.0, -1.0 / gsd, y0 / gsd - 0.5]])
+        A = S[:, :2] @ M
+        A[:, 2] += S[:, 2]
+        return (nx0 + offset[0], ny0 + offset[1]), Wn, Hn, A
+
+
+def fit_gps_warp(ar, rec) -> Optional["GpsWarp"]:
+    """Robust affine fit of the bundle-adjusted camera centres to their GPS positions, for RTK
+    surveys only (multi-metre consumer GPS would add noise, not remove it)."""
+    if ar.positions is None or not ar.alignment.georeferenced:
+        return None
+    std = [ar.frames[i].gps_std_h for i in rec.used]
+    gps = np.array([ar.positions[i] for i in rec.used], np.float64)
+    ok = np.isfinite(gps).all(1) & np.array([s is not None and s < 0.5 for s in std])
+    if ok.sum() < 10:
+        return None
+    a, b = rec.C[ok, :2], gps[ok]
+    c = a.mean(0)
+    keep = np.ones(len(a), bool)
+    for _ in range(4):
+        X = np.c_[a[keep] - c, np.ones(keep.sum())]
+        sol = np.linalg.lstsq(X, b[keep] - c, rcond=None)[0]
+        e = np.linalg.norm(np.c_[a - c, np.ones(len(a))] @ sol - (b - c), axis=1)
+        keep = e < max(3.0 * 1.4826 * np.median(e[keep]), 0.05)
+    L, t = sol[:2].T, sol[2]
+    sv = np.linalg.svd(L, compute_uv=False)
+    if not (0.95 < sv.min() and sv.max() < 1.05):
+        log.warning("GPS layout fit implausible (scale %.3f..%.3f): products left in the BA frame", sv.min(), sv.max())
+        return None
+    rot = math.degrees(math.atan2(L[1, 0] - L[0, 1], L[0, 0] + L[1, 1]))
+    log.info("GPS layout correction from %d/%d RTK cameras: scale %.4f / %.4f, rotation %+.3f deg, "
+             "shift %.3f m (residual median %.3f m)", keep.sum(), len(a), sv.max(), sv.min(), rot,
+             float(np.hypot(*t)), float(np.median(e[keep])))
+    return GpsWarp(L, t, c)
+
+
+def _warp_tile(arr, A, tx, ty, w, h, kind, fill):
+    """Resample one output tile from the source raster through the affine A (out px -> source px):
+    RGB bilinear (nearest next to transparent cells), everything else nearest."""
+    u, v = np.meshgrid(np.arange(tx, tx + w, dtype=np.float64), np.arange(ty, ty + h, dtype=np.float64))
+    sc = A[0, 0] * u + A[0, 1] * v + A[0, 2]
+    sr = A[1, 0] * u + A[1, 1] * v + A[1, 2]
     H, W = arr.shape[:2]
+    ci, ri = np.rint(sc).astype(np.int64), np.rint(sr).astype(np.int64)
+    inside = (ci >= 0) & (ci < W) & (ri >= 0) & (ri < H)
+    cn, rn = np.clip(ci, 0, W - 1), np.clip(ri, 0, H - 1)
+    out = arr[rn, cn]
+    if kind == "rgba":
+        c0 = np.clip(np.floor(sc).astype(np.int64), 0, W - 2)
+        r0 = np.clip(np.floor(sr).astype(np.int64), 0, H - 2)
+        fx = np.clip(sc - c0, 0, 1)[..., None].astype(np.float32)
+        fy = np.clip(sr - r0, 0, 1)[..., None].astype(np.float32)
+        q00, q01, q10, q11 = arr[r0, c0], arr[r0, c0 + 1], arr[r0 + 1, c0], arr[r0 + 1, c0 + 1]
+        solid = (q00[..., 3] > 0) & (q01[..., 3] > 0) & (q10[..., 3] > 0) & (q11[..., 3] > 0)
+        bil = ((q00[..., :3] * (1 - fx) + q01[..., :3] * fx) * (1 - fy)
+               + (q10[..., :3] * (1 - fx) + q11[..., :3] * fx) * fy)
+        out = out.copy()
+        out[..., :3] = np.where(solid[..., None], np.clip(bil + 0.5, 0, 255), out[..., :3]).astype(np.uint8)
+    out = np.array(out, copy=True)
+    out[~inside] = fill
+    return out
+
+
+def _write_raster(path, arr, kind, epsg, origin_xy, gsd, nodata=None, tile=512, warp=None, offset=(0.0, 0.0)):
+    H, W = arr.shape[:2]
+    A = None
+    if warp is not None:
+        origin_xy, W, H, A = warp.grid(origin_xy, gsd, W, H, offset)
+        fill = 0 if kind == "rgba" else (nodata if nodata is not None else 0)
     geo = dict(epsg=epsg, origin=origin_xy, pixel_size=gsd)
     w = GeoTIFFWriter(path, W, H, tile=tile, kind=kind, nodata=nodata, **geo)
 
     def job(t):
         tx, ty = t
-        blk = arr[ty:ty + tile, tx:tx + tile]
+        if A is None:
+            blk = arr[ty:ty + tile, tx:tx + tile]
+        else:
+            blk = _warp_tile(arr, A, tx, ty, min(tile, W - tx), min(tile, H - ty), kind, fill)
         if kind == "float32":
             blk = blk.astype(np.float32, copy=False)          # int rasters convert per tile, not whole
         if kind == "rgba" and not blk[..., 3].any():
@@ -255,7 +359,13 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     ox, oy = ar.origin if georef else (0.0, 0.0)
     frames = ar.frames
     offset3 = (ox, oy, 0.0)
-    export.write_ply(os.path.join(out_dir, "sparse.ply"), rec.X, rec.color, offset3, "sparse SfM points")
+    warp = fit_gps_warp(ar, rec) if getattr(opt, "gps_warp", True) else None
+    gw = (lambda P: P) if warp is None else warp.xy            # local coordinates -> GPS layout
+
+    def _raster(*a, **k):
+        return _write_raster(*a, warp=warp, offset=(ox, oy), **k)
+
+    export.write_ply(os.path.join(out_dir, "sparse.ply"), gw(rec.X), rec.color, offset3, "sparse SfM points")
     rel = [frames[i].rel_alt for i in rec.used]
     absa = [frames[i].abs_alt for i in rec.used]
     z_abs_offset = (float(np.median([a - r for a, r in zip(absa, rel)]))
@@ -263,7 +373,7 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     cams = {}
     for k, i in enumerate(rec.used):
         it = rec.intr[rec.cam_group[k]]
-        cams[frames[i].name] = dict(R=rec.R[k].tolist(), C=(rec.C[k] + np.array(offset3)).tolist(),
+        cams[frames[i].name] = dict(R=rec.R[k].tolist(), C=(gw(rec.C[k:k + 1])[0] + np.array(offset3)).tolist(),
                                     f=it.f, k1=it.k1, k2=it.k2, k3=it.k3, cx=it.cx, cy=it.cy,
                                     width=it.width, height=it.height)
 
@@ -396,7 +506,7 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         gray, gvalid, g_gsd = ((rgba_o[..., 0], ortho_valid, o_gsd) if rgba_o is not None
                                else (dense.rgb[..., 0], covered, gsd))
         raw = np.where(gvalid, lo + gray.astype(np.float32) * ((hi - lo) / 255.0), np.nan)
-        _write_raster(os.path.join(out_dir, "orthophoto_thermal.tif"), raw.astype(np.float32), "float32", epsg,
+        _raster(os.path.join(out_dir, "orthophoto_thermal.tif"), raw.astype(np.float32), "float32", epsg,
                       origin_xy, g_gsd, float("nan"))
         del raw
         colors = palette_lut(opt.palette)[apply_contrast(np.asarray(gray), gvalid, opt.contrast)]
@@ -408,35 +518,35 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
 
     # ---- rasters
     dsm_out = np.where(covered, dsm, NODATA).astype(np.float32)
-    _write_raster(os.path.join(out_dir, "dsm.tif"), dsm_out, "float32", epsg, origin_xy, gsd, NODATA)
+    _raster(os.path.join(out_dir, "dsm.tif"), dsm_out, "float32", epsg, origin_xy, gsd, NODATA)
     # inspection rasters on the same grid: 1/0 validity, support (1 measured, 2 interpolated),
     # chosen source image (index into report["source_images"]) and number of seeing views
-    _write_raster(os.path.join(out_dir, "valid_mask.tif"), covered.astype(np.float32), "float32", epsg,
+    _raster(os.path.join(out_dir, "valid_mask.tif"), covered.astype(np.float32), "float32", epsg,
                   origin_xy, gsd)
     # Pix4D overlap map: number of calibrated images that photograph each DSM point
     from .densify import camera_count
     overlap = camera_count(rec, dense.minX, dense.maxY, dsm.shape[1], dsm.shape[0], gsd,
                            step=max(1, int(round(0.5 / gsd))), Z=dsm)
-    _write_raster(os.path.join(out_dir, "overlap.tif"), np.where(covered, overlap, 0).astype(np.float32),
+    _raster(os.path.join(out_dir, "overlap.tif"), np.where(covered, overlap, 0).astype(np.float32),
                   "float32", epsg, origin_xy, gsd)
     ov_stats = (dict(median=float(np.median(overlap[covered])), fraction_5plus=float((overlap[covered] >= 5).mean()),
                      fraction_3plus=float((overlap[covered] >= 3).mean())) if covered.any() else None)
     if ov_stats:
         log.info("Overlap: median %.0f images per point, %.0f%% of the area seen by 5+ images",
                  ov_stats["median"], 100 * ov_stats["fraction_5plus"])
-    _write_raster(os.path.join(out_dir, "dsm_support.tif"), support.astype(np.float32), "float32", epsg,
+    _raster(os.path.join(out_dir, "dsm_support.tif"), support.astype(np.float32), "float32", epsg,
                   origin_xy, gsd, 0.0)
     if src_id is not None:
-        _write_raster(os.path.join(out_dir, "source_image_id.tif"), src_id, "float32",
+        _raster(os.path.join(out_dir, "source_image_id.tif"), src_id, "float32",
                       epsg, origin_xy, o_gsd, -1.0)
-        _write_raster(os.path.join(out_dir, "coverage_count.tif"), count, "float32",
+        _raster(os.path.join(out_dir, "coverage_count.tif"), count, "float32",
                       epsg, origin_xy, o_gsd)
     if rgba_o is not None:
         rgba = rgba_o                                    # already RGBA, alpha = coloured by a photo
     else:
         rgba = np.dstack([colors, (ortho_valid * 255).astype(np.uint8)])
         rgba[~ortho_valid, :3] = 0
-    _write_raster(os.path.join(out_dir, "orthophoto.tif"), rgba, "rgba", epsg, origin_xy, o_gsd)
+    _raster(os.path.join(out_dir, "orthophoto.tif"), rgba, "rgba", epsg, origin_xy, o_gsd)
     pf = max(1, math.ceil(max(dsm.shape) / 2048))
     Image.fromarray(_colorize(dsm, covered, gsd)[::pf, ::pf]).save(os.path.join(out_dir, "dsm_preview.png"))
     po = max(1, math.ceil(max(rgba.shape[:2]) / 2048))
@@ -452,10 +562,10 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         t = time.time()
         dtm, ground = dtm_from_dsm(dsm, gsd, TerrainOptions(max_object_size=opt.dtm_max_object,
                                                              slope=opt.dtm_slope))
-        _write_raster(os.path.join(out_dir, "dtm.tif"), np.where(covered, dtm, NODATA).astype(np.float32),
+        _raster(os.path.join(out_dir, "dtm.tif"), np.where(covered, dtm, NODATA).astype(np.float32),
                       "float32", epsg, origin_xy, gsd, NODATA)
         ndsm_raw = np.where(covered, np.maximum(dsm - dtm, 0.0), np.nan)
-        _write_raster(os.path.join(out_dir, "ndsm.tif"), np.where(covered, ndsm_raw, NODATA).astype(np.float32),
+        _raster(os.path.join(out_dir, "ndsm.tif"), np.where(covered, ndsm_raw, NODATA).astype(np.float32),
                       "float32", epsg, origin_xy, gsd, NODATA)
         Image.fromarray(_colorize(dtm, covered, gsd)[::pf, ::pf]).save(os.path.join(out_dir, "dtm_preview.png"))
         log.info("DTM: %.0f%% of the surface classified as ground (%.1fs)",
@@ -469,6 +579,8 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
             else:
                 dtm_c = np.where(covered, dtm, np.nan)
             contours = contour_lines(dtm_c, gsd * cf, dense.minX, dense.maxY, opt.contour_interval)
+            if warp is not None:
+                contours = [(lv, [gw(np.asarray(seg, np.float64)) for seg in segs]) for lv, segs in contours]
             if contours:
                 export.write_geojson_contours(os.path.join(out_dir, "contours.geojson"), contours,
                                               offset=(ox, oy), epsg=epsg)
@@ -494,8 +606,9 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         outputs.update(dtm="dtm.tif", ndsm="ndsm.tif")
     if contours:                                     #changed here
         outputs["contours"] = "contours.geojson"
+    xyz_out = gw(xyz)
     if "ply" in opt.formats:
-        export.write_ply(os.path.join(out_dir, "dense.ply"), xyz, col, offset3, f"EPSG:{epsg}" if epsg else "")
+        export.write_ply(os.path.join(out_dir, "dense.ply"), xyz_out, col, offset3, f"EPSG:{epsg}" if epsg else "")
         outputs["dense_ply"] = "dense.ply"
     if "las" in opt.formats or "laz" in opt.formats:
         #changed here: Pix4D-style point-cloud classification for the LAS deliverable
@@ -512,7 +625,7 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                 cls = np.where(below & (cls == 2), 1, cls).astype(np.uint8)
         las_path = os.path.join(out_dir, "dense.las")
         spacing = cloud.spacing if cloud is not None else gsd * max(1, opt.cloud_step)
-        export.write_las(las_path, xyz, col, epsg, scale=las_scale(spacing), classification=cls,
+        export.write_las(las_path, xyz_out, col, epsg, scale=las_scale(spacing), classification=cls,
                          add=np.array(offset3))
         outputs["dense_las"] = "dense.las"
         if "laz" in opt.formats:
@@ -539,6 +652,7 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
             log.warning("Poisson mesh unavailable (install open3d, see above for errors): mesh built from the DSM")
         else:
             V, F, VC = m
+            V = gw(V)
             if "obj" in opt.formats:
                 export.write_obj_colored(os.path.join(out_dir, "mesh.obj"), V, F, VC, offset3)
                 outputs["mesh_obj"] = "mesh.obj"
@@ -553,6 +667,7 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         f = max(1, int(math.ceil(math.sqrt(n_valid / max(opt.mesh_max_vertices, 1)))))
         Zm, vm = _block_reduce(dsm, f, covered)
         V, F, UV = export.grid_mesh(Zm, vm & np.isfinite(Zm), dense.minX, dense.maxY, gsd * f)
+        V = gw(V)
         th = max(1, math.ceil(max(rgba.shape[:2]) / opt.texture_max))
         # 3D-model texture only: cells no photo sees take the dense-matching colour instead of black
         tex_rgb = (np.where(ortho_valid[..., None], colors, dense.rgb) if colors.shape[:2] == dsm.shape
@@ -567,6 +682,8 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         mesh_info = dict(method="DSM grid (2.5D)", vertices=int(len(V)), triangles=int(len(F)))
         log.info("Mesh: %d vertices, %d triangles at %.3f m", len(V), len(F), gsd * f)
 
+    dsm_grid = ((origin_xy, dsm.shape[1], dsm.shape[0]) if warp is None
+                else warp.grid(origin_xy, gsd, dsm.shape[1], dsm.shape[0], (ox, oy))[:3])
     report = dict(
         images_total=len(frames), images_used=len(rec.used), images_dropped=ar.dropped,
         backend=ar.backend.name, georeferenced=georef, epsg=epsg, origin=[ox, oy],
@@ -579,9 +696,11 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                    min_views=opt.depth_min_views if cloud is not None else None,
                    point_spacing_m=float(cloud.spacing) if cloud is not None else None),
         mesh=mesh_info,
-        dsm=dict(gsd=gsd, width=int(dsm.shape[1]), height=int(dsm.shape[0]),
-                 bounds=[origin_xy[0], origin_xy[1] - dsm.shape[0] * gsd, origin_xy[0] + dsm.shape[1] * gsd,
-                         origin_xy[1]],
+        gps_warp=(dict(linear=warp.L.tolist(), shift_m=warp.t.tolist(), centre_local=warp.c.tolist())
+                  if warp is not None else None),
+        dsm=dict(gsd=gsd, width=int(dsm_grid[1]), height=int(dsm_grid[2]),
+                 bounds=[dsm_grid[0][0], dsm_grid[0][1] - dsm_grid[2] * gsd, dsm_grid[0][0] + dsm_grid[1] * gsd,
+                         dsm_grid[0][1]],
                  confident_fraction=float(conf.sum() / max(covered.sum(), 1)),
                  measured_cells=int((support == 1).sum()), interpolated_cells=int((support == 2).sum()),
                  max_fill_m=opt.dsm_max_fill, requested_resolution=opt.dsm_resolution,

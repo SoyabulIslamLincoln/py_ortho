@@ -29,6 +29,8 @@ from .camera import (Intrinsics, group_intrinsics, poses_from_alignment, rodrigu
 
 log = logging.getLogger(__name__)
 
+RTK_SIGMA_FLOOR = 0.05      # m: lever arm / exposure-timing error the reported RTK std leaves out
+
 
 @dataclass
 class Reconstruction:
@@ -648,15 +650,24 @@ def reconstruct(ar, gps_sigma: float = 3.0, alt_sigma: float = 0.5, ratio: float
     pos = ar.positions
     C_t = rec.C.copy()
     C_s = np.full((N, 3), np.inf)
+    # RTK fixes carry their own accuracy (DJI XMP RtkStdLat/Lon, ~0.1 m): with the generic multi-metre
+    # GPS sigma the block was free to twist ~1 deg against the RTK positions (049: 1.1 deg vs Pix4D)
+    std_h = [frames[i].gps_std_h for i in used]
     if pos is not None and al.georeferenced:
         for k, i in enumerate(used):
             if np.all(np.isfinite(pos[i])):
                 C_t[k, :2] = pos[i]
-                C_s[k, :2] = gps_sigma
+                C_s[k, :2] = gps_sigma if std_h[k] is None else min(gps_sigma, max(std_h[k], RTK_SIGMA_FLOOR))
+        n_rtk = sum(s is not None for s in std_h)
+        if n_rtk:
+            log.info("RTK position priors on %d cameras (median sigma %.3f m)", n_rtk,
+                     float(np.median([s for s in std_h if s is not None])))
     else:  # fix the gauge softly around the 2D solution
         H = float(np.median(rec.C[:, 2]))
         C_s[:, :2] = 0.05 * H
     if has_rel_alt:
+        # not RtkStdHgt: the RTK height carries a heading-dependent bias (0.25-0.5 m between opposite
+        # strips on 041/049) that a tight vertical prior turns into a rolled block
         C_s[:, 2] = alt_sigma
     else:
         C_s[:, 2] = 0.2 * float(np.median(np.abs(rec.C[:, 2])))

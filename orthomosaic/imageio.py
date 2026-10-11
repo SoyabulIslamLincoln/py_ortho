@@ -36,6 +36,7 @@ class Frame:
     speed_y: Optional[float] = None     # DJI XMP FlightYSpeed (m/s, east)
     speed_z: Optional[float] = None     # DJI XMP FlightZSpeed (m/s, down)
     shutter: Optional[str] = None       # DJI XMP ShutterType ("Electronic" = rolling shutter)
+    gps_std_h: Optional[float] = None   # DJI XMP RtkStdLat/Lon: RTK horizontal 1-sigma (m)
     make: str = ""
     model: str = ""
     raw_shape: Optional[tuple] = None     # (h, w) of embedded radiometric thermal data (DJI R-JPEG)
@@ -99,6 +100,10 @@ def _read_dji_xmp(path: str, fr: "Frame"):
                 setattr(fr, attr, float(m.group(1)))
             except ValueError:
                 pass
+    std = [float(m.group(1)) for k in (b"RtkStdLat", b"RtkStdLon")
+           if (m := re.search(rb'drone-dji:' + k + rb'="([0-9.eE]+)"', head))]
+    if std:
+        fr.gps_std_h = max(std)
     m = re.search(rb'drone-dji:ShutterType="([A-Za-z]+)"', head)
     if m:
         fr.shutter = m.group(1).decode()

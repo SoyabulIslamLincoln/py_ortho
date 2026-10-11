@@ -112,6 +112,43 @@ def test_writers_roundtrip():
         assert struct.unpack("<III", g[:12])[2] == len(g)
 
 
+def test_gps_warp_maps_products_onto_gps():
+    """RTK camera layout fit: products are resampled so a point at BA position p lands at warp(p)."""
+    import types
+    from orthomosaic.reconstruct import _write_raster, fit_gps_warp
+    from orthomosaic.geotiff import read_geotiff
+    rng = np.random.default_rng(0)
+    th = np.radians(0.8)
+    L = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]]) @ np.diag([0.98, 1.0])
+    C = np.c_[rng.uniform(0, 40, 60), rng.uniform(-90, 0, 60), np.full(60, 30.0)]
+    gps = (C[:, :2] - 20) @ L.T + 20 + [0.1, -0.05]
+    gps[3] += 1.5                                        # one bad fix: rejected by the robust fit
+    frames = [types.SimpleNamespace(gps_std_h=0.09) for _ in C]
+    ar = types.SimpleNamespace(positions=gps, frames=frames, alignment=types.SimpleNamespace(georeferenced=True))
+    rec = types.SimpleNamespace(used=list(range(len(C))), C=C)
+    w = fit_gps_warp(ar, rec)
+    assert np.allclose(w.L, L, atol=1e-6)
+    assert np.abs(w.xy(C)[:, :2] - gps).max(axis=1)[np.arange(60) != 3].max() < 1e-6
+    for f in frames:
+        f.gps_std_h = 3.0
+    assert fit_gps_warp(ar, rec) is None                 # consumer GPS: left alone
+    g, ox, oy = 0.05, 500000.0, 4000000.0
+    rgba = np.zeros((900, 1000, 4), np.uint8)
+    rgba[..., 3] = 255
+    pts = np.array([[10.0, -10.0], [40.0, -35.0], [5.0, -40.0]])
+    for x, y in pts:
+        rgba[int(-y / g) - 2:int(-y / g) + 3, int(x / g) - 2:int(x / g) + 3, :3] = 255
+    with tempfile.TemporaryDirectory() as d:
+        f = os.path.join(d, "o.tif")
+        _write_raster(f, rgba, "rgba", 32633, (ox, oy), g, warp=w, offset=(ox, oy))
+        a, geo = read_geotiff(f)
+        for x, y in w.xy(pts + g * np.array([0.5, -0.5])):       # dot centres (cell centres)
+            c, r = (x + ox - geo["origin"][0]) / g - 0.5, (geo["origin"][1] - (y + oy)) / g - 0.5
+            win = a[int(r) - 5:int(r) + 6, int(c) - 5:int(c) + 6, 0] > 128
+            yy, xx = np.nonzero(win)
+            assert abs(xx.mean() - 5 - (c - int(c))) < 0.6 and abs(yy.mean() - 5 - (r - int(r))) < 0.6
+
+
 if __name__ == "__main__":
     for k, fn in list(globals().items()):
         if k.startswith("test_"):
