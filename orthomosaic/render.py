@@ -11,7 +11,7 @@ from typing import Callable, Optional
 import numpy as np
 
 from .geotiff import GeoTIFFWriter
-from .imageio import load_rgb
+from .imageio import load_rgb, load_thermal
 
 log = logging.getLogger(__name__)
 
@@ -70,8 +70,9 @@ def render(frames, affines: dict, gains: dict, backend, out_path: str, gsd: floa
            workers: int = 4, cache_mb: int = 1024, preview_path: Optional[str] = None,
            max_pixels: float = 4e10, post=None, thermal=None):
     """post: optional callable applied to every rendered RGBA block.
-    thermal: dict(lut, range, raw_path) -> the blended gray is raw thermal; colour it with the
-    palette and also write the raw values (float32, nodata NaN) to raw_path."""
+    thermal: dict(lut, range, raw_path) -> blend the radiometric frames as float values (16-bit
+    carrier, see thermal.gray_to_carrier), write them (°C or raw counts, float32, nodata NaN) to
+    raw_path and colour the 8-bit view of them with the palette."""
     ids = sorted(affines)
     # world footprints
     boxes = {}
@@ -97,9 +98,8 @@ def render(frames, affines: dict, gains: dict, backend, out_path: str, gsd: floa
     writer = GeoTIFFWriter(out_path, W, H, tile=tile, **geo)
     raw_writer = None
     if thermal is not None:
-        from .thermal import colorize_rgba
+        from .thermal import carrier_to_gray, colorize_rgba, gray_to_carrier, gray_to_values
         raw_writer = GeoTIFFWriter(thermal["raw_path"], W, H, tile=tile, kind="float32", nodata=float("nan"), **geo)
-        t_lo, t_hi = thermal["range"]
         t_lut = thermal["lut"]
 
     # world -> loaded-image pixel transforms
@@ -113,8 +113,9 @@ def render(frames, affines: dict, gains: dict, backend, out_path: str, gsd: floa
         S = np.array([[sx, 0, 0.5 * sx - 0.5], [0, sy, 0.5 * sy - 0.5], [0, 0, 1]])
         inv[i] = S @ np.linalg.inv(P)
 
-    cache = ImageCache(lambda i: backend.upload(load_rgb(frames[i], render_scale)),
-                       backend.image_nbytes, cache_mb * 1024 * 1024)
+    load = ((lambda i: gray_to_carrier(load_thermal(frames[i], render_scale))) if thermal is not None
+            else (lambda i: load_rgb(frames[i], render_scale)))
+    cache = ImageCache(lambda i: backend.upload(load(i)), backend.image_nbytes, cache_mb * 1024 * 1024)
 
     pf = max(1, math.ceil(max(W, H) / 2048)) if preview_path else 0
     preview = np.zeros((math.ceil(H / pf), math.ceil(W / pf), 4), np.uint8) if pf else None
@@ -138,26 +139,32 @@ def render(frames, affines: dict, gains: dict, backend, out_path: str, gsd: floa
         x0, y0 = bx * block, by * block
         bw, bh = min(block, W - x0), min(block, H - y0)
         hits = block_hits(bx, by)
-        rgba = None
+        rgba = gray = None
         if hits:
             B = np.array([[gsd, 0, minX + (x0 + 0.5) * gsd], [0, -gsd, maxY - (y0 + 0.5) * gsd], [0, 0, 1]])
             acc = backend.new_block(bh, bw)
             for i in hits:
                 M = (inv[i] @ B)[:2]
                 backend.warp_accumulate(acc, cache.get(i), M, gains.get(i, np.ones(3, np.float32)), power, mode)
-            rgba = backend.finalize(acc, mode)
+            if thermal is not None:
+                vals, cov = backend.finalize_float(acc, mode)
+                gray = carrier_to_gray(vals)
+                rgba = np.zeros((bh, bw, 4), np.uint8)
+                rgba[..., :3] = np.clip(gray + 0.5, 0, 255).astype(np.uint8)[..., None]
+                rgba[..., 3] = cov * np.uint8(255)
+            else:
+                rgba = backend.finalize(acc, mode)
             if not rgba[..., 3].any():
                 rgba = None
             else:
                 if post is not None:
                     rgba = post(rgba)
-        return x0, y0, bw, bh, rgba
+        return x0, y0, bw, bh, rgba, gray
 
-    def compress_block(x0, y0, bw, bh, rgba):
+    def compress_block(x0, y0, bw, bh, rgba, gray=None):
         out = []
         if rgba is not None and raw_writer is not None:
-            raw = np.where(rgba[..., 3] > 0, t_lo + rgba[..., 0].astype(np.float32) * ((t_hi - t_lo) / 255.0),
-                           np.nan).astype(np.float32)
+            raw = np.where(rgba[..., 3] > 0, gray_to_values(gray, thermal["range"]), np.nan).astype(np.float32)
             for ty in range(0, bh, tile):
                 for tx in range(0, bw, tile):
                     blk = raw[ty:ty + tile, tx:tx + tile]

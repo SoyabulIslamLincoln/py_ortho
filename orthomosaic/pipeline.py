@@ -48,8 +48,13 @@ class Options:
     block: int = 1024
     cache_mb: int = 1024
     preview: bool = True
-    # thermal (DJI radiometric R-JPEG): mosaic raw sensor values, colour with a palette at the end
+    # thermal (DJI radiometric R-JPEG): mosaic measured values (float32), colour with a palette at the end
     thermal: str = "auto"              # auto (use raw data when every image has it) | off
+    thermal_units: str = "celsius"     # celsius (DJI iirp cameras: M4T, M30T, M3T, H30T, ...) | raw (sensor counts)
+    emissivity: Optional[float] = None       # None = the value stored in each image (DJI default 0.95)
+    thermal_distance: Optional[float] = None  # m to the target; None = stored in each image (DJI default 5 m)
+    humidity: Optional[float] = None         # %; None = stored in each image
+    reflected_temp: Optional[float] = None   # °C; None = stored in each image (the drone's ambient reading)
     palette: str = "rainbow"           # rainbow | iron | white_hot | black_hot | arctic | lava | ... (see thermal.py)
     contrast: str = "linear"           # linear | equalize | clahe - display only, applied by build_3d before the palette
 
@@ -58,9 +63,9 @@ def _thermal_spec(ar, opt, output):
     """Palette + raw-value raster settings when the survey is radiometric thermal."""
     if ar.thermal_range is None:
         return None
-    from .thermal import legend, palette_lut
+    from .thermal import legend, palette_lut, value_label
     base = os.path.splitext(output)[0]
-    legend(base + "_legend.png", opt.palette, ar.thermal_range)
+    legend(base + "_legend.png", opt.palette, ar.thermal_range, value_label(ar.thermal_units))
     return dict(lut=palette_lut(opt.palette), range=ar.thermal_range, raw_path=base + "_thermal.tif")
 
 
@@ -86,7 +91,8 @@ class AlignResult:
     backend: object
     workers: int
     dropped: list
-    thermal_range: Optional[tuple] = None   # raw-value range when mosaicking radiometric thermal
+    thermal_range: Optional[tuple] = None   # value range when mosaicking radiometric thermal
+    thermal_units: Optional[str] = None     # "°C" or "raw" (sensor counts) for radiometric thermal
 
 
 def _auto_features(frames, max_dim: int) -> int:
@@ -127,15 +133,13 @@ def align_images(images: Union[str, Sequence[str]], opt: Options) -> AlignResult
     with ThreadPoolExecutor(workers) as ex:
         frames = list(ex.map(read_frame, paths))
 
-    # ---- radiometric thermal: work on raw sensor values with one survey-wide scale
-    thermal_range = None
+    # ---- radiometric thermal: work on measured values (°C) with one survey-wide scale
+    thermal_range = thermal_units = None
     if opt.thermal != "off" and all(f.raw_shape is not None for f in frames):
-        from .thermal import survey_range
-        thermal_range = survey_range(frames)
-        for f in frames:
-            f.thermal_range = thermal_range
-        log.info("Radiometric thermal images (raw %dx%d): raw range %.0f..%.0f, palette '%s'",
-                 frames[0].raw_shape[1], frames[0].raw_shape[0], *thermal_range, opt.palette)
+        from .thermal import setup_survey
+        thermal_range, thermal_units = setup_survey(frames, opt)
+        log.info("Radiometric thermal images (raw %dx%d): range %.1f..%.1f %s, palette '%s'",
+                 frames[0].raw_shape[1], frames[0].raw_shape[0], *thermal_range, thermal_units, opt.palette)
     elif opt.thermal != "off" and any(f.raw_shape is not None for f in frames):
         log.warning("Only some images carry radiometric thermal data; using the JPEG colours as they are")
 
@@ -219,7 +223,7 @@ def align_images(images: Union[str, Sequence[str]], opt: Options) -> AlignResult
     log.info("Aligned %d images, georeferenced=%s, native GSD=%.4f, match RMS=%.2f px",
              len(al.used), al.georeferenced, al.gsd, al.residual_px)
     res = AlignResult(frames, feats, work_scale, pairs, len(cand), al, positions, epsg, origin,
-                      backend, workers, dropped, thermal_range)
+                      backend, workers, dropped, thermal_range, thermal_units)
     res._mutual = mutual            # private cache (not a field: absent after dataclasses.replace)
     return res
 
@@ -235,6 +239,8 @@ def build_orthomosaic(images: Union[str, Sequence[str]], output: str,
 
     # thermal values are radiometric: never "exposure-compensate" them
     gains = solve_gains(al.used, pairs) if (opt.exposure_compensation and ar.thermal_range is None) else {}
+
+    from .thermal import measurement_summary
 
     # ---- render
     gsd = opt.resolution or al.gsd / opt.render_scale
@@ -252,7 +258,8 @@ def build_orthomosaic(images: Union[str, Sequence[str]], output: str,
         pairs_candidate=cand, pairs_verified=len(pairs),
         georeferenced=al.georeferenced, epsg=epsg if al.georeferenced else None,
         gsd=gsd, match_rms_px=al.residual_px, seconds=round(time.time() - t0, 1),
-        thermal=(dict(raw_range=list(ar.thermal_range), palette=opt.palette,
+        thermal=(dict(raw_range=list(ar.thermal_range), units=ar.thermal_units, palette=opt.palette,
+                      measurement=measurement_summary(frames),
                       raw_values=os.path.splitext(output)[0] + "_thermal.tif",
                       legend=os.path.splitext(output)[0] + "_legend.png") if ar.thermal_range else None),
         options=asdict(opt), **info,

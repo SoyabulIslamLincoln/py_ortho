@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from .imageio import load_rgb
+from .imageio import load_rgb, load_thermal
 try:
     from . import _dense
 except ImportError:                       # source tree without the compiled kernel
@@ -262,6 +262,10 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
     memory-mapped from files in `tmp_dir` (the caller removes it): alpha is 255 where a photo
     coloured the cell, `source` the index into ``rec.used`` of the view chosen per cell (-1 =
     unobserved) and `count` the number of views that see the cell.
+
+    Radiometric thermal (``ar.thermal_range`` set): frames are sampled and blended as float32 gray
+    (load_thermal), and the unquantised result is also written to ``<tmp_dir>/value.npy``
+    ((H, W) float32 gray levels, NaN = no data) for the °C raster.
     """
     opt = opt if opt is not None else _Defaults()
     g = lambda name: getattr(opt, name, getattr(_Defaults, name))
@@ -282,6 +286,11 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
     SRC = np.lib.format.open_memmap(os.path.join(tmp, "src.npy"), "w+", np.int32, (H, W))
     SRC[:] = -1                                               # index into rec.used, -1 = none
     CNT = np.lib.format.open_memmap(os.path.join(tmp, "cnt.npy"), "w+", np.uint8, (H, W))
+    thermal = getattr(ar, "thermal_range", None) is not None
+    VAL = None
+    if thermal:
+        VAL = np.lib.format.open_memmap(os.path.join(tmp, "value.npy"), "w+", np.float32, (H, W))
+        VAL[:] = np.nan
     if not covered.any() or len(rec.used) == 0:
         return rgba_out, SRC, CNT, tmp
 
@@ -299,7 +308,7 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
     def load(k):
         i = rec.used[k]
         fr = frames[i]
-        if _fast is not None:
+        if _fast is not None and not thermal:
             # one compiled pass (same rounding as the NumPy steps below)
             rgb = load_rgb(fr, img_scale)
             h, w = rgb.shape[:2]
@@ -310,7 +319,8 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
             return _View([], rgb if u8 else backend.upload(rgb),
                          np.ascontiguousarray(rec.R[k]), np.ascontiguousarray(rec.C[k]),
                          it.f * sx, it.k1, it.k2, (it.cx + 0.5) * sx - 0.5, (it.cy + 0.5) * sx - 0.5, it.k3)
-        rgb = load_rgb(fr, img_scale).astype(np.float32)
+        rgb = (np.repeat(load_thermal(fr, img_scale)[..., None], 3, axis=2) if thermal
+               else load_rgb(fr, img_scale).astype(np.float32))
         gg = gains.get(i)
         if gg is not None:
             rgb *= np.asarray(gg, np.float32)
@@ -335,7 +345,8 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
                      np.ascontiguousarray(rec.R[k]), np.ascontiguousarray(rec.C[k]),
                      it.f * sx, it.k1, it.k2, (it.cx + 0.5) * sx - 0.5, (it.cy + 0.5) * sx - 0.5, it.k3)
 
-    u8 = backend.name == "cpu" and _dense is not None and hasattr(_dense, "sample_view_u8")
+    # thermal stays float32 end to end (an 8-bit cache would quantise the measured values)
+    u8 = backend.name == "cpu" and _dense is not None and hasattr(_dense, "sample_view_u8") and not thermal
     cache = ImageCache(load, lambda v: v.nbytes, int(g("cache_mb")) * 1024 * 1024)
 
     def sample(v, X0, Y0, Ztile):
@@ -556,6 +567,8 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
         block = rgba_out[ty:ty + th, tx:tx + tw]
         block[m, :3] = np.clip(rgb[m] + 0.5, 0, 255).astype(np.uint8)
         block[m, 3] = 255
+        if VAL is not None:
+            VAL[ty:ty + th, tx:tx + tw][m] = rgb[m, 0]
         SRC[ty:ty + th, tx:tx + tw][m] = src[m]
         CNT[ty:ty + th, tx:tx + tw] = np.minimum(count, 255)
 

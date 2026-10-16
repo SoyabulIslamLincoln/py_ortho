@@ -219,6 +219,11 @@ class CUDABackend:
         out[..., 3] = covered.astype(cp.uint8) * 255
         return cp.asnumpy(out)
 
+    def finalize_float(self, block, mode):
+        acc, wsum = block
+        vals = acc / cp.maximum(wsum, 1e-12)[..., None] if mode == 0 else acc
+        return cp.asnumpy(vals.astype(cp.float32)), cp.asnumpy(wsum > 0)
+
     def sample_view(self, img, cam, X0, Y0, gsd, Z):
         R, C, f, k1, k2, k3, cx, cy = cam
         Z = cp.ascontiguousarray(cp.asarray(Z, cp.float32))

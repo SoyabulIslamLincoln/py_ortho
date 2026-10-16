@@ -5,6 +5,7 @@ import argparse
 import logging
 
 from .pipeline import Options, build_orthomosaic
+from .thermal import add_thermal_args, thermal_kwargs
 
 
 def main(argv=None):
@@ -28,6 +29,7 @@ def main(argv=None):
     ap.add_argument("--palette", default=d.palette,
                     help="thermal palette: rainbow (default), iron, white_hot, black_hot, arctic, lava, ...")
     ap.add_argument("--no-thermal", action="store_true", help="ignore radiometric data; use JPEG colours")
+    add_thermal_args(ap, d)
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
 
@@ -37,7 +39,7 @@ def main(argv=None):
                   feature_max_dim=a.feature_max_dim, n_features=a.features, neighbors=a.neighbors,
                   gps_sigma=a.gps_sigma, blend=a.blend, exposure_compensation=not a.no_exposure,
                   cache_mb=a.cache_mb, preview=not a.no_preview, palette=a.palette,
-                  thermal="off" if a.no_thermal else "auto")
+                  thermal="off" if a.no_thermal else "auto", **thermal_kwargs(a))
     build_orthomosaic(a.images, a.output, opt)
 
 

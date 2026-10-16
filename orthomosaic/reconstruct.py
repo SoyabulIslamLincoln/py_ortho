@@ -24,6 +24,7 @@ from . import export, mvs, sfm
 from .align import solve_gains
 from .geotiff import GeoTIFFWriter
 from .pipeline import Options, align_images
+from .thermal import measurement_summary
 
 log = logging.getLogger(__name__)
 NODATA = -9999.0
@@ -499,22 +500,26 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
             log.info("True orthophoto: %.0f%% of DSM cells coloured only from visible views (%.1fs)",
                      100 * ortho_frac, time.time() - t1)
 
-    # ---- thermal: the dense colours are raw values (gray); keep them and colour with the palette
+    # ---- thermal: the orthophoto holds measured values (float gray); write them in °C and colour
+    # the 8-bit view with the palette
     if thermal:
-        from .thermal import apply_contrast, legend, palette_lut
-        lo, hi = ar.thermal_range
+        from .thermal import apply_contrast, gray_to_values, legend, palette_lut, value_label
         gray, gvalid, g_gsd = ((rgba_o[..., 0], ortho_valid, o_gsd) if rgba_o is not None
                                else (dense.rgb[..., 0], covered, gsd))
-        raw = np.where(gvalid, lo + gray.astype(np.float32) * ((hi - lo) / 255.0), np.nan)
-        _raster(os.path.join(out_dir, "orthophoto_thermal.tif"), raw.astype(np.float32), "float32", epsg,
+        # true orthophoto: the unquantised float blend; sweep colours only exist as 8-bit gray
+        fval = (np.load(os.path.join(ortho_tmp, "value.npy"), mmap_mode="r") if rgba_o is not None
+                else gray)
+        raw = np.where(gvalid, gray_to_values(fval, ar.thermal_range), np.nan).astype(np.float32)
+        _raster(os.path.join(out_dir, "orthophoto_thermal.tif"), raw, "float32", epsg,
                       origin_xy, g_gsd, float("nan"))
-        del raw
+        del raw, fval
         colors = palette_lut(opt.palette)[apply_contrast(np.asarray(gray), gvalid, opt.contrast)]
         if rgba_o is not None:
             rgba_o[..., :3] = colors               # palette into the rendered RGBA (alpha kept)
             rgba_o[~gvalid, :3] = 0
             colors = rgba_o[..., :3]
-        legend(os.path.join(out_dir, "thermal_legend.png"), opt.palette, ar.thermal_range, contrast=opt.contrast)
+        legend(os.path.join(out_dir, "thermal_legend.png"), opt.palette, ar.thermal_range,
+               value_label(ar.thermal_units), contrast=opt.contrast)
 
     # ---- rasters
     dsm_out = np.where(covered, dsm, NODATA).astype(np.float32)
@@ -731,7 +736,8 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                             classes="ASPRS 2 ground / 3 low veg / 5 high veg / 6 building")
         if cls is not None else None,
         dense_points=int(len(xyz)), outputs=outputs, seconds=round(time.time() - t0, 1),
-        thermal=(dict(raw_range=list(ar.thermal_range), palette=opt.palette, contrast=opt.contrast, raw_values="orthophoto_thermal.tif",
+        thermal=(dict(raw_range=list(ar.thermal_range), units=ar.thermal_units, palette=opt.palette, contrast=opt.contrast,
+                      raw_values="orthophoto_thermal.tif", measurement=measurement_summary(frames),
                       legend="thermal_legend.png",
                       drift_offsets_gray=([round(float(min(v[0] for v in biases.values())), 2),
                                            round(float(max(v[0] for v in biases.values())), 2)] if biases else None),
@@ -762,6 +768,9 @@ def build_thermal_bound(rgb_images, thermal_images, out_dir, options: Optional[O
     topt = thermal_options or Options3D(backend=opt.backend, workers=opt.workers, gps_sigma=opt.gps_sigma,
                                         feature_max_dim=4000, n_features=8000, neighbors=16, min_inliers=15,
                                         exposure_compensation=False, palette=opt.palette,
+                                        thermal_units=opt.thermal_units, emissivity=opt.emissivity,
+                                        thermal_distance=opt.thermal_distance, humidity=opt.humidity,
+                                        reflected_temp=opt.reflected_temp,
                                         contrast=opt.contrast, gcp=opt.gcp,
                                         gcp_sigma=opt.gcp_sigma, dsm_resolution=opt.dsm_resolution)
     t0 = time.time()
@@ -794,6 +803,7 @@ def build_thermal_bound(rgb_images, thermal_images, out_dir, options: Optional[O
 
 
 def main(argv=None):
+    from .thermal import add_thermal_args, thermal_kwargs
     d = Options3D()
     ap = argparse.ArgumentParser(prog="orthomosaic-3d",
                                  description="2.5D reconstruction (DSM, true orthophoto, point cloud, mesh) "
@@ -848,6 +858,7 @@ def main(argv=None):
     ap.add_argument("--cache-mb", type=int, default=d.cache_mb)
     ap.add_argument("--palette", default=d.palette, help="thermal palette (rainbow, iron, white_hot, ...)")
     ap.add_argument("--no-thermal", action="store_true", help="ignore radiometric data; use JPEG colours")
+    add_thermal_args(ap, d)
     ap.add_argument("--gcp", default=None, help="GCP list file (WebODM/Pix4D format) to anchor the block")
     ap.add_argument("--gcp-sigma", type=float, default=d.gcp_sigma, help="surveyed GCP accuracy in metres")
     ap.add_argument("--bind-thermal", default=None, metavar="THERMAL_IMAGES",
@@ -861,6 +872,7 @@ def main(argv=None):
                     max_views=a.max_views, min_score=a.min_score, cloud_step=a.cloud_step,
                     mesh_max_vertices=a.mesh_max_vertices, cache_mb=a.cache_mb, palette=a.palette,
                     thermal="off" if a.no_thermal else "auto", dtm=not a.no_dtm, dtm_max_object=a.dtm_max_object,
+                    **thermal_kwargs(a),
                     gcp=a.gcp, gcp_sigma=a.gcp_sigma,
                     #changed here: Pix4D-grade ortho / colour / elevation-mapping switches
                     true_ortho=not a.no_true_ortho, occlusion=not a.no_occlusion,

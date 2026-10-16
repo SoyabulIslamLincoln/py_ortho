@@ -226,12 +226,23 @@ def write_quality_report(report: Union[dict, str], out_html: str,
     if R.get("thermal"):
         t = R["thermal"]
         rng = t.get("raw_range") or [None, None]
-        rng_txt = f"{_fmt(rng[0], 0)} – {_fmt(rng[1], 0)}"
-        thermal_html = (f"<section><h2>Thermal</h2><table class='kv'><tbody>"
-                        f"{_row('Palette', t.get('palette'))}"
-                        f"{_row('Raw value range', rng_txt)}"
-                        f"</tbody></table><p class='muted'>Raw sensor units (monotonic with temperature); "
-                        f"radiometric-to-°C conversion is not applied.</p></section>")
+        celsius = t.get("units") == "°C"
+        m = t.get("measurement") or {}
+        nd = 1 if celsius else 0
+        rng_txt = f"{_fmt(rng[0], nd)} – {_fmt(rng[1], nd)}" + (" °C" if celsius else "")
+        rows = _row("Palette", t.get("palette")) + _row(
+            "Temperature range (p0.5–p99.5)" if celsius else "Raw value range", rng_txt)
+        if celsius and m:
+            rows += (f"{_row('Emissivity', _fmt(m.get('emissivity'), 2))}"
+                     f"{_row('Distance (m)', _fmt(m.get('distance'), 1))}"
+                     f"{_row('Relative humidity (%)', _fmt(m.get('humidity'), 0))}"
+                     f"{_row('Reflected temperature (°C)', _fmt(m.get('reflected'), 1))}"
+                     f"{_row('Ambient temperature (°C)', _fmt(m.get('ambient'), 1))}")
+        note = ("Values are object temperature in °C (float32, one band), converted per image with its "
+                "measurement parameters (medians shown) before mosaicking."
+                if celsius else "Raw sensor units (monotonic with temperature); radiometric-to-°C conversion is not applied.")
+        thermal_html = (f"<section><h2>Thermal</h2><table class='kv'><tbody>{rows}"
+                        f"</tbody></table><p class='muted'>{note}</p></section>")
 
     html = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">

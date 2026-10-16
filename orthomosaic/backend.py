@@ -8,6 +8,7 @@ Both expose the same small interface used by the pipeline:
     upload(img_uint8_rgb)                 -> device image
     warp_accumulate(block, dev_img, M, gain, power, mode)
     finalize(block, mode)                 -> numpy uint8 RGBA
+    finalize_float(block, mode)           -> (numpy float32 (H,W,3) blended channels, covered (H,W) bool)
     xp                                    -> array module (numpy / cupy) for dense 3D
     sample_view(img, cam, X0, Y0, gsd, Z) -> (samples (H,W,ch) float32, valid (H,W))
     to_numpy(a)                           -> numpy array
@@ -58,6 +59,10 @@ class CPUBackend:
     def finalize(self, block, mode):
         acc, wsum = block
         return _core.finalize(acc, wsum, int(mode))
+
+    def finalize_float(self, block, mode):
+        acc, wsum = block
+        return (acc / np.maximum(wsum, 1e-12)[..., None] if mode == 0 else acc.copy()), wsum > 0
 
     def sample_view(self, img, cam, X0, Y0, gsd, Z):
         """Z: (H, W) heights, or a (D, H, W) stack of height hypotheses."""

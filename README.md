@@ -219,7 +219,9 @@ Resolution is never finer than GSD − 10 % (`ignore_gsd=True` to override).
 | `fill_hidden` | — | True | Colour fully occluded cells from the best photo |
 | `occlusion` | `--no-occlusion` | True | Occlusion test in the orthophoto |
 | `color_balance` | `--no-color-balance` | True | Per-image gain + offset |
-| `thermal_offsets` | — | True | Thermal only: per-photo drift offsets + sensor flat field (additive, raw values kept) |
+| `thermal_offsets` | — | True | Thermal only: per-photo drift offsets + sensor flat field (additive, absolute level kept) |
+| `thermal_units` | `--thermal-units` | `celsius` | Thermal output in °C (DJI iirp cameras) or `raw` sensor counts |
+| `emissivity`, `thermal_distance`, `humidity`, `reflected_temp` | `--emissivity` … | None | °C conversion overrides (None = value stored in each image) |
 | `dtm` | `--no-dtm` | True | Bare-ground DTM |
 | `contour_interval` | `--contours` | 0 | Contour spacing (m), 0 = off |
 | `mesh_method` | — | `auto` | Poisson from the cloud (open3d) or DSM mesh |
@@ -253,10 +255,25 @@ are not an independent accuracy check — keep separate checkpoints for that.
 
 ## Thermal
 
-DJI radiometric R-JPEGs (M30T, M3T, M4T, H20T …) are mosaicked on raw sensor values with one
-survey-wide scale, then coloured with a palette (`rainbow`, `iron`, `white_hot`, `black_hot`,
-`arctic`, `lava`, `hot_metal`, `medical`, `green_hot`, `rainbow_hc`). Raw values are written to
-`*_thermal.tif`; `python -m orthomosaic.thermal recolor` changes the palette afterwards.
+DJI radiometric R-JPEGs (M30T, M3T, M4T, H20T …) are mosaicked as one float32 channel of measured
+values, never as palette colours. Only the final product is coloured with a palette (`rainbow`, `iron`, `white_hot`, `black_hot`,
+`arctic`, `lava`, `hot_metal`, `medical`, `green_hot`, `rainbow_hc`). The values are written to
+`*_thermal.tif` / `orthophoto_thermal.tif` (float32, one band, NaN = no data);
+`python -m orthomosaic.thermal recolor` changes the palette afterwards.
+
+**Temperature (°C).** On DJI "iirp" cameras (M4T, M30T, M3T, M3TD, H30T, H20N), each raw count is
+a blackbody temperature, `T0 = (raw >> 2) / 16` K. Every image is converted to object
+temperature before mosaicking, using the measurement parameters stored in that image: emissivity,
+distance, humidity, and reflected and ambient temperature. The conversion uses the radiometric
+model of DJI's Thermal SDK, `e*tau*T^4 + (1-e)*tau*Trefl^4 + (1-tau)*Tatm^4`, with FLIR's
+atmospheric transmission. DJI's proprietary tau and emissivity tables are not used, so expect
+small differences from DJI Thermal Analysis Tool and Pix4D. These are negligible at the stored
+5 m distance and grow with distance and with low emissivity. Override the stored parameters with
+`emissivity`, `thermal_distance`, `humidity` and `reflected_temp` (`--emissivity`,
+`--thermal-distance`, `--humidity`, `--reflected-temp`). `thermal_units="raw"` (`--thermal-units raw`)
+keeps sensor counts. Other R-JPEG types (H20T/XT S "dirp", "girp", "hirp") fall back to raw counts.
+The 2D renderer carries 16-bit values through its 8-bit kernels (high byte, low byte), and the true
+orthophoto samples and blends in float32. No step quantises the values to 8 bits.
 
 The 3D pipeline (`build_3d`, `orthomosaic-3d`) calibrates every thermal flight automatically,
 with no hand tuning. These steps apply only to radiometric thermal; RGB processing is unchanged:

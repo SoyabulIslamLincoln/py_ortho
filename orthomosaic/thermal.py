@@ -1,9 +1,12 @@
-"""Thermal imagery: radiometric R-JPEG decoding and colour palettes.
+"""Thermal imagery: radiometric R-JPEG decoding, temperature conversion and colour palettes.
 
 DJI thermal cameras (M30T, M3T, M4T, H20T, ...) store the raw 16-bit sensor image in the
-JPEG's APP3 segments. The pipeline mosaics those raw values (not the palette colours, which
-must never be blended) and applies a palette only to the final product. A raw-value raster
-is written alongside, so the palette can be changed later without re-processing:
+JPEG's APP3 segments. On "iirp" cameras (M4T, M30T, M3T, M3TD, H30T, H20N) those counts are
+converted to object temperature in °C with the measurement parameters stored in each image
+(other R-JPEG flavours keep raw counts). The pipeline mosaics these values as float32, one
+channel (never the palette colours, which must not be blended), and applies a palette only to
+the final product. The value raster (°C) is written alongside, so the palette can be changed
+later without re-processing:
 
     python -m orthomosaic.thermal recolor ortho_thermal.tif -o ortho_iron.tif --palette iron
     python -m orthomosaic.thermal list
@@ -160,8 +163,9 @@ def colorize_rgba(rgba: np.ndarray, lut: np.ndarray) -> np.ndarray:
 # radiometric R-JPEG
 # --------------------------------------------------------------------------
 
-def _app3_segments(path: str, read_data: bool):
-    """Walk JPEG markers up to the scan; return (total APP3 payload length, payload or None, size)."""
+def _app3_segments(path: str, read_data: bool, marker_id: int = 0xE3):
+    """Walk JPEG markers up to the scan; return (total payload length, payload or None) of the
+    `marker_id` segments (APP3 = raw thermal image, APP4 = DJI measurement header)."""
     total, chunks = 0, []
     with open(path, "rb") as fh:
         if fh.read(2) != b"\xff\xd8":
@@ -173,7 +177,7 @@ def _app3_segments(path: str, read_data: bool):
             marker, length = hdr[1], struct.unpack(">H", hdr[2:4])[0]
             if marker == 0xDA:          # start of scan: metadata is over
                 break
-            if marker == 0xE3:
+            if marker == marker_id:
                 if read_data:
                     chunks.append(fh.read(length - 2))
                 else:
@@ -202,33 +206,164 @@ def read_raw_thermal(path: str, shape: tuple[int, int]) -> np.ndarray:
     return np.frombuffer(data[:2 * h * w], "<u2").reshape(h, w)
 
 
-def raw_to_gray(raw: np.ndarray, value_range: tuple[float, float], size: tuple[int, int],
-                flat: Optional[np.ndarray] = None) -> np.ndarray:
-    """Normalise raw sensor values to uint8 with the survey-wide range and resize to (w, h).
-    `flat`: optional (h, w) additive correction in gray levels (see flat_field)."""
+_IIRP_MAGIC = b"\xff\xd2\xd1\xff"
+
+
+def rjpeg_format(path: str) -> str:
+    """DJI R-JPEG flavour from the APP4 header tag ("iirp", "hirp", "girp", ...; the Thermal SDK
+    picks its decoder the same way), "iirp-highgain" for unmeasurable 'high-high gain' captures,
+    or "unknown" (no tagged header: H20T/XT S "dirp", or not a DJI R-JPEG)."""
+    _, seg = _app3_segments(path, True, 0xE4)
+    if not seg or len(seg) < 0x20 or seg[:4] != _IIRP_MAGIC:
+        return "unknown"
+    tag = seg[4:12].split(b"\0", 1)[0].decode("latin-1") or "unknown"
+    return "iirp-highgain" if tag == "iirp" and len(seg) > 0x80 and seg[0x80] == 3 else tag
+
+
+def read_measurement_params(path: str) -> Optional[dict]:
+    """Measurement parameters a DJI "iirp" R-JPEG (M4T, M30T, M3T, M3TD, H30T, H20N) stores in its
+    APP4 header, as set on the drone: emissivity, distance (m), humidity (%), reflected and ambient
+    temperature (°C). None for other R-JPEG flavours (dirp/girp/hirp), whose raw counts are not
+    temperatures, and for "high-high gain" captures, which DJI does not measure either."""
+    _, seg = _app3_segments(path, True, 0xE4)
+    if not seg or len(seg) < 0xA0 or seg[:4] != _IIRP_MAGIC or seg[4:8] != b"iirp":
+        return None
+    amb, dist, ems, hum, refl = struct.unpack_from("<5f", seg, 0x20)
+    if seg[0x80] == 3:
+        return None
+    return dict(emissivity=float(ems), distance=float(dist), humidity=float(hum) * 100.0,
+                reflected=float(refl), ambient=float(amb))
+
+
+def atmospheric_transmission(distance: float, humidity: float, ambient: float) -> float:
+    """Fraction of the object's radiation that reaches the camera through `distance` m of air
+    (FLIR's two-band water-vapour model; humidity in %, ambient in °C)."""
+    t = ambient
+    h2o = humidity / 100.0 * math.exp(1.5587 + 0.06939 * t - 0.00027816 * t * t + 6.8455e-7 * t ** 3)
+    s, r = math.sqrt(max(distance, 0.0)), math.sqrt(h2o)
+    tau = 1.9 * math.exp(-s * (0.006569 - 0.002276 * r)) - 0.9 * math.exp(-s * (0.01262 - 0.00667 * r))
+    return float(min(max(tau, 0.05), 1.0))
+
+
+def raw_to_celsius(raw: np.ndarray, params: dict) -> np.ndarray:
+    """DJI iirp raw counts -> object temperature in °C (float32).
+
+    A count is a blackbody (emissivity 1) temperature: ``T0 = (raw >> 2) / 16`` K. The camera
+    receives ``e*tau*W(T) + (1-e)*tau*W(T_refl) + (1-tau)*W(T_atm)`` with ``W ~ T^4`` (the
+    radiometric model of DJI's Thermal SDK), solved here for the object temperature T."""
+    K = 273.15
+    t0 = (np.asarray(raw, np.uint16) >> 2).astype(np.float64) * 0.0625
+    e = min(max(float(params["emissivity"]), 0.01), 1.0)
+    tau = atmospheric_transmission(params["distance"], params["humidity"], params["ambient"])
+    w = (t0 ** 4 - (1.0 - e) * tau * (params["reflected"] + K) ** 4
+         - (1.0 - tau) * (params["ambient"] + K) ** 4)
+    return (np.sqrt(np.sqrt(np.maximum(w, 0.0) / (e * tau))) - K).astype(np.float32)
+
+
+def frame_values(frame) -> np.ndarray:
+    """A frame's raw thermal image in measurement units (float32, raw resolution): °C when the
+    survey is calibrated (``frame.thermal_cal`` holds its parameters), raw counts otherwise."""
+    raw = read_raw_thermal(frame.path, frame.raw_shape)
+    cal = getattr(frame, "thermal_cal", None)
+    return raw.astype(np.float32) if cal is None else raw_to_celsius(raw, cal)
+
+
+def values_to_gray(values: np.ndarray, value_range: tuple[float, float], size: tuple[int, int],
+                   flat: Optional[np.ndarray] = None, quantize: bool = True) -> np.ndarray:
+    """Normalise measurement values to gray levels (0-255 = the survey-wide range) and resize to
+    (w, h). `flat`: optional (h, w) additive correction in gray levels (see flat_field).
+    quantize=True: uint8 (feature matching); False: float32, unclipped (mosaicking)."""
     from PIL import Image
     lo, hi = value_range
-    g = (raw.astype(np.float32) - lo) * (255.0 / max(hi - lo, 1e-6))
-    im = Image.fromarray(np.clip(g, 0, 255).astype(np.float32), "F")
+    g = (np.asarray(values, np.float32) - lo) * (255.0 / max(hi - lo, 1e-6))
+    im = Image.fromarray((np.clip(g, 0, 255) if quantize else g).astype(np.float32), "F")
     if im.size != size:
         im = im.resize(size, Image.BILINEAR if size[0] >= im.size[0] else Image.BOX)
-    g = np.asarray(im)
+    g = np.asarray(im, np.float32)
     if flat is not None:
         g = g + flat
-    return np.clip(g + 0.5, 0, 255).astype(np.uint8)
+    return np.clip(g + 0.5, 0, 255).astype(np.uint8) if quantize else g
+
+
+def gray_to_values(gray, value_range: tuple[float, float]):
+    """Inverse of values_to_gray (without the resampling): gray levels -> °C / raw counts."""
+    lo, hi = value_range
+    return lo + np.asarray(gray, np.float32) * np.float32((hi - lo) / 255.0)
+
+
+# The 2D renderer's kernels blend uint8 RGB. Warping and blending are linear per channel, so a
+# 16-bit gray carried as (high byte, low byte, high byte) blends exactly when the float
+# accumulators are read back (backend.finalize_float): 256*A0 + A1 is the blended 16-bit value.
+CARRIER_LO, CARRIER_SPAN = -128.0, 512.0   # gray levels the carrier covers (beyond the survey range)
+
+
+def gray_to_carrier(gray: np.ndarray) -> np.ndarray:
+    """float gray (h, w) -> uint8 (h, w, 3) 16-bit carrier, 1/128 gray-level steps."""
+    c = np.clip(np.rint((gray - CARRIER_LO) * (65535.0 / CARRIER_SPAN)), 0, 65535).astype(np.uint16)
+    out = np.empty(c.shape + (3,), np.uint8)
+    out[..., 0] = out[..., 2] = c >> 8
+    out[..., 1] = c & 255
+    return out
+
+
+def carrier_to_gray(blended: np.ndarray) -> np.ndarray:
+    """Blended float carrier channels (..., 3) -> float gray."""
+    return ((blended[..., 0] * 256.0 + blended[..., 1]) * (CARRIER_SPAN / 65535.0) + CARRIER_LO).astype(np.float32)
 
 
 def survey_range(frames, sample: int = 40, pct=(0.5, 99.5)) -> tuple[float, float]:
-    """Common raw-value range over a sample of the survey (so every image uses the same scale)."""
+    """Common value range over a sample of the survey (so every image uses the same scale)."""
     idx = np.linspace(0, len(frames) - 1, min(sample, len(frames))).round().astype(int)
-    vals = []
-    for i in sorted(set(idx.tolist())):
-        fr = frames[i]
-        raw = read_raw_thermal(fr.path, fr.raw_shape)
-        vals.append(raw[::4, ::4].ravel())
-    v = np.concatenate(vals)
-    lo, hi = np.percentile(v, pct)
+    vals = [frame_values(frames[i])[::4, ::4].ravel() for i in sorted(set(idx.tolist()))]
+    lo, hi = np.percentile(np.concatenate(vals), pct)
     return float(lo), float(hi)
+
+
+def setup_survey(frames, opt) -> tuple[tuple[float, float], str]:
+    """Prepare radiometric frames: per-image °C calibration (when every image carries DJI iirp
+    measurement parameters and ``opt.thermal_units`` is "celsius"; options override the stored
+    emissivity / distance / humidity / reflected temperature) and the survey-wide value range.
+    Returns (value_range, units) with units "°C" or "raw"."""
+    units = "raw"
+    for f in frames:
+        f.thermal_cal = None
+    if getattr(opt, "thermal_units", "celsius") == "celsius":
+        params = [read_measurement_params(f.path) for f in frames]
+        if all(p is not None for p in params):
+            over = {k: v for k, v in (("emissivity", getattr(opt, "emissivity", None)),
+                                      ("distance", getattr(opt, "thermal_distance", None)),
+                                      ("humidity", getattr(opt, "humidity", None)),
+                                      ("reflected", getattr(opt, "reflected_temp", None))) if v is not None}
+            for f, p in zip(frames, params):
+                f.thermal_cal = {**p, **over}
+            units = "°C"
+            med = {k: float(np.median([f.thermal_cal[k] for f in frames])) for k in params[0]}
+            log.info("Thermal -> °C: emissivity %.2f, distance %.1f m, humidity %.0f%%, reflected %.1f °C, "
+                     "ambient %.1f °C (median of the per-image values%s)", med["emissivity"], med["distance"],
+                     med["humidity"], med["reflected"], med["ambient"],
+                     "; overridden: " + ", ".join(over) if over else "")
+        else:
+            from collections import Counter
+            from PIL import Image
+            bad = [f for f, p in zip(frames, params) if p is None]
+            fmts = Counter(rjpeg_format(f.path) for f in bad)
+            with Image.open(bad[0].path) as im:
+                fw = im.getexif().get(305, "?")              # EXIF Software = camera firmware
+            log.warning("Thermal -> °C needs DJI 'iirp' R-JPEGs; %d/%d images are %s (%s, camera firmware %s): "
+                        "keeping raw sensor counts (no °C)", len(bad), len(frames),
+                        ", ".join(f"'{k}' x{v}" for k, v in fmts.most_common()), bad[0].model or "?", fw)
+    rng = survey_range(frames)
+    for f in frames:
+        f.thermal_range = rng
+    return rng, units
+
+
+def measurement_summary(frames) -> Optional[dict]:
+    """Median measurement parameters of calibrated frames (for the reports)."""
+    cals = [f.thermal_cal for f in frames if getattr(f, "thermal_cal", None)]
+    if not cals:
+        return None
+    return {k: round(float(np.median([c[k] for c in cals])), 3) for k in cals[0]}
 
 
 def _flat_terms(px, py, width: int, height: int) -> np.ndarray:
@@ -331,6 +466,10 @@ def solve_offsets(used, pairs, size: Optional[tuple[int, int]] = None, prior: fl
 # products
 # --------------------------------------------------------------------------
 
+def value_label(units: str) -> str:
+    return "temperature (°C)" if units == "°C" else "raw sensor value"
+
+
 def legend(path: str, palette: PaletteSpec, value_range: tuple[float, float], label: str = "raw sensor value",
            contrast: str = "linear"):
     """Small colour-bar PNG with the value range (a non-linear contrast only marks the ends)."""
@@ -345,7 +484,7 @@ def legend(path: str, palette: PaletteSpec, value_range: tuple[float, float], la
     for frac in ((0.0, 0.5, 1.0) if contrast == "linear" else (0.0, 1.0)):
         x = 20 + frac * (W - 41)
         d.line([(x, 10 + bar), (x, 16 + bar)], fill="black")
-        txt = f"{lo + frac * (hi - lo):.0f}"
+        txt = f"{lo + frac * (hi - lo):.{1 if hi - lo < 50 else 0}f}"
         d.text((x - 4 * len(txt) / 2 * 1.5, 18 + bar), txt, fill="black")
     name = palette if isinstance(palette, str) else "custom"
     if contrast != "linear":
@@ -357,7 +496,8 @@ def legend(path: str, palette: PaletteSpec, value_range: tuple[float, float], la
 def recolor(thermal_tif: str, out_tif: str, palette: PaletteSpec = DEFAULT_PALETTE,
             value_range: Optional[tuple[float, float]] = None, legend_png: Optional[str] = None,
             contrast: str = "linear") -> str:
-    """Re-render a raw-value thermal GeoTIFF (from build_orthomosaic / build_3d) with another palette."""
+    """Re-render a thermal value GeoTIFF (°C or raw counts, from build_orthomosaic / build_3d) with
+    another palette."""
     from .geotiff import GeoTIFFWriter, read_geotiff
     val, geo = read_geotiff(thermal_tif)
     valid = np.isfinite(val)
@@ -378,15 +518,34 @@ def recolor(thermal_tif: str, out_tif: str, palette: PaletteSpec = DEFAULT_PALET
                 w.write_tile(tx // 512, ty // 512, w.compress_tile(blk))
     w.close()
     if legend_png:
-        legend(legend_png, palette, value_range, contrast=contrast)
+        # raw DJI counts are in the tens of thousands; temperatures are not
+        units = "°C" if valid.any() and np.nanmax(np.abs(val[valid])) < 1000 else "raw"
+        legend(legend_png, palette, value_range, value_label(units), contrast=contrast)
     return out_tif
+
+
+def add_thermal_args(ap, d):
+    """Temperature-conversion flags shared by both command lines."""
+    ap.add_argument("--thermal-units", choices=["celsius", "raw"], default=d.thermal_units,
+                    help="thermal output in °C (DJI iirp cameras) or raw sensor counts")
+    ap.add_argument("--emissivity", type=float, default=None, help="target emissivity (default: stored in the images)")
+    ap.add_argument("--thermal-distance", type=float, default=None,
+                    help="distance to the target in m for the atmospheric correction (default: stored in the images)")
+    ap.add_argument("--humidity", type=float, default=None, help="relative humidity %% (default: stored in the images)")
+    ap.add_argument("--reflected-temp", type=float, default=None,
+                    help="reflected apparent temperature °C (default: stored in the images)")
+
+
+def thermal_kwargs(a):
+    return dict(thermal_units=a.thermal_units, emissivity=a.emissivity, thermal_distance=a.thermal_distance,
+                humidity=a.humidity, reflected_temp=a.reflected_temp)
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="python -m orthomosaic.thermal", description="Thermal palettes")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list", help="list the available palettes")
-    r = sub.add_parser("recolor", help="re-colour a *_thermal.tif raw-value raster with another palette")
+    r = sub.add_parser("recolor", help="re-colour a *_thermal.tif value raster (°C) with another palette")
     r.add_argument("thermal_tif")
     r.add_argument("-o", "--output", required=True)
     r.add_argument("--palette", default=DEFAULT_PALETTE)

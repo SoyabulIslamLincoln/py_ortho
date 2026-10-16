@@ -40,7 +40,8 @@ class Frame:
     make: str = ""
     model: str = ""
     raw_shape: Optional[tuple] = None     # (h, w) of embedded radiometric thermal data (DJI R-JPEG)
-    thermal_range: Optional[tuple] = None  # set by the pipeline: decode raw thermal with this range
+    thermal_range: Optional[tuple] = None  # set by the pipeline: survey-wide value range (°C or raw counts)
+    thermal_cal: Optional[dict] = None     # set by the pipeline: measurement parameters for raw -> °C (None = raw)
     thermal_flat: Optional[np.ndarray] = None  # set by build_3d: sensor flat-field coefficients (thermal.flat_field)
     # filled by the pipeline
     E: Optional[float] = None
@@ -159,12 +160,9 @@ def load_rgb(frame: Frame, scale: float = 1.0) -> np.ndarray:
     tw = max(1, int(round(frame.width * scale)))
     th = max(1, int(round(frame.height * scale)))
     if frame.thermal_range is not None and frame.raw_shape is not None:
-        # radiometric thermal: use the raw sensor values (common survey-wide scale) as gray
-        from .thermal import flat_field, raw_to_gray, read_raw_thermal
-        flat = (None if frame.thermal_flat is None
-                else flat_field(frame.thermal_flat, frame.width, frame.height, (tw, th)))
-        g = raw_to_gray(read_raw_thermal(frame.path, frame.raw_shape), frame.thermal_range, (tw, th), flat)
-        return np.repeat(g[..., None], 3, axis=2)
+        # radiometric thermal: 8-bit gray of the measured values (feature matching, previews);
+        # the mosaics use load_thermal
+        return np.repeat(_thermal_gray(frame, tw, th, True)[..., None], 3, axis=2)
     with Image.open(frame.path) as im:
         if scale < 1.0 and im.format == "JPEG":
             dw, dh = (tw, th) if frame.orientation not in (5, 6, 7, 8) else (th, tw)
@@ -175,3 +173,19 @@ def load_rgb(frame: Frame, scale: float = 1.0) -> np.ndarray:
         if im.size != (tw, th):
             im = im.resize((tw, th), Image.BILINEAR if scale >= 0.5 else Image.BOX)
         return np.asarray(im, dtype=np.uint8).copy()
+
+
+def _thermal_gray(frame: Frame, tw: int, th: int, quantize: bool) -> np.ndarray:
+    from .thermal import flat_field, frame_values, values_to_gray
+    flat = (None if frame.thermal_flat is None
+            else flat_field(frame.thermal_flat, frame.width, frame.height, (tw, th)))
+    return values_to_gray(frame_values(frame), frame.thermal_range, (tw, th), flat, quantize)
+
+
+def load_thermal(frame: Frame, scale: float = 1.0) -> np.ndarray:
+    """Radiometric thermal frame as one float32 channel in gray levels (0-255 = the survey value
+    range, unclipped and unquantised, flat field applied), at the same size as load_rgb.
+    thermal.gray_to_values turns blended gray back into °C / raw counts."""
+    tw = max(1, int(round(frame.width * scale)))
+    th = max(1, int(round(frame.height * scale)))
+    return _thermal_gray(frame, tw, th, False)

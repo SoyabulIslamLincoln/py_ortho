@@ -166,6 +166,11 @@ class MLXBackend:
         alpha = covered.astype(mx.uint8) * 255
         return np.array(mx.concatenate([rgb, alpha[..., None]], axis=-1))
 
+    def finalize_float(self, block, mode):
+        acc, wsum = block
+        vals = acc / mx.maximum(wsum, 1e-12)[..., None] if mode == 0 else acc
+        return np.array(vals.astype(mx.float32)), np.array(wsum > 0)
+
     # -- dense 3D -----------------------------------------------------------------
     def sample_view(self, img, cam, X0, Y0, gsd, Z):
         R, C, f, k1, k2, k3, cx, cy = cam
