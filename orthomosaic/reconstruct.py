@@ -73,6 +73,7 @@ class Options3D(Options):
     #changed here: Pix4D-grade true orthophoto + elevation-mapping controls
     true_ortho: bool = True                 # re-render the ortho on the final DSM (occlusion-aware)
     thermal_offsets: bool = True            # radiometric thermal: remove per-frame drift + sensor flat field (additive)
+    footprint_smooth_m: float = 0.75        # thermal on the RGB surface: smooth the mosaic's outer border (m, 0 = off)
     occlusion: bool = True                  # drop views hidden behind buildings/trees
     occlusion_tol: float = 0.20             # metres a ray may pass under the surface before it blocks
     occlusion_steps: int = 96               # max line-of-sight samples per ray (1 DSM cell apart when possible)
@@ -96,6 +97,33 @@ class Options3D(Options):
     # ground control points (survey anchors)
     gcp: Optional[str] = None               # path to a WebODM/Pix4D GCP list file
     gcp_sigma: float = 0.05                 # surveyed GCP accuracy in metres
+
+
+@dataclass
+class Surface:
+    """A finished DSM in a block's local frame, to render another (rig-bound) block on.
+
+    Thermal's own height sweep measures ~15% of its cells (low texture, 640/1280 px frames); the
+    other 85% are interpolated, and a roof edge rendered on that surface follows the interpolated
+    blobs instead of the real wall, so straight edges come out wavy. The RGB DSM of the same flight
+    is measured almost everywhere, with sharp height steps."""
+    dsm: np.ndarray                 # (H, W) float32, NaN = no data
+    support: np.ndarray             # (H, W) 1 measured / 2 interpolated / 0 none
+    minX: float                     # local frame, top-left cell corner
+    maxY: float
+    gsd: float
+    origin: tuple                   # UTM offset of the local frame
+    warp: Optional["GpsWarp"] = None
+
+    def height(self, xy: np.ndarray) -> np.ndarray:
+        """Surface height at local (n, 2) positions (nearest cell), NaN outside or in holes."""
+        H, W = self.dsm.shape
+        c = np.floor((xy[:, 0] - self.minX) / self.gsd).astype(np.int64)
+        r = np.floor((self.maxY - xy[:, 1]) / self.gsd).astype(np.int64)
+        ok = (c >= 0) & (c < W) & (r >= 0) & (r < H)
+        z = np.full(len(xy), np.nan, np.float64)
+        z[ok] = self.dsm[r[ok], c[ok]]
+        return z
 
 
 def _colorize(Z, valid, gsd=1.0):
@@ -343,24 +371,64 @@ def sparse_block(images: Union[str, Sequence[str]], opt: Options3D):
 
 
 def build_3d(images: Union[str, Sequence[str]], out_dir: str, options: Optional[Options3D] = None,
-             pre: Optional[tuple] = None) -> dict:
+             pre: Optional[tuple] = None, surface: Optional[Surface] = None,
+             surface_out: Optional[list] = None) -> dict:
     """Full 2.5D reconstruction. `pre` = (AlignResult, Reconstruction) reuses an existing block
-    (e.g. a rig-bound thermal reconstruction) instead of aligning and triangulating again."""
+    (e.g. a rig-bound thermal reconstruction) instead of aligning and triangulating again.
+    `surface` renders the block on that DSM (same local frame) instead of reconstructing its own;
+    `surface_out`, a list, receives this run's final DSM as a `Surface`."""
     opt = options or Options3D()
     t0 = time.time()
     os.makedirs(out_dir, exist_ok=True)
     ar, rec = pre if pre is not None else sparse_block(images, opt)
-    return _products(ar, rec, out_dir, opt, t0)
+    return _products(ar, rec, out_dir, opt, t0, surface, surface_out)
 
 
-def _products(ar, rec, out_dir, opt, t0) -> dict:
+def smooth_footprint(valid: np.ndarray, gsd: float, radius_m: float = 0.75) -> np.ndarray:
+    """`valid` with a smooth outer border: a cell stays where ~90% of the area within `radius_m`
+    is valid, and the result is softened once more. Teeth and notches smaller than the radius
+    (frame corners, frame hand-overs) become a smooth line; the border moves in by ~0.4 x radius.
+    Holes inside the footprint are left as they are."""
+    from .ortho import _box
+    r = max(1, int(round(radius_m / gsd)))
+    inner = _box(valid.astype(np.float32), r) > 0.9
+    smooth = _box(inner.astype(np.float32), max(1, r // 2)) > 0.5
+    return smooth & valid
+
+
+def _surface_dense(surface: Surface, rec, min_views: int = 1):
+    """DenseResult + (dsm, conf, support) from a given surface, cut to the cells this block's
+    cameras may photograph (the RGB footprint is wider than thermal's narrow field of view).
+    The camera count runs on 16-cell blocks, so the cut is grown by 1.5 blocks: a superset whose
+    staircase edge never shows, because the orthophoto's own per-pixel visibility then sets the
+    border and the products are trimmed to it (`_trim_to_ortho`)."""
+    from .densify import camera_coverage
+    H, W = surface.dsm.shape
+    step = 16
+    seen = mvs._near(camera_coverage(rec, surface.minX, surface.maxY, W, H, surface.gsd, min_views=min_views,
+                                     step=step), 3 * step // 2).astype(bool)
+    dsm = np.where(seen, surface.dsm, np.nan).astype(np.float32)
+    covered = np.isfinite(dsm)
+    dense = mvs.DenseResult(Z=dsm, score=covered.astype(np.float32), rgb=np.zeros((H, W, 3), np.uint8),
+                            covered=covered, minX=surface.minX, maxY=surface.maxY, gsd=surface.gsd)
+    support = np.where(covered, surface.support, 0).astype(np.uint8)
+    return dense, dsm, covered & (support == 1), support
+
+
+def _products(ar, rec, out_dir, opt, t0, surface: Optional[Surface] = None,
+              surface_out: Optional[list] = None) -> dict:
     al = ar.alignment
     georef = bool(al.georeferenced)
     epsg = ar.epsg if georef else None
     ox, oy = ar.origin if georef else (0.0, 0.0)
     frames = ar.frames
     offset3 = (ox, oy, 0.0)
-    warp = fit_gps_warp(ar, rec) if getattr(opt, "gps_warp", True) else None
+    if surface is not None:
+        if georef and tuple(surface.origin) != tuple(ar.origin):
+            raise ValueError(f"surface origin {surface.origin} != block origin {ar.origin}: rebase the block first")
+        warp = surface.warp            # the surface's GPS layout, so both products share one grid
+    else:
+        warp = fit_gps_warp(ar, rec) if getattr(opt, "gps_warp", True) else None
     gw = (lambda P: P) if warp is None else warp.xy            # local coordinates -> GPS layout
 
     def _raster(*a, **k):
@@ -400,7 +468,12 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         gains, biases = {}, {}
     res = cap_resolution(opt.dsm_resolution, al.gsd, opt.ignore_gsd)
     cloud = None
-    if opt.dense_method == "depthmap" and not thermal:
+    if surface is not None:
+        dense, dsm, conf, support = _surface_dense(surface, rec)
+        log.info("Rendering on the given surface (%d x %d cells at %.3f m, %.0f%% measured): no own "
+                 "dense matching", dsm.shape[1], dsm.shape[0], surface.gsd,
+                 100 * conf.sum() / max(np.isfinite(dsm).sum(), 1))
+    elif opt.dense_method == "depthmap" and not thermal:
         from .densify import DepthOptions, densify, rasterize
         cloud = densify(ar, rec, gains, biases, out_dir,
                         DepthOptions(max_image_dim=opt.depth_max_image, neighbors=opt.depth_neighbors,
@@ -432,9 +505,10 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                                 extent_trim=0.0 if thermal else 1.0)
         dense = mvs.dense_reconstruct(ar, rec, gains, al.gsd, dopt, biases=biases)
     gsd = dense.gsd
-    max_fill = -1 if opt.dsm_max_fill < 0 else int(math.ceil(opt.dsm_max_fill / gsd))
-    dsm, conf, support = mvs.postprocess(dense, opt.min_score, smooth_range=opt.dsm_smooth,
-                                         smooth_iters=opt.dsm_smooth_iters, max_fill_cells=max_fill)
+    if surface is None:
+        max_fill = -1 if opt.dsm_max_fill < 0 else int(math.ceil(opt.dsm_max_fill / gsd))
+        dsm, conf, support = mvs.postprocess(dense, opt.min_score, smooth_range=opt.dsm_smooth,
+                                             smooth_iters=opt.dsm_smooth_iters, max_fill_cells=max_fill)
     if cloud is not None:
         # ODM median-smooths its DEM (radius 4 cells at 5 cm, i.e. ~0.2 m wide): removes the
         # isolated 10-30 cm spikes that otherwise print as dots in the orthophoto, while a median
@@ -458,6 +532,8 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
                 stepped=None if dense.stepped is None else dense.stepped[cut],
                 minX=dense.minX + c0 * gsd, maxY=dense.maxY - r0 * gsd)
     origin_xy = (dense.minX + ox, dense.maxY + oy)
+    if surface_out is not None:
+        surface_out.append(Surface(dsm, support, dense.minX, dense.maxY, gsd, (ox, oy), warp))
 
     #changed here: Pix4D "Orthomosaic" stage -- re-render the colours on the FINAL DSM with
     #occlusion handling (views hidden behind a building are dropped), view-angle weighting and
@@ -470,7 +546,8 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
     # thermal renders here too: the sweep's colours are chosen per 160-cell tile, which prints a
     # visible block grid; the renderer picks one coherent source per region and blends seams.
     # Thermal frames load as raw-value gray (imageio) and have no gains, so the values stay raw.
-    if getattr(opt, "true_ortho", True) and covered.any():
+    # a given surface carries no colours of its own: rendering is the only way to colour it
+    if (getattr(opt, "true_ortho", True) or surface is not None) and covered.any():
         from .ortho import true_orthophoto
         t1 = time.time()
         o_gsd = cap_resolution(opt.ortho_resolution or al.gsd, al.gsd, opt.ignore_gsd)
@@ -495,6 +572,15 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         # matching colours would paint walls/roofs onto the hidden ground.
         colors = rgba_o[..., :3]
         ortho_valid = rgba_o[..., 3] > 0
+        if surface is not None and ortho_valid.any() and getattr(opt, "footprint_smooth_m", 0.75) > 0:
+            # the outer border is the union of photo frames, stepped where one frame hands over to
+            # the next; trim it to a smooth line as Pix4D does (RGB uses the cloud's convex hull)
+            keep = smooth_footprint(ortho_valid, o_gsd, opt.footprint_smooth_m)
+            cut = ortho_valid & ~keep
+            rgba_o[cut] = 0
+            src_id[cut] = -1
+            count[cut] = 0
+            ortho_valid = keep
         if ortho_valid.any():
             ortho_frac = float(ortho_valid.sum() / max(covered_o.sum(), 1))
             log.info("True orthophoto: %.0f%% of DSM cells coloured only from visible views (%.1fs)",
@@ -520,6 +606,18 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
             colors = rgba_o[..., :3]
         legend(os.path.join(out_dir, "thermal_legend.png"), opt.palette, ar.thermal_range,
                value_label(ar.thermal_units), contrast=opt.contrast)
+    if surface is not None and rgba_o is not None:
+        # the photos' footprints, not the coarse camera count, end the products: DSM cells (and
+        # the cloud, DTM, overlap) only where the orthophoto has a value -- straight frame edges
+        yi = np.minimum(((np.arange(dsm.shape[0]) + 0.5) * gsd / o_gsd).astype(np.int64), rgba_o.shape[0] - 1)
+        xi = np.minimum(((np.arange(dsm.shape[1]) + 0.5) * gsd / o_gsd).astype(np.int64), rgba_o.shape[1] - 1)
+        seen = np.asarray(ortho_valid)[yi][:, xi]
+        covered &= seen
+        conf &= seen
+        dsm = np.where(covered, dsm, np.nan).astype(np.float32)
+        support = np.where(covered, support, 0).astype(support.dtype)
+        # point cloud / mesh colours on the DSM grid: nearest orthophoto cell
+        dense.rgb[:] = np.asarray(rgba_o[..., :3])[yi][:, xi]
 
     # ---- rasters
     dsm_out = np.where(covered, dsm, NODATA).astype(np.float32)
@@ -695,7 +793,8 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
         z_datum=rec.stats.get("z_datum"), z_to_absolute_offset=z_abs_offset,
         sfm=rec.stats,
         overlap=ov_stats,
-        dense=dict(method="depth maps -> fused 3D cloud -> DSM" if cloud is not None else "ground-grid height sweep",
+        dense=dict(method=("surface of the bound RGB block" if surface is not None
+                           else "depth maps -> fused 3D cloud -> DSM" if cloud is not None else "ground-grid height sweep"),
                    points=int(len(cloud.xyz)) if cloud is not None else None,
                    median_views=int(np.median(cloud.views)) if cloud is not None else None,
                    min_views=opt.depth_min_views if cloud is not None else None,
@@ -756,14 +855,22 @@ def _products(ar, rec, out_dir, opt, t0) -> dict:
 
 
 def build_thermal_bound(rgb_images, thermal_images, out_dir, options: Optional[Options3D] = None,
-                        thermal_options: Optional[Options3D] = None) -> dict:
+                        thermal_options: Optional[Options3D] = None, thermal_dsm: str = "rgb",
+                        dirs: tuple = ("rgb", "thermal")) -> dict:
     """RGB-driven thermal binding: aerial-triangulate the RGB block, then place the thermal images
     from their RGB twins through a shared rig, so the thermal DSM/orthophoto inherit RGB accuracy
     and are co-registered with the RGB products.
 
-    Writes RGB products to <out_dir>/rgb and bound thermal products to <out_dir>/thermal.
+    `thermal_dsm="rgb"` (default) renders the thermal orthophoto on the RGB DSM, as Pix4D does when
+    thermal and RGB share a project: roof edges and walls come out straight and on the RGB grid.
+    `"thermal"` keeps the thermal block's own height sweep.
+
+    Writes RGB products to <out_dir>/<dirs[0]> and bound thermal products to <out_dir>/<dirs[1]>
+    (with binding_report.json: rig, refinement and the surface used).
     """
-    from .binding import bind_thermal
+    from .binding import bind_thermal, rebase
+    if thermal_dsm not in ("rgb", "thermal"):
+        raise ValueError(f"thermal_dsm must be 'rgb' or 'thermal', not {thermal_dsm!r}")
     opt = options or Options3D()
     topt = thermal_options or Options3D(backend=opt.backend, workers=opt.workers, gps_sigma=opt.gps_sigma,
                                         feature_max_dim=4000, n_features=8000, neighbors=16, min_inliers=15,
@@ -778,27 +885,40 @@ def build_thermal_bound(rgb_images, thermal_images, out_dir, options: Optional[O
 
     log.info("== RGB block (aerial triangulation) ==")
     ar_rgb, rec_rgb = sparse_block(rgb_images, opt)
-    rgb_report = build_3d(None, os.path.join(out_dir, "rgb"), opt, pre=(ar_rgb, rec_rgb))
+    surfaces = []
+    rgb_report = build_3d(None, os.path.join(out_dir, dirs[0]), opt, pre=(ar_rgb, rec_rgb), surface_out=surfaces)
 
     log.info("== Thermal block ==")
     ar_th, rec_th = sparse_block(thermal_images, topt)
+    if ar_th.epsg != ar_rgb.epsg:
+        raise RuntimeError(f"RGB (EPSG {ar_rgb.epsg}) and thermal (EPSG {ar_th.epsg}) blocks are in different zones")
+    # one local frame for both blocks (each block's origin is its own rounded mean GPS)
+    rebase(rec_th, ar_th.positions, ar_th.origin, ar_rgb.origin)
+    ar_th.origin = ar_rgb.origin
 
     log.info("== Binding thermal to RGB ==")
-    rec_bound, rig = bind_thermal(rec_rgb, ar_rgb.frames, rec_th, ar_th.frames)
-    if rig["translation_scatter_m"] > 0.5 or rig["rotation_scatter_deg"] > 2.0:
-        log.warning("Rig is inconsistent (rotation scatter %.2f deg, translation scatter %.2f m): the two "
-                    "cameras may not be rigidly mounted, or a pose set is noisy", rig["rotation_scatter_deg"],
-                    rig["translation_scatter_m"])
-    th_report = build_3d(None, os.path.join(out_dir, "thermal"), topt, pre=(ar_th, rec_bound))
+    rec_bound, rig = bind_thermal(rec_rgb, ar_rgb.frames, rec_th, ar_th.frames,
+                                  ground=surfaces[0].height if surfaces else None, workers=ar_th.workers)
+    if rig["rotation_scatter_deg"] > 2.0:
+        log.warning("Rig rotation is inconsistent (scatter %.2f deg): the two cameras may not be rigidly "
+                    "mounted, or the thermal-only poses are noisy (the refinement corrects attitudes "
+                    "within ~0.5 deg)", rig["rotation_scatter_deg"])
+    ref = rig.get("refinement") or {}
+    if (ref.get("median_err_px") or 0) > 1.5:
+        log.warning("Bound thermal refinement leaves a median error of %.2f px: thermal photos may not "
+                    "line up exactly on the RGB surface", ref["median_err_px"])
+    th_report = build_3d(None, os.path.join(out_dir, dirs[1]), topt, pre=(ar_th, rec_bound),
+                         surface=surfaces[0] if thermal_dsm == "rgb" and surfaces else None)
     th_report["rig"] = rig
 
     report = dict(seconds=round(time.time() - t0, 1), rig=rig,
-                  rgb=dict(dir="rgb", **{k: rgb_report[k] for k in ("images_used", "epsg", "dsm")}),
-                  thermal=dict(dir="thermal", **{k: th_report[k] for k in ("images_used", "epsg", "dsm")}))
-    with open(os.path.join(out_dir, "binding_report.json"), "w") as fh:
+                  rgb=dict(dir=dirs[0], **{k: rgb_report[k] for k in ("images_used", "epsg", "dsm")}),
+                  thermal=dict(dir=dirs[1], surface=thermal_dsm,
+                               **{k: th_report[k] for k in ("images_used", "epsg", "dsm")}))
+    with open(os.path.join(out_dir, dirs[1], "binding_report.json"), "w") as fh:
         json.dump(report, fh, indent=1)
-    log.info("Thermal binding done in %.1fs: rig baseline %.3f m, rotation %.2f deg -> %s",
-             time.time() - t0, rig["rig_baseline_m"], max(abs(v) for v in rig["rig_rotation_deg"]), out_dir)
+    log.info("Thermal binding done in %.1fs: rig rotation %.2f deg, thermal on the %s DSM -> %s",
+             time.time() - t0, max(abs(v) for v in rig["rig_rotation_deg"]), thermal_dsm.upper(), out_dir)
     return report
 
 
@@ -864,6 +984,9 @@ def main(argv=None):
     ap.add_argument("--bind-thermal", default=None, metavar="THERMAL_IMAGES",
                     help="RGB-driven thermal binding: `images` is the RGB set, this is the thermal set; "
                          "the thermal block is placed from the RGB poses via a shared rig")
+    ap.add_argument("--thermal-dsm", choices=["rgb", "thermal"], default="rgb",
+                    help="with --bind-thermal: render the thermal orthophoto on the RGB DSM (default, sharp "
+                         "edges) or on the thermal block's own height sweep")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.INFO,
@@ -884,7 +1007,7 @@ def main(argv=None):
                     contour_interval=a.contours, classify_cloud=not a.no_classify,
                     formats=tuple(f.strip() for f in a.formats.split(",") if f.strip()))
     if a.bind_thermal:
-        build_thermal_bound(a.images, a.bind_thermal, a.output, opt)
+        build_thermal_bound(a.images, a.bind_thermal, a.output, opt, thermal_dsm=a.thermal_dsm)
     else:
         build_3d(a.images, a.output, opt)
 

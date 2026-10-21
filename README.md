@@ -114,7 +114,7 @@ import glob
 rgb = sorted(glob.glob("flight/*_V.JPG"))
 build_3d(rgb, "recon_rgb/", Options3D())
 
-# thermal placed from the RGB block via a rigid rig -> co-registered thermal DSM/ortho
+# thermal placed from the RGB block via a rigid rig and rendered on the RGB DSM
 build_thermal_bound("rgb/", "thermal/", "recon_bound/", Options3D(backend="mps"))
 ```
 
@@ -293,6 +293,36 @@ with no hand tuning. These steps apply only to radiometric thermal; RGB processi
 - **Full footprint.** The narrow thermal field of view puts the end-of-strip photos at the outer
   edge of the survey, so the thermal grid includes every footprint rather than trimming extreme
   corners. This trimming previously cut straight edges into long strips.
+
+### Thermal on the RGB surface (`--bind-thermal`)
+
+A thermal orthophoto is only as straight as the DSM it is rendered on. Thermal's own height sweep
+measures about 15% of its cells (flight 050: 13.5%; RGB: 85%): thermal frames are small and
+low in texture. The rest is interpolated, and a roof edge rendered on those interpolated blobs
+follows them, so straight edges come out wavy. Pix4D avoids this when RGB and thermal share a
+project. `build_thermal_bound` / `orthomosaic-3d RGB_DIR --bind-thermal THERMAL_DIR` does the same:
+
+1. The RGB block is triangulated and its DSM built as usual (`<out>/rgb`).
+2. The thermal block is triangulated and moved to the RGB local frame. Each thermal camera is
+   placed at its RGB twin's centre, with the RGB attitude turned by the rig rotation. The
+   thermal-only SfM cannot measure the few-cm lever arm (on 050 it gave 0.83 m), so it is not
+   applied (`lever_arm=False`).
+3. A thermal-only adjustment refines the thermal lens and attitudes. Camera centres are pinned
+   (5 cm) and tie-point heights are held to the RGB DSM (15 cm). On a nadir block, pinned centres
+   alone cannot detect a wrong focal length, because the tie points just move up or down. With
+   the ground known, a 3% focal error is removed. `binding_report.json` → `rig.refinement`
+   (in the thermal folder) records the result.
+4. The thermal orthophoto is rendered on the RGB DSM, cut to the thermal footprint, with the RGB
+   block's GPS-layout warp. The thermal rasters then share the RGB grid, and coregistration is
+   not needed. `--thermal-dsm thermal` keeps the old thermal height sweep. The outer border, the
+   union of the photo frames, steps where one frame hands over to the next. It is trimmed to a
+   smooth line, as Pix4D does (`footprint_smooth_m`, 0.75 m; 0 = off). The border moves in by
+   about 0.3 m.
+
+The renderer also never samples a photo beyond its corner radius. The M4T thermal lens model
+(k3 ≈ −0.4) folds back past r ≈ 0.85, so without this limit ground ~30 m outside a frame was
+painted into it as long streaks at the edge of the survey. The limit also applies to the
+`overlap.tif` / footprint camera counts.
 
 ### Thermal on RGB (automatic control points)
 

@@ -149,6 +149,21 @@ def test_gps_warp_maps_products_onto_gps():
             assert abs(xx.mean() - 5 - (c - int(c))) < 0.6 and abs(yy.mean() - 5 - (r - int(r))) < 0.6
 
 
+def test_smooth_footprint_removes_steps_keeps_interior():
+    from orthomosaic.reconstruct import smooth_footprint
+    H, W = 400, 400
+    yy, xx = np.mgrid[0:H, 0:W]
+    valid = xx < 200 + 0.5 * yy                                  # diagonal border ...
+    valid &= ~(((yy // 40) % 2 == 0) & (xx > 180 + 0.5 * yy))    # ... with 20-cell notches every 40 rows
+    valid[150:160, 50:60] = False                                 # an interior hole
+    out = smooth_footprint(valid, 0.02, 0.4)                      # radius 20 cells
+    assert not (out & ~valid).any()                               # never adds cells
+    assert not out[150:160, 50:60].any() and out[100:200, 20:40].all()   # interior kept, hole kept
+    # the border: column of the last valid cell per row varies smoothly (no 20-cell jumps)
+    last = np.array([np.flatnonzero(out[r])[-1] for r in range(60, 340)])
+    assert np.abs(np.diff(last)).max() <= 3
+
+
 if __name__ == "__main__":
     for k, fn in list(globals().items()):
         if k.startswith("test_"):

@@ -777,12 +777,16 @@ def camera_count(rec, minX: float, maxY: float, W: int, H: int, gsd: float, step
         z = np.where(np.isfinite(zc), zc, zg)
     P = np.stack([minX + (xx.ravel() * step + step / 2) * gsd, maxY - (yy.ravel() * step + step / 2) * gsd, z], 1)
     count = np.zeros(xx.size, np.int32)
+    from .ortho import lens_r2max
+    r2max = [lens_r2max(it) for it in rec.intr]
     for k in range(len(rec.used)):
         it = rec.intr[rec.cam_group[k]]
         cam = _Cam(rec.R[k], rec.C[k], it.f, it.k1, it.k2, it.cx, it.cy, it.width, it.height, it.k3)
         xc = (P - cam.C) @ cam.R.T
         u, v = cam.project_cam(xc[:, 0], xc[:, 1], xc[:, 2])
-        count += (xc[:, 2] > 0) & (u >= 0) & (v >= 0) & (u <= it.width - 1) & (v <= it.height - 1)
+        # past the lens model's fold, ground far outside the frame projects into it
+        inside = xc[:, 0] ** 2 + xc[:, 1] ** 2 <= r2max[rec.cam_group[k]] * xc[:, 2] ** 2
+        count += (xc[:, 2] > 0) & inside & (u >= 0) & (v >= 0) & (u <= it.width - 1) & (v <= it.height - 1)
     return np.repeat(np.repeat(count.reshape(hs, ws), step, 0), step, 1)[:H, :W]
 
 

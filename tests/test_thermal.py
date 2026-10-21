@@ -256,6 +256,26 @@ def test_solve_offsets_removes_frame_drift_and_flat_field():
     assert abs(fixed.astype(float).mean() - plain.astype(float).mean()) < 0.6 and fixed.std() > 0.5
 
 
+def test_lens_limit_stops_distortion_fold_back():
+    """M4T thermal lens (k3 = -0.4): the radial polynomial folds back past r ~ 0.85, so a point far
+    outside the frame would land inside it. The renderer only uses points within the corner radius."""
+    from orthomosaic.camera import Intrinsics
+    from orthomosaic.ortho import _outside_lens, lens_r2max
+    it = Intrinsics(width=1280, height=1024, f=1970.0, k1=-0.126, k2=0.044, k3=-0.397, ppx=640.0, ppy=512.0)
+    r = 1.1                                                       # ~48 deg off axis
+    rd = r * (1 + r * r * (it.k1 + r * r * (it.k2 + r * r * it.k3)))
+    assert 0 < rd * it.f < 512                                    # the fold puts it inside the image
+    r2max = lens_r2max(it)
+    corner = np.hypot(639.5, 511.5) / it.f
+    assert corner ** 2 < r2max < (1.05 * corner) ** 2
+    R = np.diag([1.0, -1.0, -1.0])                                # nadir camera at 30 m
+    Z = np.zeros((1, 3), np.float32)
+    out = _outside_lens(R, np.array([0.0, 0.0, 30.0]), r2max, -0.5, 0.5, 1.0, Z)   # cell centres x = 0, 1, 2
+    assert not out.any()
+    far = _outside_lens(R, np.array([-33.0, 0.0, 30.0]), r2max, -0.5, 0.5, 1.0, Z)  # r = 33/30 = 1.1
+    assert far.all()
+
+
 if __name__ == "__main__":
     for k, fn in list(globals().items()):
         if k.startswith("test_"):

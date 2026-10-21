@@ -19,6 +19,7 @@ the current matching tile.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import tempfile
 import time
@@ -89,6 +90,35 @@ try:
     from . import _fast
 except ImportError:                       # source tree without the compiled kernel
     _fast = None
+
+
+def lens_r2max(it) -> float:
+    """Largest squared undistorted radius (normalised) a point may have to be in the photo.
+
+    The radial polynomial r(1 + k1 r^2 + k2 r^4 + k3 r^6) only describes the lens inside the
+    frame; past its maximum it bends back, so ground far outside the frame (30 m off on the M4T
+    thermal, k3 = -0.38) projects *into* the image and is painted as long streaks. Limit: the
+    radius of the farthest image corner, on the rising branch of the polynomial."""
+    rd = math.hypot(max(it.cx, it.width - 1 - it.cx), max(it.cy, it.height - 1 - it.cy)) / it.f
+    r = np.linspace(0.0, 4.0 * rd + 1.0, 8001)
+    r2 = r * r
+    d = r * (1 + r2 * (it.k1 + r2 * (it.k2 + r2 * it.k3)))
+    rising = np.flatnonzero(np.diff(d) <= 0)
+    stop = rising[0] if rising.size else len(r) - 1        # first fold of the polynomial
+    reach = np.flatnonzero(d[:stop + 1] >= rd)
+    lim = r[reach[0]] * 1.01 if reach.size else r[stop]
+    return float(min(lim, r[stop]) ** 2)
+
+
+def _outside_lens(R, C, r2max, X0, Y0, gsd, Z):
+    """(h, w) bool: cells of a tile whose undistorted radius in camera (R, C) exceeds `r2max`
+    (or that lie behind it)."""
+    h, w = Z.shape
+    x = X0 + (np.arange(w) + 0.5) * gsd - C[0]
+    y = Y0 - (np.arange(h) + 0.5) * gsd - C[1]
+    z = Z.astype(np.float64) - C[2]
+    a = [R[i, 0] * x[None, :] + R[i, 1] * y[:, None] + R[i, 2] * z for i in range(3)]
+    return (a[2] <= 1e-6) | (a[0] * a[0] + a[1] * a[1] > r2max * a[2] * a[2])
 
 
 def _box(a, r):
@@ -178,6 +208,7 @@ def _global_sources(rec, dsm, minX, maxY, gsd, use_occ, occ_steps, occ_tol, zmax
         front = z > 1e-6
         nrm = xc[:, :2] / np.where(front, z, 1.0)[:, None]
         r2 = (nrm * nrm).sum(1)
+        front &= r2 < lens_r2max(it)
         uv = (it.f * (1 + r2 * (it.k1 + r2 * (it.k2 + r2 * it.k3))))[:, None] * nrm + (it.cx, it.cy)
         bu = np.minimum(uv[:, 0], it.width - 1 - uv[:, 0]) / (0.5 * it.width)
         bv = np.minimum(uv[:, 1], it.height - 1 - uv[:, 1]) / (0.5 * it.height)
@@ -348,6 +379,7 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
     # thermal stays float32 end to end (an 8-bit cache would quantise the measured values)
     u8 = backend.name == "cpu" and _dense is not None and hasattr(_dense, "sample_view_u8") and not thermal
     cache = ImageCache(load, lambda v: v.nbytes, int(g("cache_mb")) * 1024 * 1024)
+    r2max = [lens_r2max(it) for it in rec.intr]          # past this radius the lens model folds back
 
     def sample(v, X0, Y0, Ztile):
         if not u8:
@@ -461,6 +493,7 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
             nwin = np.ascontiguousarray(normals(py0, py1, px0, px1), np.float32)
             for j, (k, v) in enumerate(zip(cand, views)):
                 rgbw, vv = sample(v, X0, Y0, Ztile)
+                vv = np.where(_outside_lens(rec.R[k], rec.C[k], r2max[rec.cam_group[k]], X0, Y0, gsd, Ztile), 0, vv)
                 C = rec.C[k].astype(np.float64)
                 vis_map = _vis_map(C, sub, X0, Y0, py0, px0, vis_h, vis_w) if use_occ else None
                 cos_n = _fast.ortho_view_cos(sub8, dsm, py0, px0, float(X0), float(Y0), float(gsd), nwin,
@@ -480,6 +513,7 @@ def true_orthophoto(ar, rec, dsm, minX, maxY, gsd, gains=None, biases=None, opt=
             n_c = normals(py0, py1, px0, px1)[rr, cc]
             for j, (k, v) in enumerate(zip(cand, views)):
                 rgbw, vv = sample(v, X0, Y0, Ztile)
+                vv = np.where(_outside_lens(rec.R[k], rec.C[k], r2max[rec.cam_group[k]], X0, Y0, gsd, Ztile), 0, vv)
                 rgbw = np.nan_to_num(rgbw, nan=0.0, posinf=0.0, neginf=0.0)
                 valid = (vv[rr, cc] > 0) & (rgbw[rr, cc, 3] > 0)
                 C = rec.C[k].astype(np.float64)
