@@ -294,9 +294,29 @@ with no hand tuning. These steps apply only to radiometric thermal; RGB processi
   edge of the survey, so the thermal grid includes every footprint rather than trimming extreme
   corners. This trimming previously cut straight edges into long strips.
 
+### Thermal on RGB (automatic control points)
+
+The RGB and thermal blocks are solved separately, each held only by the drone GPS, so their
+orthophotos can disagree by a smooth affine. On flight 050 the thermal sat 1.5 m off the RGB,
+with about 1.5 % scale and 0.7° rotation. With Pix4D this is fixed by hand: pick distinct features
+(HVAC units, dishes, roof corners) in both mosaics and fit the thermal onto the RGB.
+`orthomosaic-coregister` does this automatically. Both mosaics are reduced to a gradient
+("structure") image, so thermal and RGB edges correlate even though their intensities don't. RGB
+tiles are then found in the thermal coarse to fine, from 20 cm to 5 cm, giving about 80 control
+points on 050. A robust affine fit of those points moves the thermal:
+
+    orthomosaic-coregister rgb/orthophoto.tif thermal/orthophoto_thermal.tif \
+        -o thermal/orthophoto_thermal_coreg.tif --also thermal/orthophoto.tif
+
+On 050 this took the thermal from 1.49 m off the RGB to 5.6 cm (median over the control points),
+the same as Pix4D's own thermal on its RGB (7.7 cm, measured the same way). The alignment JSON
+(`*_coreg_alignment.json`) uses `thermal_overlay.py`'s format and lists the control points, so a
+fit can be reviewed and refined there. `--model similarity|translation` restricts the fit.
+
 ---
 
 ## Performance
+
 
 The Python API and CLI remain unchanged. Numerical work runs in compiled C (Cython and
 handwritten kernels), CUDA C++ through CuPy, or Metal through MLX. This is not a standalone,
@@ -374,3 +394,7 @@ are historical and are not additional improvements over 0.8.0.
 - Absolute accuracy depends on GNSS/GCPs; low reprojection error is not proof of survey accuracy.
 
 License: MIT.
+
+
+<!-- git tag v -->
+<!-- git push origin -->
