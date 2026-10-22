@@ -14,6 +14,7 @@ normal matrix of size 3N x 3N):
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Optional
 
@@ -129,6 +130,216 @@ def _compact_mutual(di, dj, idx12, b12, s12, idx21, max_hamming=90):
                 return v.astype(dt)
         return v
     return (di, dj, small(q), small(idx12[q]), small(b12[q]), small(s12[q]))
+
+
+# --------------------------------------------------------------------------
+# Pose-guided matching (photos the global search could not connect)
+# --------------------------------------------------------------------------
+# On repetitive surfaces (corrugated roofs, solar rows, parking stripes) a descriptor's best and
+# second-best match are the same pattern one period apart, so the ratio test rejects the true
+# match and whole flight-line segments drop out of the block. With GPS, gimbal yaw and height, a
+# feature's position in the neighbouring photo is known to ~tens of pixels: searching only there
+# (COLMAP "spatial matching") leaves one period-candidate and the ratio test works again.
+
+_POP8 = np.array([bin(v).count("1") for v in range(256)], np.uint8)
+_FAR = 1 << 30
+
+
+def _hamming(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """(n, m) Hamming distances between uint8 descriptor rows."""
+    if hasattr(np, "bitwise_count"):
+        x = a.view(np.uint64)[:, None, :] ^ b.view(np.uint64)[None, :, :]
+        return np.bitwise_count(x).sum(2, dtype=np.int32)
+    return _POP8[a[:, None, :] ^ b[None, :, :]].sum(2, dtype=np.int32)
+
+
+def guided_mutual(fi: Features, fj: Features, H: np.ndarray, radius: float):
+    """backend.match_mutual restricted to pairs with |H(xy_i) - xy_j| < radius px:
+    (idx12, best12, second12, idx21), int32, as _core.match_hamming_mutual."""
+    di, dj = np.ascontiguousarray(fi.desc), np.ascontiguousarray(fj.desc)
+    pi = fi.xy @ H[:, :2].T + H[:, 2]
+    ni, nj = len(pi), len(fj.xy)
+    if ni and nj and hasattr(_core, "match_hamming_guided"):
+        # C kernel (GIL released): d2 rows bucketed on a radius-sized grid
+        x0, y0 = float(fj.xy[:, 0].min()), float(fj.xy[:, 1].min())
+        gw = int((fj.xy[:, 0].max() - x0) // radius) + 1
+        gh = int((fj.xy[:, 1].max() - y0) // radius) + 1
+        cell = ((fj.xy[:, 1] - y0) // radius).astype(np.int64) * gw + ((fj.xy[:, 0] - x0) // radius).astype(np.int64)
+        order = np.argsort(cell, kind="stable").astype(np.int64)
+        start = np.searchsorted(cell[order], np.arange(gw * gh + 1)).astype(np.int64)
+        return _core.match_hamming_guided(di.view(np.uint64), dj.view(np.uint64),
+                                          np.ascontiguousarray(pi, np.float64),
+                                          np.ascontiguousarray(fj.xy, np.float64), order, start,
+                                          x0, y0, float(radius), gw, gh, float(radius))
+    idx12 = np.full(ni, -1, np.int32)
+    b12 = np.full(ni, _FAR, np.int32)
+    s12 = np.full(ni, _FAR, np.int32)
+    idx21 = np.full(nj, -1, np.int32)
+    b21 = np.full(nj, _FAR, np.int32)
+    if ni == 0 or nj == 0:
+        return idx12, b12, s12, idx21
+    cj = np.floor(fj.xy / radius).astype(np.int64)
+    ci = np.floor(pi / radius).astype(np.int64)
+    off = min(int(ci.min()), int(cj.min())) - 1
+    span = max(int(ci.max()), int(cj.max())) - off + 2
+    kj = (cj[:, 0] - off) * span + (cj[:, 1] - off)
+    order = np.argsort(kj, kind="stable")
+    ks = kj[order]
+    ki = (ci[:, 0] - off) * span + (ci[:, 1] - off)
+    r2 = radius * radius
+    for key in np.unique(ki):
+        I = np.flatnonzero(ki == key)
+        J = np.concatenate([order[np.searchsorted(ks, key + dx * span + dy):
+                                  np.searchsorted(ks, key + dx * span + dy, "right")]
+                            for dx in (-1, 0, 1) for dy in (-1, 0, 1)])
+        if J.size == 0:
+            continue
+        d = _hamming(di[I], dj[J])
+        dd = pi[I][:, None, :] - fj.xy[J][None, :, :]
+        d[(dd * dd).sum(2) > r2] = _FAR
+        if J.size > 1:
+            o = np.argpartition(d, 1, axis=1)[:, :2]
+            two = np.take_along_axis(d, o, 1)
+            swap = two[:, 1] < two[:, 0]
+            first = np.where(swap, o[:, 1], o[:, 0])
+            b, s = two.min(1), two.max(1)
+        else:
+            first, b, s = np.zeros(len(I), np.int64), d[:, 0], np.full(len(I), _FAR, np.int32)
+        idx12[I] = np.where(b < _FAR, J[first], -1)
+        b12[I], s12[I] = b, s
+        col = d.argmin(0)
+        cb = d[col, np.arange(J.size)]
+        upd = cb < b21[J]
+        b21[J[upd]] = cb[upd]
+        idx21[J[upd]] = I[col[upd]]
+    return idx12, b12, s12, idx21
+
+
+def metadata_model(frames, al: "Alignment", positions: np.ndarray):
+    """image -> ground affine from GPS, gimbal yaw and height above take-off, calibrated on the
+    aligned photos (rotation = sign * yaw + offset, metres per pixel = k * height). Returns
+    affine(i, rho) or None; rho scales the height (rho > 1: the surface is above take-off level)."""
+    th, ps, k_alt, flips = [], [], [], []
+    for i in al.used:
+        f = frames[i]
+        L = al.affines[i][:, :2]
+        U, _, Vt = np.linalg.svd(L)
+        Q = U @ Vt
+        flips.append(np.sign(np.linalg.det(Q)))
+        if f.gimbal_yaw is not None:
+            th.append(np.arctan2(Q[1, 0], Q[0, 0]))
+            ps.append(np.radians(f.gimbal_yaw))
+        if f.rel_alt and f.rel_alt > 1.0:
+            k_alt.append(np.sqrt(abs(np.linalg.det(L))) / f.rel_alt)
+    if len(th) < 5 or not k_alt:
+        return None
+    th, ps = np.array(th), np.array(ps)
+    best = None
+    for sgn in (1.0, -1.0):
+        res = th - sgn * ps
+        c = float(np.angle(np.exp(1j * res).mean()))
+        for _ in range(3):                    # turns (yaw read 180 deg off) out, then refit
+            dev = np.abs(np.angle(np.exp(1j * (res - c))))
+            keep = dev < np.radians(20)
+            if keep.sum() < 3:
+                break
+            c = float(np.angle(np.exp(1j * res[keep]).mean()))
+        dev = np.abs(np.angle(np.exp(1j * (res - c))))
+        if best is None or np.median(dev) < best[2]:
+            best = (sgn, c, float(np.median(dev)))
+    sgn, c, med_dev = best
+    if med_dev > np.radians(5):
+        log.info("Guided matching: gimbal yaw does not predict the photo rotation (median %.1f deg off)",
+                 np.degrees(med_dev))
+        return None
+    flip = float(np.median(flips)) or -1.0
+    k = float(np.median(k_alt))
+
+    def affine(i, rho=1.0):
+        f = frames[i]
+        if f.gimbal_yaw is None or not f.rel_alt or not np.all(np.isfinite(positions[i])):
+            return None
+        a = sgn * np.radians(f.gimbal_yaw) + c
+        L = (k * f.rel_alt / rho) * np.array([[np.cos(a), -np.sin(a)], [np.sin(a), np.cos(a)]]) @ np.diag([1.0, flip])
+        ctr = np.array([(f.width - 1) / 2.0, (f.height - 1) / 2.0])
+        return np.column_stack([L, positions[i] - L @ ctr])
+    return affine
+
+
+def recover_unconnected(frames, feats, positions, al: "Alignment", cand: list, ransac_thresh: float,
+                        ratio: float = 0.8, min_inliers: int = 12, radius: float = 80.0,
+                        rhos: tuple = (0.9, 1.0, 1.15, 1.3, 1.5), workers: int = 1,
+                        mutual_out: Optional[dict] = None) -> tuple[list[PairMatch], dict]:
+    """Pose-guided matches for the photos left out of `al`: each such photo's candidate pairs
+    (`cand`) are matched within `radius` px of where GPS + yaw + height put the features. The
+    surface height (photo parallax, `rhos`) is picked per photo on its nearest neighbour.
+    Returns (verified pairs, {photo: metadata affine} for the photos a surface height was found for)."""
+    if positions is None or not al.georeferenced:
+        return [], {}
+    used = set(al.used)
+    missing = sorted(set(range(len(frames))) - used)
+    affine = metadata_model(frames, al, positions) if missing else None
+    if affine is None:
+        return [], {}
+    nb = {i: [] for i in missing}
+    for a, b in cand:
+        for x, y in ((a, b), (b, a)):
+            if x in nb:
+                nb[x].append(y)
+
+    def match(i, j, rho, store=None):
+        Ai, Aj = affine(i, rho), affine(j, rho)
+        if Ai is None or Aj is None or len(feats[i]) < min_inliers or len(feats[j]) < min_inliers:
+            return None
+        H = (np.linalg.inv(np.vstack([Aj, [0, 0, 1]])) @ np.vstack([Ai, [0, 0, 1]]))[:2]
+        return _verify_pair(i, j, feats[i], feats[j], guided_mutual(feats[i], feats[j], H, radius),
+                            ransac_thresh, ratio, min_inliers=min_inliers, mutual_out=store)
+
+    def photo_rho(i):
+        near = sorted(nb[i], key=lambda j: float(np.linalg.norm(positions[j] - positions[i])))[:2]
+        best = (0, None)
+        for j in near:
+            for rho in rhos:
+                m = match(i, j, rho)
+                if m is not None and m.n_inliers > best[0]:
+                    best = (m.n_inliers, rho)
+            if best[1] is not None:
+                break
+        return i, best[1]
+
+    with ThreadPoolExecutor(max(1, workers)) as ex:
+        rho_of = {i: r for i, r in ex.map(photo_rho, missing) if r is not None}
+    todo = sorted({(min(i, j), max(i, j)) for i in rho_of for j in nb[i]})
+
+    def job(ij):
+        i, j = ij
+        # sfm.reconstruct reuses these mutual matches for its 3D tracks (it would otherwise
+        # re-match the pair unguided and lose them again)
+        return match(i, j, rho_of.get(i, rho_of.get(j)), mutual_out)
+
+    with ThreadPoolExecutor(max(1, workers)) as ex:
+        found = [m for m in ex.map(job, todo) if m is not None]
+    return found, {i: affine(i, rho) for i, rho in rho_of.items()}
+
+
+def admit_guided(al: "Alignment", pairs: list[PairMatch], extra: list[PairMatch], placements: dict,
+                 min_pairs: int = 2) -> tuple["Alignment", list[PairMatch], list[int]]:
+    """Add photos recovered by guided matching to an alignment *for the 3D bundle adjustment*: each
+    photo with >= `min_pairs` verified guided pairs starts at its GPS + yaw + height pose (the
+    planar 2D solve cannot hold a roof seen with 30% more parallax than the ground beside it; the
+    BA can) and brings its pairs as tie points. Returns (alignment, pairs, admitted photos)."""
+    n = {}
+    for p in extra:
+        for i in (p.i, p.j):
+            n[i] = n.get(i, 0) + 1
+    admitted = sorted(i for i, a in placements.items() if a is not None and n.get(i, 0) >= min_pairs)
+    if not admitted:
+        return al, pairs, []
+    keep = set(al.used) | set(admitted)
+    affines = dict(al.affines)
+    affines.update({i: placements[i] for i in admitted})
+    new = [p for p in extra if p.i in keep and p.j in keep]
+    return (Alignment(sorted(keep), affines, al.georeferenced, al.gsd, al.residual_px), pairs + new, admitted)
 
 
 # --------------------------------------------------------------------------

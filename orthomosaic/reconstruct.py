@@ -362,6 +362,15 @@ def sparse_block(images: Union[str, Sequence[str]], opt: Options3D):
     """Aerial triangulation: align + SfM bundle adjustment (with GCPs if given).
     Returns (AlignResult, Reconstruction)."""
     ar = align_images(images, opt)
+    guided = getattr(ar, "_guided", None)
+    if guided:
+        from .align import admit_guided
+        ar.alignment, ar.pairs, admitted = admit_guided(ar.alignment, ar.pairs, *guided)
+        if admitted:
+            names = {ar.frames[i].name for i in admitted}
+            ar.dropped = [n for n in ar.dropped if n not in names]
+            log.info("Guided matching: %d image(s) join the bundle adjustment at their GPS pose; %d still "
+                     "unconnected", len(admitted), len(ar.dropped))
     gcps = _load_gcps(ar, opt)
     rec = sfm.reconstruct(ar, gps_sigma=opt.gps_sigma, alt_sigma=opt.alt_sigma,
                           rolling_shutter=opt.rolling_shutter, rolling_shutter_readout=opt.rolling_shutter_readout,
@@ -944,6 +953,8 @@ def main(argv=None):
                     help="disable occlusion handling in the true orthophoto (faster)")
     ap.add_argument("--no-color-balance", action="store_true",
                     help="use gains-only exposure compensation (no per-image offset)")
+    ap.add_argument("--no-guided", action="store_true",
+                    help="do not re-match photos left out of the block where GPS + yaw + height put their features")
     ap.add_argument("--view-angle-power", type=float, default=d.view_angle_power,
                     help="nadir preference when blending the true orthophoto (0 = off)")
     ap.add_argument("--ortho-blend", choices=["seam", "feather"], default=d.ortho_blend,
@@ -999,7 +1010,7 @@ def main(argv=None):
                     gcp=a.gcp, gcp_sigma=a.gcp_sigma,
                     #changed here: Pix4D-grade ortho / colour / elevation-mapping switches
                     true_ortho=not a.no_true_ortho, occlusion=not a.no_occlusion,
-                    color_balance=not a.no_color_balance, view_angle_power=a.view_angle_power,
+                    color_balance=not a.no_color_balance, view_angle_power=a.view_angle_power, guided_matching=not a.no_guided,
                     dem_gapfill_steps=a.dem_gapfill_steps, ignore_gsd=a.ignore_gsd,
                     sky_removal=a.sky_removal, bg_removal=a.bg_removal, rolling_shutter=a.rolling_shutter,
                     rolling_shutter_readout=a.rolling_shutter_readout, dense_method=a.dense_method, depth_max_image=a.depth_max_image,

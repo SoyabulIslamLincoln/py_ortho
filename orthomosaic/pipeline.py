@@ -36,6 +36,8 @@ class Options:
     neighbors: int = 8                 # candidate pairs per image (GPS kNN); 0 = auto from the overlap
     ratio: float = 0.8
     min_inliers: int = 25
+    guided_matching: bool = True       # photos left out of the block: re-match where GPS + yaw + height put
+                                       # the features (repetitive roofs); costs nothing when none are left out
     # alignment
     gps_sigma: float = 3.0             # metres
     match_sigma_px: float = 4.0
@@ -216,6 +218,17 @@ def align_images(images: Union[str, Sequence[str]], opt: Options) -> AlignResult
 
     # ---- global alignment
     al, pairs = solve_alignment(frames, pairs, positions, opt.gps_sigma, opt.match_sigma_px)
+    guided = None
+    if getattr(opt, "guided_matching", True) and al.georeferenced and len(al.used) < len(frames):
+        # photos the search left out: match them where GPS + yaw + height put their features. The 2D
+        # block stays as solved; the 3D bundle adjustment admits them (reconstruct.sparse_block)
+        from .align import recover_unconnected
+        t = time.time()
+        extra, placements = recover_unconnected(frames, feats, positions, al, cand, thresh, opt.ratio,
+                                                opt.min_inliers, workers=workers, mutual_out=mutual)
+        guided = (extra, placements)
+        log.info("Guided matching of %d unconnected image(s): %d pairs verified (%.1fs)",
+                 len(frames) - len(al.used), len(extra), time.time() - t)
     dropped = [frames[k].name for k in range(len(frames)) if k not in set(al.used)]
     if dropped:
         log.warning("%d image(s) not connected to the main block were skipped: %s",
@@ -225,6 +238,7 @@ def align_images(images: Union[str, Sequence[str]], opt: Options) -> AlignResult
     res = AlignResult(frames, feats, work_scale, pairs, len(cand), al, positions, epsg, origin,
                       backend, workers, dropped, thermal_range, thermal_units)
     res._mutual = mutual            # private cache (not a field: absent after dataclasses.replace)
+    res._guided = guided            # (pairs, placements) for the 3D bundle adjustment, or None
     return res
 
 

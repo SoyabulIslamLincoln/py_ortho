@@ -210,6 +210,7 @@ Resolution is never finer than GSD − 10 % (`ignore_gsd=True` to override).
 | `attitude_sigma_deg` | — | 2.0 | Gimbal pitch/roll prior in the bundle adjustment (0 = off) |
 | `n_features` | `--features` | 0 (auto) | Keypoints per image; auto ≈ 1 250 per megapixel (15 000 on 12 MP) |
 | `neighbors` | `--neighbors` | 0 (auto) | Matching partners per image; auto = photos overlapping ≥ ~50%, 6–12 |
+| `guided_matching` | `--no-guided` | True | Re-match photos left out of the block (repetitive roofs, solar rows) only where GPS + gimbal yaw + height put their features; no cost when none are left out |
 | `ortho_resolution` | — | native GSD | Orthophoto cell (m); its grid is separate from the DSM's |
 | `ortho_max_cells` | — | 60 M | Orthophoto pixel cap (memory) |
 | `dsm_max_fill` | `--dsm-max-fill` | −1 | Hole fill distance (m); −1 = everywhere photographed by ≥ 2 cameras |

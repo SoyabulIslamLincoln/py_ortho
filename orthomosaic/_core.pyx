@@ -9,7 +9,7 @@ across images / pairs / output blocks with plain Python threads.
 import numpy as np
 cimport numpy as cnp
 from libc.math cimport sqrt, exp, floor, ceil, atan2, cos, sin, fabs, pow, log
-from libc.stdint cimport uint8_t, uint32_t, uint64_t, int32_t
+from libc.stdint cimport uint8_t, uint32_t, uint64_t, int32_t, int64_t
 
 cnp.import_array()
 
@@ -386,6 +386,67 @@ def match_hamming_mutual(const uint64_t[:, ::1] d1, const uint64_t[:, ::1] d2):
                 if d < cb[j]:
                     cb[j] = d
                     back[j] = <int>i
+            idx[i] = bi
+            bst[i] = best
+            sec[i] = second
+    return idx_np, best_np, sec_np, back_np
+
+
+def match_hamming_guided(const uint64_t[:, ::1] d1, const uint64_t[:, ::1] d2, const double[:, ::1] p1,
+                         const double[:, ::1] xy2, const int64_t[::1] order, const int64_t[::1] start,
+                         double x0, double y0, double cell, Py_ssize_t gw, Py_ssize_t gh, double radius):
+    """match_hamming_mutual restricted to d2 rows within `radius` of each d1 row's predicted
+    position p1. d2 rows are bucketed on a `cell`-sized grid (origin x0, y0; gw x gh cells):
+    `order` lists d2 rows cell by cell, `start` (gw*gh + 1) the first row of each cell."""
+    cdef Py_ssize_t n1 = d1.shape[0], n2 = d2.shape[0], i, j, t, cx, cy, gx, gy, c
+    cdef int d, best, second, bi
+    cdef uint64_t a0, a1, a2, a3
+    cdef double px, py, dx, dy, r2 = radius * radius
+    idx_np = np.full(n1, -1, np.int32)
+    best_np = np.full(n1, 1 << 30, np.int32)
+    sec_np = np.full(n1, 1 << 30, np.int32)
+    back_np = np.full(n2, -1, np.int32)
+    colbest_np = np.full(n2, 1 << 30, np.int32)
+    cdef int32_t[::1] idx = idx_np, bst = best_np, sec = sec_np, back = back_np, cb = colbest_np
+    if d1.shape[1] != 4 or d2.shape[1] != 4:
+        raise ValueError("expected 256-bit descriptors")
+    with nogil:
+        for i in range(n1):
+            px = p1[i, 0]
+            py = p1[i, 1]
+            cx = <Py_ssize_t>floor((px - x0) / cell)
+            cy = <Py_ssize_t>floor((py - y0) / cell)
+            a0 = d1[i, 0]
+            a1 = d1[i, 1]
+            a2 = d1[i, 2]
+            a3 = d1[i, 3]
+            best = 1 << 30
+            second = 1 << 30
+            bi = -1
+            for gy in range(cy - 1, cy + 2):
+                if gy < 0 or gy >= gh:
+                    continue
+                for gx in range(cx - 1, cx + 2):
+                    if gx < 0 or gx >= gw:
+                        continue
+                    c = gy * gw + gx
+                    for t in range(start[c], start[c + 1]):
+                        j = order[t]
+                        dx = xy2[j, 0] - px
+                        dy = xy2[j, 1] - py
+                        if dx * dx + dy * dy > r2:
+                            continue
+                        d = (om_popcount64(a0 ^ d2[j, 0]) + om_popcount64(a1 ^ d2[j, 1])
+                             + om_popcount64(a2 ^ d2[j, 2]) + om_popcount64(a3 ^ d2[j, 3]))
+                        if d < best:
+                            second = best
+                            best = d
+                            bi = <int>j
+                        elif d < second:
+                            second = d
+                        if d < cb[j]:
+                            cb[j] = d
+                            back[j] = <int>i
             idx[i] = bi
             bst[i] = best
             sec[i] = second

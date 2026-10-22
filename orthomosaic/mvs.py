@@ -509,26 +509,23 @@ def _box_mean(a: np.ndarray, r: int) -> np.ndarray:
     return (s[:a.shape[0], :a.shape[1]] / (k * k)).astype(np.float32)
 
 
-def _lower_envelope(Z: np.ndarray, f: int) -> np.ndarray:
-    """Smooth lower surface: minimum of each f x f block (NaN-aware), holes filled by push-pull,
-    bilinearly upsampled to the full grid."""
+def _local_min(Z: np.ndarray, radius_m: float, gsd: float, block_m: float = 0.5) -> np.ndarray:
+    """NaN-aware minimum within ~`radius_m` (on a `block_m` block grid, nearest-upsampled)."""
     import warnings
     H, W = Z.shape
+    f = max(1, int(round(block_m / gsd)))
     h, w = -(-H // f), -(-W // f)
     P = np.full((h * f, w * f), np.nan, np.float32)
     P[:H, :W] = Z
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        B = np.nanmin(P.reshape(h, f, w, f), axis=(1, 3)).astype(np.float32)
-    B = fill_holes(B)
-    ys = np.clip((np.arange(H) + 0.5) / f - 0.5, 0, h - 1)
-    xs = np.clip((np.arange(W) + 0.5) / f - 0.5, 0, w - 1)
-    y0 = np.minimum(np.floor(ys).astype(int), max(h - 2, 0)); x0 = np.minimum(np.floor(xs).astype(int), max(w - 2, 0))
-    y1, x1 = np.minimum(y0 + 1, h - 1), np.minimum(x0 + 1, w - 1)
-    fy = (ys - y0).astype(np.float32)[:, None]; fx = (xs - x0).astype(np.float32)[None, :]
-    top = B[y0][:, x0] * (1 - fx) + B[y0][:, x1] * fx
-    bot = B[y1][:, x0] * (1 - fx) + B[y1][:, x1] * fx
-    return (top * (1 - fy) + bot * fy).astype(np.float32)
+        B = np.nanmin(P.reshape(h, f, w, f), axis=(1, 3))
+    B = np.where(np.isfinite(B), B, np.inf).astype(np.float32)
+    for _ in range(max(1, int(round(radius_m / block_m)))):    # separable running minimum
+        B[1:] = np.minimum(B[1:], B[:-1].copy()); B[:-1] = np.minimum(B[:-1], B[1:].copy())
+        B[:, 1:] = np.minimum(B[:, 1:], B[:, :-1].copy()); B[:, :-1] = np.minimum(B[:, :-1], B[:, 1:].copy())
+    B[~np.isfinite(B)] = np.nan
+    return np.repeat(np.repeat(B, f, 0), f, 1)[:H, :W]
 
 
 def _near(mask: np.ndarray, cells: int) -> np.ndarray:
@@ -569,7 +566,8 @@ def _bilateral_parallel(z, vmask, radius, sigma_z, sigma_s, rows=256):
 
 
 def postprocess(d: DenseResult, min_score: float, max_dev: float = 1.0,
-                smooth_range: float = 0.4, smooth_iters: int = 2, max_fill_cells: int = -1):
+                smooth_range: float = 0.4, smooth_iters: int = 2, max_fill_cells: int = -1,
+                low_split: float = 0.7):
     """Returns (dsm, confident_mask, support).
 
     `support` codes every cell: 0 no data, 1 measured (confident stereo), 2 interpolated.
@@ -585,6 +583,15 @@ def postprocess(d: DenseResult, min_score: float, max_dev: float = 1.0,
     """
     conf = (d.score >= min_score) & np.isfinite(d.Z)
     Zc = np.where(conf, d.Z, np.nan).astype(np.float32)
+    stepped = (np.zeros(d.Z.shape, bool) if d.stepped is None else d.stepped & np.isfinite(d.Z))
+    if d.stepped is not None:
+        # radius outlier removal (dense cloud): a lone measurement in a mostly empty ~1 m
+        # neighbourhood (dark shadow, glass, water) has no neighbours to vote it out below, and
+        # the hole fill would spread it into a metres-high blob. Its radius-grown cells go with it.
+        lonely = (conf | stepped) & (_box_mean(conf | stepped, max(2, int(round(0.5 / d.gsd)))) < 0.15)
+        conf &= ~lonely
+        stepped &= ~lonely
+        Zc[lonely] = np.nan
     # progressive spike removal: coarse blunders first, then finer speckle against a wider median
     for thr, r in ((max_dev, 2), (0.6 * max_dev, 2), (0.4 * max_dev, 3)):
         med = _nanmedian_filter(Zc, r)
@@ -597,20 +604,30 @@ def postprocess(d: DenseResult, min_score: float, max_dev: float = 1.0,
     if d.stepped is not None:
         # a gap next to a height step (ground at the foot of a wall, hidden from most photos) takes
         # the local ground height, not a ramp from the roof: a ramp stretches the photo texture
-        # into the melted, wavy edges seen beside buildings
+        # into the melted, wavy edges seen beside buildings. Measured cells > 2 m above the lowest
+        # surface within 3 m are "high" (roofs, trees); a hole cell whose measured surroundings are
+        # mostly low is filled from the low cells only, so the wall stays a step.
         f = max(1, int(round(0.5 / d.gsd)))
-        low = _lower_envelope(Zc, f)
         hole = ~np.isfinite(Zc)
-        # min() of two continuous surfaces is continuous: no per-cell switching, so no terraces
-        filled = np.where(hole, np.minimum(filled, low), filled).astype(np.float32)
+        meas = ~hole
+        high = meas & (Zc > _local_min(Zc, 3.0, d.gsd) + 2.0)
+        p_high = fill_holes(np.where(meas, high.astype(np.float32), np.nan))
+        # roof edges are seen from every photo, the ground beside them is not: a gap between the
+        # two is mostly ground, so the split leans to the high side
+        low_side = hole & (p_high < low_split)
+        filled = np.where(low_side, fill_holes(np.where(high, np.nan, Zc)), filled)
+        if high.any():
+            filled = np.where(hole & ~low_side, fill_holes(np.where(high, Zc, np.nan)), filled)
+        filled = filled.astype(np.float32)
         # unmeasured areas carry no detail anyway: make them smooth (~0.5 m), so the orthophoto
         # drapes the photos over a calm surface instead of warping them over interpolation noise
-        # (ODM gets the same effect by texturing a simplified 2.5D mesh)
-        sm = _box_mean(np.nan_to_num(filled), f) / np.maximum(_box_mean(np.isfinite(filled).astype(np.float32), f), 1e-6)
-        filled = np.where(hole & np.isfinite(filled), sm, filled).astype(np.float32)
+        # (ODM gets the same effect by texturing a simplified 2.5D mesh); each side of the
+        # ground/roof split is smoothed on its own, so no ramp forms across it
+        for side in (low_side, hole & ~low_side):
+            num = _box_mean(np.where(side, filled, 0).astype(np.float32), f)
+            filled = np.where(side, num / np.maximum(_box_mean(side, f), 1e-6), filled).astype(np.float32)
     # heights already filled from nearby points (densify radius steps, 0 < score < min_score)
     # are better than the push-pull estimate: keep them where they are not spikes
-    stepped = (np.zeros(d.Z.shape, bool) if d.stepped is None else d.stepped & np.isfinite(d.Z))
     if stepped.any():
         med = _nanmedian_filter(np.where(conf | stepped, d.Z, np.nan).astype(np.float32), 2)
         stepped &= ~(np.abs(d.Z - med) > max_dev)
